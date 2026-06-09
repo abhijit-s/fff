@@ -208,9 +208,23 @@ impl MasterState {
         let slug = base_path_slug(std::path::Path::new(base_path));
 
         // Ring assignment is read-only and deterministic; compute outside any lock.
+        // If the ring is empty (workers still starting), spawn one on demand so
+        // Handshakes that arrive before n_min workers are ready still get served.
         let index = {
             let ring = self.ring.lock().await;
-            ring.assign(std::path::Path::new(base_path))?
+            ring.assign(std::path::Path::new(base_path))
+        };
+        let index = match index {
+            Some(idx) => idx,
+            None => {
+                let new_idx = self.alloc_index().await;
+                tracing::info!("master: ring empty, spawning first worker on demand ({new_idx})");
+                if let Err(e) = self.spawn_worker(new_idx).await {
+                    tracing::error!("master: on-demand spawn failed: {e}");
+                    return None;
+                }
+                new_idx
+            }
         };
 
         // Single write-lock: re-check presence, push slug, compute scale-out trigger.
@@ -283,7 +297,10 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
     let rt_path = routing_table_path();
     let mut routing = RoutingTable::load(&rt_path).unwrap_or_default();
     let mut adopted_pids: HashMap<u32, u32> = HashMap::new();
-    let mut max_seen_index: u32 = 0;
+    // Track highest worker index seen; used to assign the next index without
+    // reusing gaps. Starts at u32::MAX so that wrapping_add(1) yields 0 when
+    // no prior workers exist (fresh start).
+    let mut max_seen_index: u32 = u32::MAX;
 
     // Restore ring from persisted snapshot, then remove dead workers.
     // Using from_serializable preserves the exact prior layout even if
@@ -318,32 +335,38 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
         exe_path,
         routing,
         ring,
-        max_seen_index + 1,
+        max_seen_index.wrapping_add(1),
         adopted_pids,
     ));
 
-    // Spawn workers to reach n_min.
-    let to_spawn = worker_cfg.n_min.saturating_sub(surviving);
-    for _ in 0..to_spawn {
-        let index = master_state.alloc_index().await;
-        if let Err(e) = master_state.spawn_worker(index).await {
-            tracing::error!("master: initial spawn failed: {e}");
-        }
-    }
-
-    // Bind master socket.
+    // Bind master socket before spawning workers so clients can connect
+    // immediately. Workers start in the background; Handshakes that arrive
+    // before the ring is populated trigger on-demand spawn inside assign_new_root.
     let socket = master_socket_path();
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
-    // Restrict to owner-only so no other local user can send management commands.
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     }
     tracing::info!("fff-engine master listening on {}", socket.display());
+
+    // Spawn workers to reach n_min in the background — don't delay socket availability.
+    let to_spawn = worker_cfg.n_min.saturating_sub(surviving);
+    if to_spawn > 0 {
+        let ms_init = Arc::clone(&master_state);
+        tokio::spawn(async move {
+            for _ in 0..to_spawn {
+                let index = ms_init.alloc_index().await;
+                if let Err(e) = ms_init.spawn_worker(index).await {
+                    tracing::error!("master: initial spawn failed: {e}");
+                }
+            }
+        });
+    }
 
     // Background: poll children for crashes and respawn them in parallel.
     // restart_count tracks (attempts, window_start) per worker index.
