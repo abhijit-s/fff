@@ -13,14 +13,66 @@ pub struct RoutingTable {
     pub workers: HashMap<u32, WorkerEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RootEntry {
+    pub slug: String,
+    pub base_path: String,
+}
+
 /// Per-worker persistent state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerEntry {
     pub index: u32,
     pub socket_path: String,
     pub pid: u32,
-    /// Slugs of roots currently loaded in this worker's in-memory registry.
-    pub root_slugs: Vec<String>,
+    #[serde(default)]
+    pub roots: Vec<RootEntry>,
+    /// Legacy field — read on load only, never written. Migrated into
+    /// `roots` by `RoutingTable::load`. Private so new code paths can't
+    /// touch it.
+    #[serde(default, rename = "root_slugs", skip_serializing)]
+    legacy_root_slugs: Vec<String>,
+}
+
+impl WorkerEntry {
+    pub fn new(index: u32, socket_path: String, pid: u32) -> Self {
+        Self {
+            index,
+            socket_path,
+            pid,
+            roots: Vec::new(),
+            legacy_root_slugs: Vec::new(),
+        }
+    }
+
+    pub fn contains_slug(&self, slug: &str) -> bool {
+        self.roots.iter().any(|r| r.slug == slug)
+    }
+
+    pub fn push_root(&mut self, slug: String, base_path: String) {
+        self.roots.push(RootEntry { slug, base_path });
+    }
+
+    /// Returns true if a matching slug was removed.
+    pub fn remove_slug(&mut self, slug: &str) -> bool {
+        let before = self.roots.len();
+        self.roots.retain(|r| r.slug != slug);
+        before != self.roots.len()
+    }
+
+    fn migrate_legacy(&mut self) {
+        if self.roots.is_empty() && !self.legacy_root_slugs.is_empty() {
+            self.roots = std::mem::take(&mut self.legacy_root_slugs)
+                .into_iter()
+                .map(|slug| RootEntry {
+                    slug,
+                    base_path: String::new(),
+                })
+                .collect();
+        } else {
+            self.legacy_root_slugs.clear();
+        }
+    }
 }
 
 /// Serializable form of the hash ring's virtual-node list.
@@ -38,7 +90,7 @@ impl RoutingTable {
     pub fn entries_for_worker(&self, worker_index: u32) -> usize {
         self.workers
             .get(&worker_index)
-            .map(|e| e.root_slugs.len())
+            .map(|e| e.roots.len())
             .unwrap_or(0)
     }
 
@@ -51,7 +103,12 @@ impl RoutingTable {
     pub fn load(path: &Path) -> io::Result<Self> {
         match fs::read_to_string(path) {
             Ok(s) => {
-                serde_json::from_str(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                let mut table: Self = serde_json::from_str(&s)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                for entry in table.workers.values_mut() {
+                    entry.migrate_legacy();
+                }
+                Ok(table)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
@@ -77,12 +134,11 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_entry(index: u32, slugs: &[&str]) -> WorkerEntry {
-        WorkerEntry {
-            index,
-            socket_path: format!("worker-{index}.sock"),
-            pid: 1000 + index,
-            root_slugs: slugs.iter().map(|s| s.to_string()).collect(),
+        let mut e = WorkerEntry::new(index, format!("worker-{index}.sock"), 1000 + index);
+        for s in slugs {
+            e.push_root((*s).to_string(), format!("/test/{s}"));
         }
+        e
     }
 
     #[test]
@@ -98,7 +154,14 @@ mod tests {
         let rt2: RoutingTable = serde_json::from_str(&json).unwrap();
 
         assert_eq!(rt2.workers.len(), 2);
-        assert_eq!(rt2.workers[&0].root_slugs, vec!["abc", "def"]);
+        assert_eq!(
+            rt2.workers[&0]
+                .roots
+                .iter()
+                .map(|r| r.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec!["abc", "def"]
+        );
         assert_eq!(rt2.ring_state.nodes, vec![(100, 0), (500, 1)]);
     }
 
@@ -131,7 +194,72 @@ mod tests {
         rt.save(&path).unwrap();
 
         let rt2 = RoutingTable::load(&path).unwrap();
-        assert_eq!(rt2.workers[&0].root_slugs, vec!["slug1"]);
+        assert_eq!(
+            rt2.workers[&0]
+                .roots
+                .iter()
+                .map(|r| r.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec!["slug1"]
+        );
+    }
+
+    #[test]
+    fn root_entry_serializes_as_object() {
+        let r = RootEntry {
+            slug: "abc123".into(),
+            base_path: "/home/me/proj".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"slug\":\"abc123\""));
+        assert!(json.contains("\"base_path\":\"/home/me/proj\""));
+    }
+
+    #[test]
+    fn worker_entry_round_trips_with_roots() {
+        let mut rt = RoutingTable::default();
+        let mut entry = WorkerEntry::new(0, "worker-0.sock".into(), 1000);
+        entry.push_root("s1".into(), "/a".into());
+        entry.push_root("s2".into(), "/b".into());
+        rt.workers.insert(0, entry);
+
+        let json = serde_json::to_string(&rt).unwrap();
+        assert!(
+            !json.contains("root_slugs"),
+            "legacy key must not be written"
+        );
+
+        let rt2: RoutingTable = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt2.workers[&0].roots[0].base_path, "/a");
+        assert_eq!(rt2.workers[&0].roots[1].slug, "s2");
+    }
+
+    #[test]
+    fn load_migrates_legacy_root_slugs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("routing.json");
+        let legacy_json = r#"{
+            "ring_state": { "nodes": [] },
+            "workers": {
+                "0": {
+                    "index": 0,
+                    "socket_path": "worker-0.sock",
+                    "pid": 1000,
+                    "root_slugs": ["legacyslug1", "legacyslug2"]
+                }
+            }
+        }"#;
+        std::fs::write(&path, legacy_json).unwrap();
+
+        let rt = RoutingTable::load(&path).unwrap();
+        let entry = &rt.workers[&0];
+        assert_eq!(entry.roots.len(), 2);
+        assert_eq!(entry.roots[0].slug, "legacyslug1");
+        assert_eq!(
+            entry.roots[0].base_path, "",
+            "legacy entries hydrate with empty base_path"
+        );
+        assert_eq!(entry.roots[1].slug, "legacyslug2");
     }
 
     #[test]

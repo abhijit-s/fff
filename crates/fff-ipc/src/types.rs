@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::routing::RootEntry;
+
 // ── Master protocol ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,13 +42,13 @@ pub enum MasterResponse {
 pub struct WorkerInfo {
     pub index: u32,
     pub socket_path: String,
-    pub root_slugs: Vec<String>,
+    pub roots: Vec<RootEntry>,
     pub pid: u32,
 }
 
 impl WorkerInfo {
     pub fn root_count(&self) -> usize {
-        self.root_slugs.len()
+        self.roots.len()
     }
 }
 
@@ -416,13 +418,16 @@ mod tests {
                 WorkerInfo {
                     index: 0,
                     socket_path: "worker-0.sock".into(),
-                    root_slugs: vec!["abc".into()],
+                    roots: vec![RootEntry {
+                        slug: "abc".into(),
+                        base_path: "/proj/a".into(),
+                    }],
                     pid: 1234,
                 },
                 WorkerInfo {
                     index: 1,
                     socket_path: "worker-1.sock".into(),
-                    root_slugs: vec![],
+                    roots: vec![],
                     pid: 5678,
                 },
             ],
@@ -432,6 +437,8 @@ mod tests {
             MasterResponse::WorkerList { workers } => {
                 assert_eq!(workers.len(), 2);
                 assert_eq!(workers[0].pid, 1234);
+                assert_eq!(workers[0].roots[0].slug, "abc");
+                assert_eq!(workers[0].roots[0].base_path, "/proj/a");
                 assert_eq!(workers[1].root_count(), 0);
             }
             _ => panic!("wrong variant"),
@@ -475,7 +482,10 @@ mod tests {
         let info = WorkerInfo {
             index: 2,
             socket_path: "w.sock".into(),
-            root_slugs: vec!["s".into()],
+            roots: vec![RootEntry {
+                slug: "s".into(),
+                base_path: "/proj/b".into(),
+            }],
             pid: 42,
         };
         let rt = round_trip(&MasterResponse::WorkerInfo(info.clone()));
@@ -483,6 +493,8 @@ mod tests {
             MasterResponse::WorkerInfo(w) => {
                 assert_eq!(w.index, 2);
                 assert_eq!(w.root_count(), 1);
+                assert_eq!(w.roots[0].slug, "s");
+                assert_eq!(w.roots[0].base_path, "/proj/b");
                 assert_eq!(w.pid, 42);
             }
             _ => panic!("wrong variant"),

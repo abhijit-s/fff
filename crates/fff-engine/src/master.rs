@@ -126,12 +126,7 @@ impl MasterState {
             let mut routing = self.routing.lock().await;
             routing.workers.insert(
                 index,
-                WorkerEntry {
-                    index,
-                    socket_path: socket.to_string_lossy().into(),
-                    pid,
-                    root_slugs: vec![],
-                },
+                WorkerEntry::new(index, socket.to_string_lossy().into(), pid),
             );
             routing.ring_state = ring_snapshot;
             self.persist_routing(&routing);
@@ -151,7 +146,7 @@ impl MasterState {
             .map(|e| WorkerInfo {
                 index: e.index,
                 socket_path: e.socket_path.clone(),
-                root_slugs: e.root_slugs.clone(),
+                roots: e.roots.clone(),
                 pid: e.pid,
             })
             .collect()
@@ -162,7 +157,7 @@ impl MasterState {
         routing.workers.get(&index).map(|e| WorkerInfo {
             index: e.index,
             socket_path: e.socket_path.clone(),
-            root_slugs: e.root_slugs.clone(),
+            roots: e.roots.clone(),
             pid: e.pid,
         })
     }
@@ -215,8 +210,8 @@ impl MasterState {
         let mut routing = self.routing.lock().await;
         let now = Instant::now();
         for (&idx, entry) in routing.workers.iter_mut() {
-            entry.root_slugs.retain(|s| s != slug);
-            if entry.root_slugs.is_empty() {
+            entry.remove_slug(slug);
+            if entry.roots.is_empty() {
                 self.idle_since.lock().await.entry(idx).or_insert(now);
             }
         }
@@ -251,21 +246,26 @@ impl MasterState {
             }
         };
 
+        // Canonicalize outside the routing lock to avoid I/O under lock.
+        let canonical = std::fs::canonicalize(base_path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| base_path.to_string());
+
         // Single write-lock: re-check presence, push slug, compute scale-out trigger.
         let should_scale_out = {
             let mut routing = self.routing.lock().await;
 
             // Re-check after lock: a concurrent Handshake may have added this slug already.
             for (idx, entry) in &routing.workers {
-                if entry.root_slugs.contains(&slug) {
+                if entry.contains_slug(&slug) {
                     return Some(*idx);
                 }
             }
 
             let mut scale_out = false;
             if let Some(entry) = routing.workers.get_mut(&index) {
-                entry.root_slugs.push(slug.clone());
-                let load = entry.root_slugs.len() as u32;
+                entry.push_root(slug.clone(), canonical);
+                let load = entry.roots.len() as u32;
                 let total_workers = routing.workers.len() as u32;
                 scale_out =
                     load >= self.config.roots_per_worker_max && total_workers < self.config.n_max;
@@ -606,7 +606,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, ms: Arc<MasterState>)
             let routing_hit = {
                 let routing = ms.routing.lock().await;
                 routing.workers.iter().find_map(|(&idx, e)| {
-                    if e.root_slugs.contains(&slug) {
+                    if e.contains_slug(&slug) {
                         Some(idx)
                     } else {
                         None

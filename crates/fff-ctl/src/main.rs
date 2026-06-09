@@ -149,8 +149,13 @@ fn cmd_list_workers() -> i32 {
                     w.root_count(),
                     w.socket_path
                 );
-                for slug in &w.root_slugs {
-                    println!("       slug: {slug}");
+                for root in &w.roots {
+                    let path_display = if root.base_path.is_empty() {
+                        "<unknown>"
+                    } else {
+                        root.base_path.as_str()
+                    };
+                    println!("       {path_display}  (slug: {})", root.slug);
                 }
             }
             0
@@ -259,8 +264,13 @@ fn cmd_worker_status(index: u32) -> i32 {
                 info.root_count()
             );
             println!("  socket: {}", info.socket_path);
-            for slug in &info.root_slugs {
-                println!("  slug: {slug}");
+            for root in &info.roots {
+                let path_display = if root.base_path.is_empty() {
+                    "<unknown>"
+                } else {
+                    root.base_path.as_str()
+                };
+                println!("  {path_display}  (slug: {})", root.slug);
             }
             0
         }
