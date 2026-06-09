@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use fff_ipc::{master_socket_path, routing_table_path};
 use tempfile::TempDir;
 
 const CTL_BIN: &str = env!("CARGO_BIN_EXE_fffctl");
@@ -76,27 +75,12 @@ impl TestEnv {
     }
 
     fn master_socket(&self) -> PathBuf {
-        let orig = std::env::var("XDG_CACHE_HOME").ok();
-        // Temporarily point helpers at our isolated dirs
-        unsafe { std::env::set_var("XDG_CACHE_HOME", &self.cache) };
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &self.runtime) };
-        let p = master_socket_path();
-        match orig {
-            Some(v) => unsafe { std::env::set_var("XDG_CACHE_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
-        }
-        p
+        // Compute directly — avoids unsafe env mutations that race with parallel tests.
+        self.cache.join("fff").join("master.sock")
     }
 
     fn routing_json(&self) -> PathBuf {
-        let orig = std::env::var("XDG_RUNTIME_DIR").ok();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &self.runtime) };
-        let p = routing_table_path();
-        match orig {
-            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
-            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
-        }
-        p
+        self.runtime.join("fff").join("routing.json")
     }
 
     fn spawn_master(&self) -> Child {
@@ -233,14 +217,17 @@ fn clean_removes_routing_json_after_master_stopped() {
     let mut master = env.spawn_master();
     assert!(env.wait_master(SOCKET_TIMEOUT), "master did not start");
 
-    // Let master write routing.json, then stop it.
-    std::thread::sleep(Duration::from_millis(300));
+    // Wait for master to write routing.json (written after first worker starts).
+    let routing = env.routing_json();
+    let deadline = Instant::now() + SOCKET_TIMEOUT;
+    while !routing.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
     sigterm(&master);
     let sock = env.master_socket();
     env.wait_socket_gone(&sock, SOCKET_TIMEOUT);
     let _ = master.wait();
 
-    let routing = env.routing_json();
     assert!(
         routing.exists(),
         "routing.json should exist after master ran"
@@ -262,13 +249,17 @@ fn clean_dry_run_does_not_remove() {
     let mut master = env.spawn_master();
     assert!(env.wait_master(SOCKET_TIMEOUT), "master did not start");
 
-    std::thread::sleep(Duration::from_millis(300));
+    // Wait for master to write routing.json before stopping.
+    let routing = env.routing_json();
+    let deadline = Instant::now() + SOCKET_TIMEOUT;
+    while !routing.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
     sigterm(&master);
     let sock = env.master_socket();
     env.wait_socket_gone(&sock, SOCKET_TIMEOUT);
     let _ = master.wait();
 
-    let routing = env.routing_json();
     assert!(
         routing.exists(),
         "routing.json should exist after master ran"

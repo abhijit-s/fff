@@ -998,10 +998,9 @@ impl FffServer {
 
         if let Ok(guard) = self.frecency.read()
             && let Some(tracker) = guard.as_ref()
+            && let Err(e) = tracker.track_access(&abs_path)
         {
-            if let Err(e) = tracker.track_access(&abs_path) {
-                tracing::warn!(?abs_path, "record_access track_access failed: {e}");
-            }
+            tracing::warn!(?abs_path, "record_access track_access failed: {e}");
         }
 
         Ok(CallToolResult::success(vec![Content::text("ok")]))
@@ -1039,7 +1038,7 @@ impl FffServer {
             .filter(|f| {
                 !f.is_deleted()
                     && f.total_frecency_score() > 0
-                    && (!dirty_only || f.git_status.map_or(false, fff::git::is_modified_status))
+                    && (!dirty_only || f.git_status.is_some_and(fff::git::is_modified_status))
             })
             .map(|f| (f, f.total_frecency_score()))
             .collect();

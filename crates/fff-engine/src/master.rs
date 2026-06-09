@@ -480,7 +480,7 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
             {
                 let routing = ms_idle.routing.lock().await;
                 let mut idle = ms_idle.idle_since.lock().await;
-                for (&idx, _) in &routing.workers {
+                for &idx in routing.workers.keys() {
                     let entry_count = routing.entries_for_worker(idx);
                     if entry_count == 0 {
                         let since = idle.entry(idx).or_insert(now);
