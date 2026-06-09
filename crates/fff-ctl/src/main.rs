@@ -296,16 +296,24 @@ fn cmd_stop(base_path: Option<&Path>, all: bool, timeout: Duration) -> i32 {
         if let Some(lock) = lockfile::read(&master_lock)
             && lock.is_alive()
         {
-            let pid = lock.pid as libc::pid_t;
-            let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-            if rc == 0 {
-                println!("Sent SIGTERM to master pid={pid}");
-                // Wait for master to exit.
-                let deadline = Instant::now() + timeout;
-                while Instant::now() < deadline && lock.is_alive() {
-                    std::thread::sleep(Duration::from_millis(50));
+            #[cfg(unix)]
+            {
+                let pid = lock.pid as libc::pid_t;
+                let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+                if rc == 0 {
+                    println!("Sent SIGTERM to master pid={}", lock.pid);
+                    // Wait for master to exit.
+                    let deadline = Instant::now() + timeout;
+                    while Instant::now() < deadline && lock.is_alive() {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    return 0;
                 }
-                return 0;
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("fffctl stop is not supported on this platform.");
+                return 1;
             }
         }
         // Legacy fallback: stop all per-root daemons.
@@ -591,6 +599,7 @@ fn discover_daemons() -> Vec<Daemon> {
     out
 }
 
+#[cfg(unix)]
 fn stop_daemon(d: &Daemon, timeout: Duration) -> Result<(), String> {
     let pid = d.lock.pid as libc::pid_t;
     // SAFETY: SIGTERM to a known PID. errno on failure is surfaced via the
@@ -620,4 +629,9 @@ fn stop_daemon(d: &Daemon, timeout: Duration) -> Result<(), String> {
         return Err(format!("SIGKILL failed: {err}"));
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn stop_daemon(_d: &Daemon, _timeout: Duration) -> Result<(), String> {
+    Err("daemon stop is not supported on this platform".into())
 }
