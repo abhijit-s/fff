@@ -231,6 +231,11 @@ fn ensure_master_running() -> Result<(), Box<dyn std::error::Error>> {
 
     let lockfile = master_lockfile_path();
 
+    // Ensure parent dir exists before checking or creating the lockfile.
+    if let Some(parent) = lockfile.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     // Check whether a live master holds the lockfile (slow start or another
     // spawner is in progress).
     if lockfile.exists() && !lockfile::is_stale(&lockfile) {
@@ -256,6 +261,14 @@ fn ensure_master_running() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // Remove our temp lockfile BEFORE spawning so the master process does not
+    // race with us: if the master starts before we remove the lockfile it sees
+    // our (live) PID and exits thinking another master is already running.
+    // Any concurrent fff-mcp that races into the window where no lockfile
+    // exists will simply lose the O_CREAT|O_EXCL to the real master once it
+    // creates its own lockfile, then fall through to wait_for_socket.
+    let _ = std::fs::remove_file(&lockfile);
+
     let spawn_result = Command::new(&engine_bin)
         .arg("--master")
         .stdin(std::process::Stdio::null())
@@ -263,22 +276,15 @@ fn ensure_master_running() -> Result<(), Box<dyn std::error::Error>> {
         .stderr(std::process::Stdio::null())
         .spawn();
 
-    let child = match spawn_result {
-        Ok(c) => c,
+    match spawn_result {
+        Ok(child) => tracing::info!("spawned fff-engine --master pid={}", child.id()),
         Err(e) => {
-            // Remove our lockfile immediately so other callers can retry.
-            let _ = std::fs::remove_file(&lockfile);
             return Err(format!(
                 "failed to start fff-engine --master ({}): {e}",
                 engine_bin.display()
             ).into());
         }
     };
-
-    tracing::info!("spawned fff-engine --master pid={}", child.id());
-
-    // Remove our temp lockfile so fff-engine --master can write its own PID.
-    let _ = std::fs::remove_file(&lockfile);
 
     let result = fff_ipc::wait_for_socket(&master, SPAWN_TIMEOUT).map_err(Into::into);
     if result.is_err() {
@@ -311,9 +317,15 @@ fn socket_owned_by_us(path: &Path) -> bool {
 }
 
 fn find_engine_bin() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("fff-engine")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("fff-engine"))
+    // Try sibling of current exe, then parent of that dir (handles test binaries
+    // living in target/debug/deps/ while the engine is in target/debug/).
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().skip(1).take(2) {
+            let candidate = ancestor.join("fff-engine");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("fff-engine")
 }
