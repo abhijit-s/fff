@@ -1,24 +1,38 @@
 class Fff < Formula
   desc "Fast frecency-ranked file finder MCP server for AI code assistants"
   homepage "https://github.com/abhijit-s/fff"
-  url "https://github.com/abhijit-s/fff/archive/refs/tags/v0.13.1.tar.gz"
-  sha256 "4e0f6f908634af40d9d2f09657f201599ba1df2eeed61ded223b42f48f3c3046"
+  version "0.13.1"
   license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/abhijit-s/fff/releases/download/v0.13.1/fff-aarch64-apple-darwin.tar.gz"
+      sha256 "4e0f6f908634af40d9d2f09657f201599ba1df2eeed61ded223b42f48f3c3046"
+    end
+    on_intel do
+      url "https://github.com/abhijit-s/fff/releases/download/v0.13.1/fff-x86_64-apple-darwin.tar.gz"
+      sha256 "d6bdf1b9004fe81188ff98cbd405d25365a3a4da9e28c88527d423431f5add2e"
+    end
+  end
 
   head do
     url "https://github.com/abhijit-s/fff.git", branch: "main"
+    depends_on "rust" => :build
   end
 
-  depends_on "rust" => :build
-
   def install
-    ENV["CMAKE_ARGS"] = "-DUSE_SQLITE_CREDENTIAL_CACHING=OFF"
-    system "cargo", "build", "--release", "--no-default-features",
-           "-p", "fff-engine", "-p", "fff-mcp", "-p", "fff-ctl"
-
-    bin.install "target/release/fff-mcp"
-    bin.install "target/release/fff-engine"
-    bin.install "target/release/fffctl"
+    if build.head?
+      ENV["CMAKE_ARGS"] = "-DUSE_SQLITE_CREDENTIAL_CACHING=OFF"
+      system "cargo", "build", "--release", "--no-default-features",
+             "-p", "fff-engine", "-p", "fff-mcp", "-p", "fff-ctl"
+      bin.install "target/release/fff-mcp"
+      bin.install "target/release/fff-engine"
+      bin.install "target/release/fffctl"
+    else
+      bin.install "fff-mcp"
+      bin.install "fff-engine"
+      bin.install "fffctl"
+    end
   end
 
   def caveats
