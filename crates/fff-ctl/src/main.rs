@@ -3,18 +3,21 @@
 //! Prefers the master management protocol when master is running.
 //! Falls back to legacy per-root lockfile scanning when master is absent.
 
+#[cfg(unix)]
 use std::io::{BufReader, BufWriter};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use fff_ipc::lockfile::{self, Lockfile};
 use fff_ipc::types::{MasterRequest, MasterResponse};
-use fff_ipc::{
-    master_lockfile_path, master_socket_path, read_message_sync, routing_table_path,
-    write_message_sync,
-};
+#[cfg(unix)]
+use fff_ipc::{master_socket_path, read_message_sync, write_message_sync};
+use fff_ipc::{master_lockfile_path, routing_table_path};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -539,6 +542,8 @@ fn clean_master_artifacts(dry_run: bool) -> usize {
 // Master management helpers
 
 /// Send one request to the master socket and return the response, or None if master is unreachable.
+/// Always returns None on non-Unix platforms — the master uses Unix domain sockets.
+#[cfg(unix)]
 fn master_request(req: MasterRequest) -> Option<MasterResponse> {
     let socket = master_socket_path();
     let stream = UnixStream::connect(&socket).ok()?;
@@ -553,6 +558,11 @@ fn master_request(req: MasterRequest) -> Option<MasterResponse> {
     writer.flush().ok()?;
     let resp: MasterResponse = read_message_sync(&mut reader).ok()?;
     Some(resp)
+}
+
+#[cfg(not(unix))]
+fn master_request(_req: MasterRequest) -> Option<MasterResponse> {
+    None
 }
 
 /// Convenience: list workers via master. Returns None if master is not running.
