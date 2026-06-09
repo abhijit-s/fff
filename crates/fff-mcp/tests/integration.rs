@@ -121,6 +121,17 @@ impl TestEnv {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// RAII guard that kills and reaps a `Child` on drop. Ensures master processes
+/// are always cleaned up even when test assertions panic.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Resolve the fff-engine binary from the same target dir as the test binary.
 fn engine_bin() -> PathBuf {
     std::env::current_exe()
@@ -152,7 +163,7 @@ fn wait_socket(path: &Path, timeout_ms: u64) -> bool {
 #[test]
 fn u7_1_connect_to_running_master() {
     let env = TestEnv::new();
-    let mut master = env.spawn_master();
+    let _guard = KillOnDrop(env.spawn_master());
 
     let master_sock = env.master_socket();
     assert!(
@@ -160,23 +171,15 @@ fn u7_1_connect_to_running_master() {
         "master socket did not appear in time"
     );
 
-    // Use the temp dir itself as the base_path — it exists and is canonical.
     let base_path = env.root.clone();
-    let result = env.connect_client(&base_path);
+    let client = env.connect_client(&base_path)
+        .expect("EngineClient::connect should succeed");
 
-    // Cleanup before asserting so the process is always killed.
-    let _ = master.kill();
-    let _ = master.wait();
-
-    let client = result.expect("EngineClient::connect should succeed");
-    // Worker socket must exist (master allocated one and the client connected).
+    // Assert while master (and its worker) are still running.
     let worker_sock = env.worker_socket(0);
-    assert!(
-        worker_sock.exists(),
-        "expected worker socket at {worker_sock:?}"
-    );
-    // Verify the client holds the correct base_path.
+    assert!(worker_sock.exists(), "expected worker socket at {worker_sock:?}");
     assert_eq!(client.base_path(), base_path);
+    // _guard drops here, killing master.
 }
 
 // ── U7-2 — connect spawns master when not running ────────────────────────────
@@ -344,35 +347,23 @@ fn u7_4_find_files_returns_search_results() {
 #[test]
 fn u7_5_same_base_path_returns_same_worker() {
     let env = TestEnv::new();
-    let mut master = env.spawn_master();
+    let _guard = KillOnDrop(env.spawn_master());
 
     let master_sock = env.master_socket();
-    assert!(
-        wait_socket(&master_sock, 10_000),
-        "master socket did not appear"
-    );
+    assert!(wait_socket(&master_sock, 10_000), "master socket did not appear");
 
     let base_path = env.root.clone();
-    let result1 = env.connect_client(&base_path);
-    let result2 = env.connect_client(&base_path);
+    let client1 = env.connect_client(&base_path).expect("first connect should succeed");
+    let client2 = env.connect_client(&base_path).expect("second connect should succeed");
 
-    let _ = master.kill();
-    let _ = master.wait();
-
-    let client1 = result1.expect("first connect should succeed");
-    let client2 = result2.expect("second connect should succeed");
-
-    // Both clients were routed to the same base_path, so they must carry the
-    // same base_path. The worker socket is determined by the master's routing
-    // table; with n_min=1 both should land on worker-0.
+    // Assert while master is still running.
     assert_eq!(client1.base_path(), client2.base_path());
-
-    // Verify worker-0 socket is the one that exists — both connections use it.
     let worker_sock = env.worker_socket(0);
     assert!(
         worker_sock.exists(),
         "worker-0 socket must exist after two connects for the same base_path"
     );
+    // _guard drops here, killing master.
 }
 
 // ── R2 — legacy per-root singleton fallback ──────────────────────────────────
@@ -448,34 +439,25 @@ fn r2_connect_legacy_reaches_singleton() {
 #[test]
 fn u7_6_different_base_paths_may_share_worker() {
     let env = TestEnv::new();
-    let mut master = env.spawn_master();
+    let _guard = KillOnDrop(env.spawn_master());
 
     let master_sock = env.master_socket();
-    assert!(
-        wait_socket(&master_sock, 10_000),
-        "master socket did not appear"
-    );
+    assert!(wait_socket(&master_sock, 10_000), "master socket did not appear");
 
-    // Create two distinct real directories so canonicalize succeeds.
     let root_a = env.root.join("project_a");
     let root_b = env.root.join("project_b");
     std::fs::create_dir_all(&root_a).expect("create project_a");
     std::fs::create_dir_all(&root_b).expect("create project_b");
 
-    let result_a = env.connect_client(&root_a);
-    let result_b = env.connect_client(&root_b);
+    let _client_a = env.connect_client(&root_a).expect("connect for project_a should succeed");
+    let _client_b = env.connect_client(&root_b).expect("connect for project_b should succeed");
 
-    let _ = master.kill();
-    let _ = master.wait();
-
-    let _client_a = result_a.expect("connect for project_a should succeed");
-    let _client_b = result_b.expect("connect for project_b should succeed");
-
+    // Assert while master is still running.
     // With roots_per_worker_max=2 and n_min=1, both roots fit on worker-0.
-    // Confirm that worker-0 socket exists (both clients were routed there).
     let worker_sock = env.worker_socket(0);
     assert!(
         worker_sock.exists(),
         "worker-0 socket must exist — both roots fit within roots_per_worker_max=2"
     );
+    // _guard drops here, killing master.
 }
