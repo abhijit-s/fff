@@ -169,7 +169,7 @@ pub async fn handle_list_recent_files(
             .filter(|f| {
                 !f.is_deleted()
                     && f.total_frecency_score() > 0
-                    && (!dirty_only || f.git_status.map_or(false, fff::git::is_modified_status))
+                    && (!dirty_only || f.git_status.is_some_and(fff::git::is_modified_status))
             })
             .map(|f| (f, f.total_frecency_score()))
             .collect();

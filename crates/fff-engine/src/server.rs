@@ -79,10 +79,9 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: Arc<EngineStat
                     };
                     if let Ok(guard) = frecency.read()
                         && let Some(tracker) = guard.as_ref()
+                        && let Err(e) = tracker.track_access(&abs_path)
                     {
-                        if let Err(e) = tracker.track_access(&abs_path) {
-                            tracing::warn!(?abs_path, "RecordAccess failed: {e}");
-                        }
+                        tracing::warn!(?abs_path, "RecordAccess failed: {e}");
                     }
                 });
                 // No response — fire-and-forget

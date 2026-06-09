@@ -282,10 +282,9 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
                     };
                     if let Ok(guard) = frecency.read()
                         && let Some(tracker) = guard.as_ref()
+                        && let Err(e) = tracker.track_access(&abs_path)
                     {
-                        if let Err(e) = tracker.track_access(&abs_path) {
-                            tracing::warn!(?abs_path, "RecordAccess failed: {e}");
-                        }
+                        tracing::warn!(?abs_path, "RecordAccess failed: {e}");
                     }
                 });
             }

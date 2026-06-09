@@ -332,7 +332,7 @@ fn wait_and_connect(
     timeout: Duration,
 ) -> Result<UnixStream, Box<dyn std::error::Error>> {
     fff_ipc::wait_for_socket(path, timeout)
-        .map_err(|e| format!("{e}").into())
+        .map_err(|e| e.into())
         .and_then(|()| {
             UnixStream::connect(path).map_err(|e| {
                 format!("failed to connect to worker socket {}: {e}", path.display()).into()
