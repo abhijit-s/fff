@@ -6,10 +6,12 @@ pub mod routing;
 pub mod types;
 
 pub use codec::{read_message, read_message_sync, write_message, write_message_sync};
+#[cfg(unix)]
+pub use paths::wait_for_socket;
 pub use paths::{
     base_path_slug, lockfile_path, log_path, master_lockfile_path, master_socket_path,
-    routing_table_path, socket_path, wait_for_socket, worker_lockfile_path, worker_socket_path,
-    xdg_cache_dir, xdg_data_dir, xdg_runtime_dir,
+    routing_table_path, socket_path, worker_lockfile_path, worker_socket_path, xdg_cache_dir,
+    xdg_data_dir, xdg_runtime_dir,
 };
 pub use routing::{RoutingTable, SerializableRing, WorkerEntry};
 pub use types::*;

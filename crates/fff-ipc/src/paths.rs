@@ -80,10 +80,10 @@ pub fn routing_table_path() -> PathBuf {
 
 /// XDG runtime directory: `$XDG_RUNTIME_DIR` → falls back to `xdg_cache_dir()` on macOS.
 pub fn xdg_runtime_dir() -> PathBuf {
-    if let Ok(v) = std::env::var("XDG_RUNTIME_DIR") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
+    if let Ok(v) = std::env::var("XDG_RUNTIME_DIR")
+        && !v.is_empty()
+    {
+        return PathBuf::from(v);
     }
     xdg_cache_dir()
 }
@@ -94,10 +94,10 @@ pub fn xdg_runtime_dir() -> PathBuf {
 /// `~/Library/Caches`. All fff cache artefacts (sockets, lockfiles, logs)
 /// land here so they are consistent and easy to inspect on any platform.
 pub fn xdg_cache_dir() -> PathBuf {
-    if let Ok(v) = std::env::var("XDG_CACHE_HOME") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
+    if let Ok(v) = std::env::var("XDG_CACHE_HOME")
+        && !v.is_empty()
+    {
+        return PathBuf::from(v);
     }
     // XDG spec default
     if let Some(home) = dirs::home_dir() {
@@ -109,10 +109,10 @@ pub fn xdg_cache_dir() -> PathBuf {
 
 /// XDG data directory: `$XDG_DATA_HOME` → `$HOME/.local/share` → `dirs::data_dir()` → `/tmp`.
 pub fn xdg_data_dir() -> PathBuf {
-    if let Ok(v) = std::env::var("XDG_DATA_HOME") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
+    if let Ok(v) = std::env::var("XDG_DATA_HOME")
+        && !v.is_empty()
+    {
+        return PathBuf::from(v);
     }
     if let Some(home) = dirs::home_dir() {
         return home.join(".local").join("share");

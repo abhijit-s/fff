@@ -67,6 +67,7 @@ impl EngineClient {
     }
 
     /// The base path this client is connected to.
+    #[allow(dead_code)]
     pub fn base_path(&self) -> &std::path::Path {
         &self.base_path
     }
