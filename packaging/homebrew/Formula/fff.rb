@@ -2,7 +2,7 @@ class Fff < Formula
   desc "Fast frecency-ranked file finder MCP server for AI code assistants"
   homepage "https://github.com/abhijit-s/fff"
   url "https://github.com/abhijit-s/fff/archive/refs/tags/v0.13.1.tar.gz"
-  sha256 "d9791790ff65888faa432c9715c9e81c6b24ada5bb159baf7157c6e287474edf"
+  sha256 "4e0f6f908634af40d9d2f09657f201599ba1df2eeed61ded223b42f48f3c3046"
   license "MIT"
 
   head do
