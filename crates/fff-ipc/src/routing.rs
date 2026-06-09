@@ -64,7 +64,10 @@ impl WorkerEntry {
         if self.roots.is_empty() && !self.legacy_root_slugs.is_empty() {
             self.roots = std::mem::take(&mut self.legacy_root_slugs)
                 .into_iter()
-                .map(|slug| RootEntry { slug, base_path: String::new() })
+                .map(|slug| RootEntry {
+                    slug,
+                    base_path: String::new(),
+                })
                 .collect();
         } else {
             self.legacy_root_slugs.clear();
@@ -131,11 +134,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_entry(index: u32, slugs: &[&str]) -> WorkerEntry {
-        let mut e = WorkerEntry::new(
-            index,
-            format!("worker-{index}.sock"),
-            1000 + index,
-        );
+        let mut e = WorkerEntry::new(index, format!("worker-{index}.sock"), 1000 + index);
         for s in slugs {
             e.push_root((*s).to_string(), format!("/test/{s}"));
         }
@@ -225,7 +224,10 @@ mod tests {
         rt.workers.insert(0, entry);
 
         let json = serde_json::to_string(&rt).unwrap();
-        assert!(!json.contains("root_slugs"), "legacy key must not be written");
+        assert!(
+            !json.contains("root_slugs"),
+            "legacy key must not be written"
+        );
 
         let rt2: RoutingTable = serde_json::from_str(&json).unwrap();
         assert_eq!(rt2.workers[&0].roots[0].base_path, "/a");
@@ -253,7 +255,10 @@ mod tests {
         let entry = &rt.workers[&0];
         assert_eq!(entry.roots.len(), 2);
         assert_eq!(entry.roots[0].slug, "legacyslug1");
-        assert_eq!(entry.roots[0].base_path, "", "legacy entries hydrate with empty base_path");
+        assert_eq!(
+            entry.roots[0].base_path, "",
+            "legacy entries hydrate with empty base_path"
+        );
         assert_eq!(entry.roots[1].slug, "legacyslug2");
     }
 
