@@ -15,9 +15,9 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use fff_ipc::lockfile::{self, Lockfile};
 use fff_ipc::types::{MasterRequest, MasterResponse};
+use fff_ipc::{master_lockfile_path, master_socket_path, routing_table_path};
 #[cfg(unix)]
-use fff_ipc::{master_socket_path, read_message_sync, write_message_sync};
-use fff_ipc::{master_lockfile_path, routing_table_path};
+use fff_ipc::{read_message_sync, write_message_sync};
 
 #[derive(Parser, Debug)]
 #[command(
