@@ -1,42 +1,24 @@
 class Fff < Formula
   desc "Fast frecency-ranked file finder MCP server for AI code assistants"
   homepage "https://github.com/abhijit-s/fff"
-  version "0.13.0"
+  url "https://github.com/abhijit-s/fff/archive/refs/tags/v0.13.1.tar.gz"
+  sha256 "d9791790ff65888faa432c9715c9e81c6b24ada5bb159baf7157c6e287474edf"
   license "MIT"
 
-  # Pre-built binaries — no Rust/LLVM dependency.
-  on_macos do
-    on_arm do
-      url "https://github.com/abhijit-s/fff/releases/download/v0.13.0/fff-aarch64-apple-darwin.tar.gz"
-      sha256 "PLACEHOLDER_ARM64"
-    end
-    on_intel do
-      url "https://github.com/abhijit-s/fff/releases/download/v0.13.0/fff-x86_64-apple-darwin.tar.gz"
-      sha256 "PLACEHOLDER_X86_64"
-    end
-  end
-
-  # HEAD: build from source (requires Rust via rustup or brew)
   head do
     url "https://github.com/abhijit-s/fff.git", branch: "main"
-    depends_on "rust" => :build
   end
 
+  depends_on "rust" => :build
+
   def install
-    if build.head?
-      ENV["CMAKE_ARGS"] = "-DUSE_SQLITE_CREDENTIAL_CACHING=OFF"
-      system "cargo", "build", "--release", "--no-default-features",
-             "-p", "fff-engine", "-p", "fff-mcp", "-p", "fff-ctl"
-      bin.install "target/release/fff-mcp"
-      bin.install "target/release/fff-engine"
-      bin.install "target/release/fffctl"
-    else
-      # fff-mcp locates fff-engine via current_exe().parent() at runtime,
-      # so all three must live in the same directory.
-      bin.install "fff-mcp"
-      bin.install "fff-engine"
-      bin.install "fffctl"
-    end
+    ENV["CMAKE_ARGS"] = "-DUSE_SQLITE_CREDENTIAL_CACHING=OFF"
+    system "cargo", "build", "--release", "--no-default-features",
+           "-p", "fff-engine", "-p", "fff-mcp", "-p", "fff-ctl"
+
+    bin.install "target/release/fff-mcp"
+    bin.install "target/release/fff-engine"
+    bin.install "target/release/fffctl"
   end
 
   def caveats
