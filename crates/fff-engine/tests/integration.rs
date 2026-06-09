@@ -536,15 +536,9 @@ fn u4_startup_skips_dead_pid_in_routing_json() {
     let dead_pid: u32 = 999_999_999;
     let dead_sock = env.worker_socket(99).to_string_lossy().into_owned();
     let mut table = RoutingTable::default();
-    table.workers.insert(
-        99,
-        WorkerEntry {
-            index: 99,
-            socket_path: dead_sock,
-            pid: dead_pid,
-            root_slugs: vec!["some-slug".into()],
-        },
-    );
+    let mut entry = WorkerEntry::new(99, dead_sock, dead_pid);
+    entry.push_root("some-slug".into(), "/test/proj".into());
+    table.workers.insert(99, entry);
     table.save(&env.routing_json()).expect("save routing.json");
 
     // Start master — it should discard the dead-PID entry and start fresh workers.
@@ -725,7 +719,7 @@ fn u5_routing_json_persisted_after_each_handshake() {
 
     let table1 =
         RoutingTable::load(&env.routing_json()).expect("load routing.json after first handshake");
-    let total_slugs1: usize = table1.workers.values().map(|e| e.root_slugs.len()).sum();
+    let total_slugs1: usize = table1.workers.values().map(|e| e.roots.len()).sum();
     assert!(
         total_slugs1 >= 1,
         "routing.json should have at least 1 slug after first Handshake"
@@ -736,7 +730,7 @@ fn u5_routing_json_persisted_after_each_handshake() {
 
     let table2 =
         RoutingTable::load(&env.routing_json()).expect("load routing.json after second handshake");
-    let total_slugs2: usize = table2.workers.values().map(|e| e.root_slugs.len()).sum();
+    let total_slugs2: usize = table2.workers.values().map(|e| e.roots.len()).sum();
     assert!(
         total_slugs2 >= total_slugs1,
         "routing.json should gain a new slug entry after second Handshake"
@@ -810,24 +804,16 @@ fn u6_startup_reconnects_live_discards_dead() {
     std::fs::create_dir_all(&routing_dir).unwrap();
 
     let mut table = RoutingTable::default();
-    table.workers.insert(
-        5,
-        WorkerEntry {
-            index: 5,
-            socket_path: live_sock,
-            pid: live_pid,
-            root_slugs: vec![],
-        },
-    );
-    table.workers.insert(
+    table
+        .workers
+        .insert(5, WorkerEntry::new(5, live_sock, live_pid));
+    let mut stale_entry = WorkerEntry::new(
         99,
-        WorkerEntry {
-            index: 99,
-            socket_path: env.worker_socket(99).to_string_lossy().into_owned(),
-            pid: dead_pid,
-            root_slugs: vec!["stale-slug".into()],
-        },
+        env.worker_socket(99).to_string_lossy().into_owned(),
+        dead_pid,
     );
+    stale_entry.push_root("stale-slug".into(), "/test/stale".into());
+    table.workers.insert(99, stale_entry);
     table.save(&env.routing_json()).unwrap();
 
     // Start master — it should adopt worker-5 and discard worker-99.
