@@ -55,7 +55,7 @@ pub fn read(path: &Path) -> Option<Lockfile> {
     Some(Lockfile { pid, base_path })
 }
 
-/// Returns true when the lockfile is missing, unparseable, or owned by a
+/// Returns true when the lockfile is missing, unparsable, or owned by a
 /// dead PID. Live daemons return false. Used to decide whether a stale
 /// lockfile can be safely removed before a fresh acquire.
 pub fn is_stale(path: &Path) -> bool {
@@ -104,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_file_is_stale() {
+    fn unparsable_file_is_stale() {
         let dir = tmp();
         let path = dir.path().join("garbage.lock");
         std::fs::write(&path, "not a pid").unwrap();
