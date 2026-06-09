@@ -99,7 +99,7 @@ fn cmd_list() -> i32 {
         let master_lock = master_lockfile_path();
         let master_pid = lockfile::read(&master_lock).map(|l| l.pid).unwrap_or(0);
         println!("master PID: {master_pid}  workers: {}", workers.len());
-        println!("{:<6}  {:<7}  {:<8}  {}", "INDEX", "PID", "ROOTS", "SOCKET");
+        println!("{:<6}  {:<7}  {:<8}  SOCKET", "INDEX", "PID", "ROOTS");
         for w in &workers {
             println!(
                 "{:<6}  {:<7}  {:<8}  {}",
@@ -283,19 +283,19 @@ fn cmd_stop(base_path: Option<&Path>, all: bool, timeout: Duration) -> i32 {
     if all {
         // Prefer stopping via master (propagates SIGTERM to all workers).
         let master_lock = master_lockfile_path();
-        if let Some(lock) = lockfile::read(&master_lock) {
-            if lock.is_alive() {
-                let pid = lock.pid as libc::pid_t;
-                let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-                if rc == 0 {
-                    println!("Sent SIGTERM to master pid={pid}");
-                    // Wait for master to exit.
-                    let deadline = Instant::now() + timeout;
-                    while Instant::now() < deadline && lock.is_alive() {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    return 0;
+        if let Some(lock) = lockfile::read(&master_lock)
+            && lock.is_alive()
+        {
+            let pid = lock.pid as libc::pid_t;
+            let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+            if rc == 0 {
+                println!("Sent SIGTERM to master pid={pid}");
+                // Wait for master to exit.
+                let deadline = Instant::now() + timeout;
+                while Instant::now() < deadline && lock.is_alive() {
+                    std::thread::sleep(Duration::from_millis(50));
                 }
+                return 0;
             }
         }
         // Legacy fallback: stop all per-root daemons.
@@ -331,13 +331,12 @@ fn cmd_stop(base_path: Option<&Path>, all: bool, timeout: Duration) -> i32 {
         let ring_index = master_request(MasterRequest::RouteInfo {
             base_path: bp.to_string_lossy().into(),
         });
-        if let Some(MasterResponse::WorkerInfo(info)) = ring_index {
-            if let Some(MasterResponse::Ack) =
+        if let Some(MasterResponse::WorkerInfo(info)) = ring_index
+            && let Some(MasterResponse::Ack) =
                 master_request(MasterRequest::StopWorker { index: info.index })
-            {
-                println!("Stopped worker-{} for {}", info.index, bp.display());
-                return 0;
-            }
+        {
+            println!("Stopped worker-{} for {}", info.index, bp.display());
+            return 0;
         }
 
         // Legacy fallback.

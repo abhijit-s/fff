@@ -2,6 +2,7 @@
 //!
 //! Each test runs in an isolated XDG environment so paths never collide.
 //! Tests spawn fff-engine in master mode and drive fffctl commands against it.
+#![cfg(unix)]
 
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};

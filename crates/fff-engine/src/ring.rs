@@ -56,6 +56,7 @@ impl HashRing {
     }
 
     // Unique worker indices currently in the ring.
+    #[allow(dead_code)]
     pub(crate) fn workers(&self) -> Vec<u32> {
         let mut seen = Vec::new();
         for &(_, w) in &self.nodes {
@@ -67,6 +68,7 @@ impl HashRing {
     }
 
     // Total virtual node count (not unique workers).
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.nodes.len()
     }
