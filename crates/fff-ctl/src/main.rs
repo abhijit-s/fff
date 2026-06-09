@@ -111,6 +111,14 @@ fn cmd_list() -> i32 {
                 w.root_count(),
                 w.socket_path
             );
+            for root in &w.roots {
+                let path_display = if root.base_path.is_empty() {
+                    "<unknown>"
+                } else {
+                    root.base_path.as_str()
+                };
+                println!("       {path_display}  (slug: {})", root.slug);
+            }
         }
         return 0;
     }
