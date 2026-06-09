@@ -456,10 +456,10 @@ impl FffServer {
         output_mode: OutputMode,
         context: Option<usize>,
     ) -> Option<Result<CallToolResult, ErrorData>> {
+        use crate::output::wire::WireGrepFormatter;
         use fff::grep::has_regex_metacharacters;
         use fff::{AiGrepConfig, QueryParser};
         use fff_ipc::types::{GrepOptions, SearchRequest, SearchResponse, WireGrepMode};
-        use crate::output::wire::WireGrepFormatter;
 
         let client_arc = self.engine_client.as_ref()?;
         let base_path = self.engine_base_path.as_deref()?;
@@ -468,14 +468,19 @@ impl FffServer {
             .and_then(|id| self.cursor_store.lock().ok()?.get(id))
             .unwrap_or(0);
 
-        let (options_core, auto_expand) = make_grep_options(output_mode, {
-            let parsed = QueryParser::new(AiGrepConfig).parse(query);
-            if has_regex_metacharacters(&parsed.grep_text()) {
-                GrepMode::Regex
-            } else {
-                GrepMode::PlainText
-            }
-        }, file_offset, context);
+        let (options_core, auto_expand) = make_grep_options(
+            output_mode,
+            {
+                let parsed = QueryParser::new(AiGrepConfig).parse(query);
+                if has_regex_metacharacters(&parsed.grep_text()) {
+                    GrepMode::Regex
+                } else {
+                    GrepMode::PlainText
+                }
+            },
+            file_offset,
+            context,
+        );
 
         let ctx_lines = options_core.before_context;
         let wire_mode = match options_core.mode {
@@ -501,12 +506,17 @@ impl FffServer {
             },
         };
 
-        let response = client_arc.lock().ok()?.search_with_recovery(&req, base_path);
+        let response = client_arc
+            .lock()
+            .ok()?
+            .search_with_recovery(&req, base_path);
 
         match response {
             SearchResponse::GrepResults(wire) => {
                 if wire.matches.is_empty() {
-                    return Some(Ok(CallToolResult::success(vec![Content::text("0 matches.")])));
+                    return Some(Ok(CallToolResult::success(vec![Content::text(
+                        "0 matches.",
+                    )])));
                 }
                 let mut cs = self.lock_cursors().ok()?;
                 let text = WireGrepFormatter {
@@ -519,9 +529,10 @@ impl FffServer {
                 .format(&mut cs);
                 Some(Ok(CallToolResult::success(vec![Content::text(text)])))
             }
-            SearchResponse::Error(msg) => {
-                Some(Err(ErrorData::internal_error(format!("fff-engine error: {msg}"), None)))
-            }
+            SearchResponse::Error(msg) => Some(Err(ErrorData::internal_error(
+                format!("fff-engine error: {msg}"),
+                None,
+            ))),
             _ => None,
         }
     }
@@ -533,8 +544,8 @@ impl FffServer {
         max_results: usize,
         cursor_id: Option<&str>,
     ) -> Option<Result<CallToolResult, ErrorData>> {
-        use fff_ipc::types::{FindOptions, SearchRequest, SearchResponse};
         use crate::output::wire::format_wire_find_files;
+        use fff_ipc::types::{FindOptions, SearchRequest, SearchResponse};
 
         let client_arc = self.engine_client.as_ref()?;
         let base_path = self.engine_base_path.as_deref()?;
@@ -555,30 +566,33 @@ impl FffServer {
             },
         };
 
-        let response = client_arc.lock().ok()?.search_with_recovery(&req, base_path);
+        let response = client_arc
+            .lock()
+            .ok()?
+            .search_with_recovery(&req, base_path);
 
         match response {
             SearchResponse::SearchResults(items) => {
                 if items.is_empty() {
-                    return Some(Ok(CallToolResult::success(vec![Content::text("0 results")])));
+                    return Some(Ok(CallToolResult::success(vec![Content::text(
+                        "0 results",
+                    )])));
                 }
                 let total_matched = items.len(); // wire doesn't carry total yet
                 let mut cs = self.lock_cursors().ok()?;
                 let text = format_wire_find_files(&items, total_matched, page_offset, &mut cs);
                 Some(Ok(CallToolResult::success(vec![Content::text(text)])))
             }
-            SearchResponse::Error(msg) => {
-                Some(Err(ErrorData::internal_error(format!("fff-engine error: {msg}"), None)))
-            }
+            SearchResponse::Error(msg) => Some(Err(ErrorData::internal_error(
+                format!("fff-engine error: {msg}"),
+                None,
+            ))),
             _ => None,
         }
     }
 
     #[cfg(unix)]
-    fn proxy_record_access(
-        &self,
-        path: &str,
-    ) -> Option<Result<CallToolResult, ErrorData>> {
+    fn proxy_record_access(&self, path: &str) -> Option<Result<CallToolResult, ErrorData>> {
         let client_arc = self.engine_client.as_ref()?;
         if let Ok(mut client) = client_arc.lock() {
             client.record_access(path);
@@ -597,7 +611,10 @@ impl FffServer {
         let client_arc = self.engine_client.as_ref()?;
         let base_path = self.engine_base_path.as_deref()?;
         let req = SearchRequest::ListRecentFiles { limit, dirty_only };
-        let response = client_arc.lock().ok()?.search_with_recovery(&req, base_path);
+        let response = client_arc
+            .lock()
+            .ok()?
+            .search_with_recovery(&req, base_path);
 
         match response {
             SearchResponse::RecentFiles(items) => {
@@ -627,7 +644,10 @@ impl FffServer {
         let client_arc = self.engine_client.as_ref()?;
         let base_path = self.engine_base_path.as_deref()?;
         let req = SearchRequest::GetGitStatus { include_clean };
-        let response = client_arc.lock().ok()?.search_with_recovery(&req, base_path);
+        let response = client_arc
+            .lock()
+            .ok()?
+            .search_with_recovery(&req, base_path);
 
         match response {
             SearchResponse::GitStatus(items) => {
@@ -648,16 +668,16 @@ impl FffServer {
     }
 
     #[cfg(unix)]
-    fn proxy_list_directories(
-        &self,
-        limit: usize,
-    ) -> Option<Result<CallToolResult, ErrorData>> {
+    fn proxy_list_directories(&self, limit: usize) -> Option<Result<CallToolResult, ErrorData>> {
         use fff_ipc::types::{SearchRequest, SearchResponse};
 
         let client_arc = self.engine_client.as_ref()?;
         let base_path = self.engine_base_path.as_deref()?;
         let req = SearchRequest::ListDirectories { limit };
-        let response = client_arc.lock().ok()?.search_with_recovery(&req, base_path);
+        let response = client_arc
+            .lock()
+            .ok()?
+            .search_with_recovery(&req, base_path);
 
         match response {
             SearchResponse::Directories(items) => {
@@ -683,8 +703,8 @@ impl FffServer {
         params: &MultiGrepParams,
         max_results: usize,
     ) -> Option<Result<CallToolResult, ErrorData>> {
-        use fff_ipc::types::{GrepOptions, SearchRequest, SearchResponse, WireGrepMode};
         use crate::output::wire::WireGrepFormatter;
+        use fff_ipc::types::{GrepOptions, SearchRequest, SearchResponse, WireGrepMode};
 
         let client_arc = self.engine_client.as_ref()?;
         let base_path = self.engine_base_path.as_deref()?;
@@ -719,12 +739,17 @@ impl FffServer {
             },
         };
 
-        let response = client_arc.lock().ok()?.search_with_recovery(&req, base_path);
+        let response = client_arc
+            .lock()
+            .ok()?
+            .search_with_recovery(&req, base_path);
 
         match response {
             SearchResponse::GrepResults(wire) => {
                 if wire.matches.is_empty() {
-                    return Some(Ok(CallToolResult::success(vec![Content::text("0 matches.")])));
+                    return Some(Ok(CallToolResult::success(vec![Content::text(
+                        "0 matches.",
+                    )])));
                 }
                 let mut cs = self.lock_cursors().ok()?;
                 let text = WireGrepFormatter {
@@ -737,9 +762,10 @@ impl FffServer {
                 .format(&mut cs);
                 Some(Ok(CallToolResult::success(vec![Content::text(text)])))
             }
-            SearchResponse::Error(msg) => {
-                Some(Err(ErrorData::internal_error(format!("fff-engine error: {msg}"), None)))
-            }
+            SearchResponse::Error(msg) => Some(Err(ErrorData::internal_error(
+                format!("fff-engine error: {msg}"),
+                None,
+            ))),
             _ => None,
         }
     }
@@ -961,10 +987,7 @@ impl FffServer {
                 path.to_path_buf()
             } else {
                 let guard = self.picker.read().map_err(|e| {
-                    ErrorData::internal_error(
-                        format!("Failed to acquire picker lock: {e}"),
-                        None,
-                    )
+                    ErrorData::internal_error(format!("Failed to acquire picker lock: {e}"), None)
                 })?;
                 let picker = guard.as_ref().ok_or_else(|| {
                     ErrorData::internal_error("File picker not initialized", None)
@@ -1280,7 +1303,11 @@ fn format_recent_files_wire(items: &[fff_ipc::types::WireSearchResult]) -> Strin
         .iter()
         .map(|item| {
             let git_status = item.git_status.map(git2::Status::from_bits_truncate);
-            format!("{}{}", item.path, file_suffix(git_status, item.frecency_score))
+            format!(
+                "{}{}",
+                item.path,
+                file_suffix(git_status, item.frecency_score)
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1303,7 +1330,10 @@ fn format_git_status_wire(items: &[fff_ipc::types::WireGitFile]) -> String {
 
     let mut groups: HashMap<&str, Vec<&str>> = HashMap::new();
     for item in items {
-        groups.entry(item.status.as_str()).or_default().push(item.path.as_str());
+        groups
+            .entry(item.status.as_str())
+            .or_default()
+            .push(item.path.as_str());
     }
 
     let mut lines: Vec<String> = Vec::new();

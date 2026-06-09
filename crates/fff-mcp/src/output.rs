@@ -548,11 +548,11 @@ pub mod wire {
     use fff::grep::is_import_line;
     use fff_ipc::types::{WireGrepResponse, WireSearchResult};
 
-    use crate::cursor::CursorStore;
     use super::{
-        OutputMode, MAX_DEF_EXPAND, MAX_DEF_EXPAND_FIRST, MAX_FIRST_MATCH_EXPAND, MAX_LINE_LEN,
-        MAX_PREVIEW, file_suffix, size_tag, trauncate_line_for_ai,
+        MAX_DEF_EXPAND, MAX_DEF_EXPAND_FIRST, MAX_FIRST_MATCH_EXPAND, MAX_LINE_LEN, MAX_PREVIEW,
+        OutputMode, file_suffix, size_tag, trauncate_line_for_ai,
     };
+    use crate::cursor::CursorStore;
 
     pub struct WireGrepFormatter<'a> {
         pub response: &'a WireGrepResponse,
@@ -589,7 +589,12 @@ pub mod wire {
             }
 
             if self.output_mode == OutputMode::Count {
-                return format_wire_count(items, &self.response.matches, self.response.next_file_offset, cursor_store);
+                return format_wire_count(
+                    items,
+                    &self.response.matches,
+                    self.response.next_file_offset,
+                    cursor_store,
+                );
             }
 
             let unique_files = {
@@ -600,13 +605,14 @@ pub mod wire {
                 seen.len()
             };
 
-            let max_output_chars: usize = if self.output_mode == OutputMode::Usage || unique_files <= 3 {
-                5000
-            } else if unique_files <= 8 {
-                3500
-            } else {
-                2500
-            };
+            let max_output_chars: usize =
+                if self.output_mode == OutputMode::Usage || unique_files <= 3 {
+                    5000
+                } else if unique_files <= 8 {
+                    3500
+                } else {
+                    2500
+                };
 
             let file_preview = collect_wire_file_preview(items, &self.response.matches);
             let mut content_def_file = String::new();
@@ -650,7 +656,13 @@ pub mod wire {
             let sorted_items: Vec<usize> = if self.auto_expand_defs {
                 let mut indices: Vec<usize> = (0..items.len()).collect();
                 indices.sort_unstable_by_key(|&i| {
-                    if items[i].1.is_definition { 0 } else if is_import_line(&items[i].1.line_text) { 2 } else { 1 }
+                    if items[i].1.is_definition {
+                        0
+                    } else if is_import_line(&items[i].1.line_text) {
+                        2
+                    } else {
+                        1
+                    }
                 });
                 indices
             } else {
@@ -667,38 +679,68 @@ pub mod wire {
                     match_lines.push(current_file.clone());
                 }
 
-                if self.auto_expand_defs && is_import_line(&m.line_text) && !def_expanded_files.is_empty() {
+                if self.auto_expand_defs
+                    && is_import_line(&m.line_text)
+                    && !def_expanded_files.is_empty()
+                {
                     continue;
                 }
 
                 if self.show_context && !m.context_before.is_empty() {
                     let start_line = m.line_number.saturating_sub(m.context_before.len() as u64);
                     for (i, ctx) in m.context_before.iter().enumerate() {
-                        match_lines.push(format!(" {}-{}", start_line + i as u64, trauncate_line_for_ai(ctx, None, MAX_LINE_LEN)));
+                        match_lines.push(format!(
+                            " {}-{}",
+                            start_line + i as u64,
+                            trauncate_line_for_ai(ctx, None, MAX_LINE_LEN)
+                        ));
                     }
                 }
 
                 match_lines.push(format!(
                     " {}: {}",
                     m.line_number,
-                    trauncate_line_for_ai(&m.line_text, Some(m.match_byte_offsets.as_ref()), MAX_LINE_LEN)
+                    trauncate_line_for_ai(
+                        &m.line_text,
+                        Some(m.match_byte_offsets.as_ref()),
+                        MAX_LINE_LEN
+                    )
                 ));
 
                 if self.show_context && !m.context_after.is_empty() {
                     let start_line = m.line_number + 1;
                     for (i, ctx) in m.context_after.iter().enumerate() {
-                        match_lines.push(format!(" {}-{}", start_line + i as u64, trauncate_line_for_ai(ctx, None, MAX_LINE_LEN)));
+                        match_lines.push(format!(
+                            " {}-{}",
+                            start_line + i as u64,
+                            trauncate_line_for_ai(ctx, None, MAX_LINE_LEN)
+                        ));
                     }
                     match_lines.push("--".to_string());
                 }
 
-                if self.auto_expand_defs && !self.show_context && m.is_definition && !m.context_after.is_empty() && !def_expanded_files.contains(&file.path) {
-                    let expand_limit = if def_expanded_files.is_empty() { MAX_DEF_EXPAND_FIRST } else { MAX_DEF_EXPAND };
+                if self.auto_expand_defs
+                    && !self.show_context
+                    && m.is_definition
+                    && !m.context_after.is_empty()
+                    && !def_expanded_files.contains(&file.path)
+                {
+                    let expand_limit = if def_expanded_files.is_empty() {
+                        MAX_DEF_EXPAND_FIRST
+                    } else {
+                        MAX_DEF_EXPAND
+                    };
                     def_expanded_files.insert(file.path.clone());
                     let start_line = m.line_number + 1;
                     for (i, ctx) in m.context_after.iter().take(expand_limit).enumerate() {
-                        if ctx.trim().is_empty() { break; }
-                        match_lines.push(format!("  {}| {}", start_line + i as u64, trauncate_line_for_ai(ctx, None, MAX_LINE_LEN)));
+                        if ctx.trim().is_empty() {
+                            break;
+                        }
+                        match_lines.push(format!(
+                            "  {}| {}",
+                            start_line + i as u64,
+                            trauncate_line_for_ai(ctx, None, MAX_LINE_LEN)
+                        ));
                     }
                 }
 
@@ -767,16 +809,33 @@ pub mod wire {
         let mut first_def = String::new();
         let mut first_file = String::new();
         for fm in &file_map {
-            if first_file.is_empty() { first_file = fm.path.to_owned(); }
-            if first_def.is_empty() && fm.is_definition { first_def = fm.path.to_owned(); }
+            if first_file.is_empty() {
+                first_file = fm.path.to_owned();
+            }
+            if first_def.is_empty() && fm.is_definition {
+                first_def = fm.path.to_owned();
+            }
         }
-        let suggest = if !first_def.is_empty() { &first_def } else { &first_file };
+        let suggest = if !first_def.is_empty() {
+            &first_def
+        } else {
+            &first_file
+        };
         if !suggest.is_empty() {
-            if file_count == 1 { lines.push(format!("→ Read {} (only match — no need to search further)", suggest)); }
-            else if !first_def.is_empty() && file_count <= 5 { lines.push(format!("→ Read {} (definition found)", suggest)); }
-            else if !first_def.is_empty() { lines.push(format!("→ Read {} (definition)", suggest)); }
-            else if file_count <= 3 { lines.push(format!("→ Read {} (best match)", suggest)); }
-            else { lines.push(format!("→ Read {}", suggest)); }
+            if file_count == 1 {
+                lines.push(format!(
+                    "→ Read {} (only match — no need to search further)",
+                    suggest
+                ));
+            } else if !first_def.is_empty() && file_count <= 5 {
+                lines.push(format!("→ Read {} (definition found)", suggest));
+            } else if !first_def.is_empty() {
+                lines.push(format!("→ Read {} (definition)", suggest));
+            } else if file_count <= 3 {
+                lines.push(format!("→ Read {} (best match)", suggest));
+            } else {
+                lines.push(format!("→ Read {}", suggest));
+            }
         }
 
         let is_small_set = file_count <= 5;
@@ -785,21 +844,43 @@ pub mod wire {
             let def_tag = if fm.is_definition { " [def]" } else { "" };
             lines.push(format!("{}{}{}", fm.path, def_tag, size_tag(fm.size)));
             let expand_limit = if fm.is_definition {
-                let lim = if def_count == 0 { MAX_DEF_EXPAND_FIRST } else { MAX_DEF_EXPAND };
+                let lim = if def_count == 0 {
+                    MAX_DEF_EXPAND_FIRST
+                } else {
+                    MAX_DEF_EXPAND
+                };
                 def_count += 1;
                 lim
-            } else if is_small_set && file_idx == 0 { MAX_FIRST_MATCH_EXPAND }
-            else if is_small_set { MAX_DEF_EXPAND }
-            else { 0 };
+            } else if is_small_set && file_idx == 0 {
+                MAX_FIRST_MATCH_EXPAND
+            } else if is_small_set {
+                MAX_DEF_EXPAND
+            } else {
+                0
+            };
 
             if !fm.line_text.is_empty() && (fm.is_definition || file_idx == 0 || is_small_set) {
-                let ranges_ref: Option<&[(u32, u32)]> = if fm.match_ranges.is_empty() { None } else { Some(&fm.match_ranges) };
-                lines.push(format!("  {}: {}", fm.line_number, trauncate_line_for_ai(&fm.line_text, ranges_ref, MAX_PREVIEW)));
+                let ranges_ref: Option<&[(u32, u32)]> = if fm.match_ranges.is_empty() {
+                    None
+                } else {
+                    Some(&fm.match_ranges)
+                };
+                lines.push(format!(
+                    "  {}: {}",
+                    fm.line_number,
+                    trauncate_line_for_ai(&fm.line_text, ranges_ref, MAX_PREVIEW)
+                ));
                 if auto_expand_defs && !fm.context_after.is_empty() && expand_limit > 0 {
                     let start = fm.line_number + 1;
                     for (i, ctx) in fm.context_after.iter().take(expand_limit).enumerate() {
-                        if ctx.trim().is_empty() { break; }
-                        lines.push(format!("  {}| {}", start + i as u64, trauncate_line_for_ai(ctx, None, MAX_PREVIEW)));
+                        if ctx.trim().is_empty() {
+                            break;
+                        }
+                        lines.push(format!(
+                            "  {}| {}",
+                            start + i as u64,
+                            trauncate_line_for_ai(ctx, None, MAX_PREVIEW)
+                        ));
                     }
                 }
             }
@@ -822,10 +903,16 @@ pub mod wire {
         let mut order: Vec<&str> = Vec::new();
         for (fi, _) in items {
             let path = files[*fi].path.as_str();
-            let count = counts.entry(path).or_insert_with(|| { order.push(path); 0 });
+            let count = counts.entry(path).or_insert_with(|| {
+                order.push(path);
+                0
+            });
             *count += 1;
         }
-        let mut lines: Vec<String> = order.iter().map(|p| format!("{}: {}", p, counts[p])).collect();
+        let mut lines: Vec<String> = order
+            .iter()
+            .map(|p| format!("{}: {}", p, counts[p]))
+            .collect();
         if next_file_offset > 0 {
             let cursor_id = cursor_store.store(next_file_offset);
             lines.push(format!("\ncursor: {}", cursor_id));

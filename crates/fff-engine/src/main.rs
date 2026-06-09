@@ -77,7 +77,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Master mode ───────────────────────────────────────────────────────────
     if args.master {
         let log_path_str = cfg.log.file.clone().unwrap_or_else(|| {
-            fff_ipc::xdg_cache_dir().join("fff").join("master.log").to_string_lossy().into()
+            fff_ipc::xdg_cache_dir()
+                .join("fff")
+                .join("master.log")
+                .to_string_lossy()
+                .into()
         });
         if let Err(e) = fff::log::init_tracing(&log_path_str, Some("info")) {
             eprintln!("Warning: failed to init tracing: {e}");
@@ -103,7 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Singleton mode (legacy / direct invocation) ───────────────────────────
-    let base_path = args.base_path.ok_or("--base-path is required in singleton mode")?;
+    let base_path = args
+        .base_path
+        .ok_or("--base-path is required in singleton mode")?;
 
     let default_log = fff_ipc::log_path(&base_path);
     let default_log_str = default_log.to_string_lossy().into_owned();
@@ -126,9 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let effective_args = state::EffectiveArgs {
         base_path: base_path.clone(),
-        frecency_db_path: args.frecency_db_path.or_else(|| {
-            cfg.frecency.db.as_deref().map(PathBuf::from)
-        }),
+        frecency_db_path: args
+            .frecency_db_path
+            .or_else(|| cfg.frecency.db.as_deref().map(PathBuf::from)),
         no_watch: eff_no_watch,
         no_warmup: eff_no_warmup,
     };

@@ -40,14 +40,18 @@ impl HashRing {
         if self.nodes.is_empty() {
             return None;
         }
-        let canonical = std::fs::canonicalize(base_path)
-            .unwrap_or_else(|_| base_path.to_path_buf());
+        let canonical =
+            std::fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
         let point = point_for_key(canonical.as_os_str().as_encoded_bytes());
 
         // Binary search for the first node with ring_point >= point (clockwise).
         let idx = self.nodes.partition_point(|&(p, _)| p < point);
         // Wrap around to the first node when point is past the last node.
-        let node = if idx < self.nodes.len() { &self.nodes[idx] } else { &self.nodes[0] };
+        let node = if idx < self.nodes.len() {
+            &self.nodes[idx]
+        } else {
+            &self.nodes[0]
+        };
         Some(node.1)
     }
 
@@ -74,7 +78,9 @@ impl HashRing {
 
     /// Snapshot the ring state for persistence.
     pub fn to_serializable(&self) -> SerializableRing {
-        SerializableRing { nodes: self.nodes.clone() }
+        SerializableRing {
+            nodes: self.nodes.clone(),
+        }
     }
 
     /// Restore a ring from a persisted snapshot.
@@ -162,7 +168,8 @@ mod tests {
 
         // Record assignments for 60 paths across both workers.
         let paths: Vec<String> = (0..60u32).map(|i| format!("/project/root-{i}")).collect();
-        let before: Vec<u32> = paths.iter()
+        let before: Vec<u32> = paths
+            .iter()
             .map(|p| ring.assign(Path::new(p)).unwrap())
             .collect();
 
@@ -192,7 +199,10 @@ mod tests {
 
         let snap = ring.to_serializable();
         let restored = HashRing::from_serializable(snap);
-        let after: Vec<Option<u32>> = paths.iter().map(|p| restored.assign(Path::new(p))).collect();
+        let after: Vec<Option<u32>> = paths
+            .iter()
+            .map(|p| restored.assign(Path::new(p)))
+            .collect();
 
         assert_eq!(original, after);
     }

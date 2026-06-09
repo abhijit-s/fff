@@ -8,7 +8,10 @@ use tokio::net::UnixListener;
 use crate::state::EngineState;
 
 /// Bind a UnixListener at `socket_path` and accept connections until SIGTERM/SIGINT.
-pub async fn run(state: Arc<EngineState>, socket_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    state: Arc<EngineState>,
+    socket_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -22,10 +25,8 @@ pub async fn run(state: Arc<EngineState>, socket_path: PathBuf) -> Result<(), Bo
         // Wait on whichever of SIGINT (Ctrl-C) or SIGTERM (fffctl stop, init,
         // brew services) arrives first. Returning from this future drops the
         // lockfile guard cleanly so no stale lockfile is left behind.
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .expect("install SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received"),
             _ = sigterm.recv() => tracing::info!("SIGTERM received"),
@@ -108,7 +109,10 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: Arc<EngineStat
     }
 }
 
-pub(crate) async fn dispatch_request(state: &EngineState, req: SearchRequest) -> fff_ipc::types::SearchResponse {
+pub(crate) async fn dispatch_request(
+    state: &EngineState,
+    req: SearchRequest,
+) -> fff_ipc::types::SearchResponse {
     use crate::handlers::{
         handle_find_files, handle_get_git_status, handle_grep, handle_list_directories,
         handle_list_recent_files, handle_multi_grep,
@@ -126,13 +130,23 @@ pub(crate) async fn dispatch_request(state: &EngineState, req: SearchRequest) ->
             let label = format!("find_files({:?})", query);
             (label, handle_find_files(state, query, options).await)
         }
-        SearchRequest::MultiGrep { patterns, constraints, options } => {
+        SearchRequest::MultiGrep {
+            patterns,
+            constraints,
+            options,
+        } => {
             let label = format!("multi_grep({:?})", patterns);
-            (label, handle_multi_grep(state, patterns, constraints, options).await)
+            (
+                label,
+                handle_multi_grep(state, patterns, constraints, options).await,
+            )
         }
         SearchRequest::ListRecentFiles { limit, dirty_only } => {
             let label = format!("list_recent_files(limit={limit}, dirty_only={dirty_only})");
-            (label, handle_list_recent_files(state, limit, dirty_only).await)
+            (
+                label,
+                handle_list_recent_files(state, limit, dirty_only).await,
+            )
         }
         SearchRequest::GetGitStatus { include_clean } => {
             let label = format!("get_git_status(include_clean={include_clean})");
@@ -159,8 +173,11 @@ pub(crate) async fn dispatch_request(state: &EngineState, req: SearchRequest) ->
 
     let elapsed = start.elapsed();
     let result_count = match &response {
-        fff_ipc::types::SearchResponse::GrepResults(r) => r.matches.iter().map(|f| f.matches.len()).sum::<usize>(),
-        fff_ipc::types::SearchResponse::SearchResults(r) | fff_ipc::types::SearchResponse::RecentFiles(r) => r.len(),
+        fff_ipc::types::SearchResponse::GrepResults(r) => {
+            r.matches.iter().map(|f| f.matches.len()).sum::<usize>()
+        }
+        fff_ipc::types::SearchResponse::SearchResults(r)
+        | fff_ipc::types::SearchResponse::RecentFiles(r) => r.len(),
         fff_ipc::types::SearchResponse::GitStatus(r) => r.len(),
         fff_ipc::types::SearchResponse::Directories(r) => r.len(),
         fff_ipc::types::SearchResponse::Error(_) | fff_ipc::types::SearchResponse::Ack => 0,

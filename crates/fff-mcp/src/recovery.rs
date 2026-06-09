@@ -32,7 +32,10 @@ pub fn respawn(base_path: &Path) -> Result<EngineClient, IpcError> {
             Ok(client) => return Ok(client),
             Err(e) => {
                 last_err = IpcError::Io(std::io::Error::other(e.to_string()));
-                tracing::warn!("recovery attempt {}/{MAX_ATTEMPTS}: {last_err}", attempt + 1);
+                tracing::warn!(
+                    "recovery attempt {}/{MAX_ATTEMPTS}: {last_err}",
+                    attempt + 1
+                );
             }
         }
     }

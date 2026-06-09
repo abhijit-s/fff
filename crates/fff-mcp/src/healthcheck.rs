@@ -29,7 +29,11 @@ pub fn run_healthcheck(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     all_ok &= check(
         "Base path",
         path_exists,
-        if path_exists { &base_path } else { "directory does not exist" },
+        if path_exists {
+            &base_path
+        } else {
+            "directory does not exist"
+        },
     );
 
     // 2. Git repository
@@ -62,7 +66,10 @@ pub fn run_healthcheck(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 // Not an error — daemon starts lazily on first tool call.
                 warn(
                     "fff-engine daemon",
-                    &format!("not yet started (socket {} absent — will be spawned on first use)", sock.display()),
+                    &format!(
+                        "not yet started (socket {} absent — will be spawned on first use)",
+                        sock.display()
+                    ),
                 );
             }
             HealthStatus::ConnRefused(e) => {
@@ -83,7 +90,11 @@ pub fn run_healthcheck(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         all_ok &= check(
             "Log file",
             parent_ok,
-            if parent_ok { log_path } else { "parent directory does not exist" },
+            if parent_ok {
+                log_path
+            } else {
+                "parent directory does not exist"
+            },
         );
     } else {
         check("Log file", false, "path not resolved");

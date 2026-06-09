@@ -167,7 +167,8 @@ mod tests {
 
     #[test]
     fn fff_config_with_worker_section_parses_fields() {
-        let toml = "[worker]\nn_min = 2\nn_max = 8\nroots_per_worker_max = 16\nidle_ttl_secs = 600\n";
+        let toml =
+            "[worker]\nn_min = 2\nn_max = 8\nroots_per_worker_max = 16\nidle_ttl_secs = 600\n";
         let cfg: FffConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.worker.n_min, 2);
         assert_eq!(cfg.worker.n_max, 8);

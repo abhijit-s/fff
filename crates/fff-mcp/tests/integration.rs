@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-use fff_ipc::types::{FindOptions, SearchRequest, SearchResponse};
 use fff_ipc::socket_path;
+use fff_ipc::types::{FindOptions, SearchRequest, SearchResponse};
 use fff_mcp::client::EngineClient;
 
 // ── Env-var serialisation lock ────────────────────────────────────────────────
@@ -63,7 +63,10 @@ impl TestEnv {
     }
 
     fn worker_socket(&self, idx: u32) -> PathBuf {
-        self.cache_dir().join("fff").join("workers").join(format!("worker-{idx}.sock"))
+        self.cache_dir()
+            .join("fff")
+            .join("workers")
+            .join(format!("worker-{idx}.sock"))
     }
 
     /// Write a minimal fff config that keeps the worker pool small and sets a
@@ -82,8 +85,7 @@ impl TestEnv {
     /// `Child` handle. The caller is responsible for calling `child.kill()`.
     fn spawn_master(&self) -> Child {
         self.write_config();
-        std::fs::create_dir_all(self.cache_dir().join("fff"))
-            .expect("create cache/fff dir");
+        std::fs::create_dir_all(self.cache_dir().join("fff")).expect("create cache/fff dir");
         Command::new(engine_bin())
             .arg("--master")
             .env("XDG_CACHE_HOME", self.cache_dir())
@@ -172,12 +174,16 @@ fn u7_1_connect_to_running_master() {
     );
 
     let base_path = env.root.clone();
-    let client = env.connect_client(&base_path)
+    let client = env
+        .connect_client(&base_path)
         .expect("EngineClient::connect should succeed");
 
     // Assert while master (and its worker) are still running.
     let worker_sock = env.worker_socket(0);
-    assert!(worker_sock.exists(), "expected worker socket at {worker_sock:?}");
+    assert!(
+        worker_sock.exists(),
+        "expected worker socket at {worker_sock:?}"
+    );
     assert_eq!(client.base_path(), base_path);
     // _guard drops here, killing master.
 }
@@ -192,7 +198,10 @@ fn u7_2_connect_spawns_master_if_not_running() {
     let env = TestEnv::new();
 
     // Verify master is NOT running yet.
-    assert!(!env.master_socket().exists(), "precondition: master socket absent");
+    assert!(
+        !env.master_socket().exists(),
+        "precondition: master socket absent"
+    );
 
     let base_path = env.root.clone();
     let result = env.connect_client(&base_path);
@@ -350,11 +359,18 @@ fn u7_5_same_base_path_returns_same_worker() {
     let _guard = KillOnDrop(env.spawn_master());
 
     let master_sock = env.master_socket();
-    assert!(wait_socket(&master_sock, 10_000), "master socket did not appear");
+    assert!(
+        wait_socket(&master_sock, 10_000),
+        "master socket did not appear"
+    );
 
     let base_path = env.root.clone();
-    let client1 = env.connect_client(&base_path).expect("first connect should succeed");
-    let client2 = env.connect_client(&base_path).expect("second connect should succeed");
+    let client1 = env
+        .connect_client(&base_path)
+        .expect("first connect should succeed");
+    let client2 = env
+        .connect_client(&base_path)
+        .expect("second connect should succeed");
 
     // Assert while master is still running.
     assert_eq!(client1.base_path(), client2.base_path());
@@ -380,13 +396,16 @@ fn r2_connect_legacy_reaches_singleton() {
 
     let base_path = env.root.join("r2_project");
     std::fs::create_dir_all(&base_path).expect("create base_path dir");
-    std::fs::create_dir_all(env.cache_dir().join("fff").join("sockets")).expect("create sockets dir");
+    std::fs::create_dir_all(env.cache_dir().join("fff").join("sockets"))
+        .expect("create sockets dir");
     std::fs::create_dir_all(env.cache_dir().join("fff").join("locks")).expect("create locks dir");
 
     // Spawn legacy singleton (no --master flag).
     let mut singleton = Command::new(engine_bin())
-        .arg("--base-path").arg(&base_path)
-        .arg("--no-watch").arg("--no-warmup")
+        .arg("--base-path")
+        .arg(&base_path)
+        .arg("--no-watch")
+        .arg("--no-warmup")
         .env("XDG_CACHE_HOME", env.cache_dir())
         .env("XDG_RUNTIME_DIR", env.runtime_dir())
         .env("XDG_CONFIG_HOME", env.config_dir())
@@ -399,9 +418,13 @@ fn r2_connect_legacy_reaches_singleton() {
     // Compute the socket path the singleton will bind.
     let legacy_sock = {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("XDG_CACHE_HOME", env.cache_dir()); }
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", env.cache_dir());
+        }
         let p = socket_path(&base_path);
-        unsafe { std::env::remove_var("XDG_CACHE_HOME"); }
+        unsafe {
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
         p
     };
 
@@ -414,13 +437,20 @@ fn r2_connect_legacy_reaches_singleton() {
     }
 
     // No master running — connect_legacy must reach the singleton directly.
-    assert!(!env.master_socket().exists(), "precondition: master must not be running");
+    assert!(
+        !env.master_socket().exists(),
+        "precondition: master must not be running"
+    );
 
     let result = {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("XDG_CACHE_HOME", env.cache_dir()); }
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", env.cache_dir());
+        }
         let r = EngineClient::connect_legacy(&base_path);
-        unsafe { std::env::remove_var("XDG_CACHE_HOME"); }
+        unsafe {
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
         r
     };
 
@@ -442,15 +472,22 @@ fn u7_6_different_base_paths_may_share_worker() {
     let _guard = KillOnDrop(env.spawn_master());
 
     let master_sock = env.master_socket();
-    assert!(wait_socket(&master_sock, 10_000), "master socket did not appear");
+    assert!(
+        wait_socket(&master_sock, 10_000),
+        "master socket did not appear"
+    );
 
     let root_a = env.root.join("project_a");
     let root_b = env.root.join("project_b");
     std::fs::create_dir_all(&root_a).expect("create project_a");
     std::fs::create_dir_all(&root_b).expect("create project_b");
 
-    let _client_a = env.connect_client(&root_a).expect("connect for project_a should succeed");
-    let _client_b = env.connect_client(&root_b).expect("connect for project_b should succeed");
+    let _client_a = env
+        .connect_client(&root_a)
+        .expect("connect for project_a should succeed");
+    let _client_b = env
+        .connect_client(&root_b)
+        .expect("connect for project_b should succeed");
 
     // Assert while master is still running.
     // With roots_per_worker_max=2 and n_min=1, both roots fit on worker-0.

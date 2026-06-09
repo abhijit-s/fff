@@ -37,14 +37,18 @@ pub fn acquire_lockfile(
         Err(_) => {
             // Lockfile exists. Check whether the owning process is still alive.
             if lockfile::is_stale(lockfile_path) {
-                eprintln!("fff-engine: removing stale lockfile (previous process exited uncleanly)");
+                eprintln!(
+                    "fff-engine: removing stale lockfile (previous process exited uncleanly)"
+                );
                 let _ = std::fs::remove_file(lockfile_path);
                 // Retry once — if this fails a live daemon raced us.
-                try_create_lockfile(lockfile_path).map_err(|_| {
-                    "another fff-engine daemon is already running for this project root"
-                })?;
+                try_create_lockfile(lockfile_path).map_err(
+                    |_| "another fff-engine daemon is already running for this project root",
+                )?;
             } else {
-                return Err("another fff-engine daemon is already running for this project root".into());
+                return Err(
+                    "another fff-engine daemon is already running for this project root".into(),
+                );
             }
         }
     }
@@ -58,7 +62,11 @@ pub fn acquire_lockfile(
 }
 
 fn try_create_lockfile(path: &Path) -> std::io::Result<()> {
-    OpenOptions::new().write(true).create_new(true).open(path).map(|_| ())
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(|_| ())
 }
 
 /// Poll until `socket_path` exists, returning `Ok` when it does.

@@ -22,9 +22,14 @@ pub enum MasterRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MasterResponse {
     /// Returned for Handshake — direct the client to this worker socket.
-    WorkerSocket { path: String, worker_index: u32 },
+    WorkerSocket {
+        path: String,
+        worker_index: u32,
+    },
     /// Returned for ListWorkers.
-    WorkerList { workers: Vec<WorkerInfo> },
+    WorkerList {
+        workers: Vec<WorkerInfo>,
+    },
     /// Returned for WorkerStatus / RouteInfo.
     WorkerInfo(WorkerInfo),
     Ack,
@@ -92,7 +97,9 @@ pub enum SearchRequest {
     /// First message sent on a worker socket connection — appended last to
     /// preserve bincode variant indices for all existing variants.
     /// Worker loads state for this root on demand and responds with Ack.
-    Connect { base_path: String },
+    Connect {
+        base_path: String,
+    },
 }
 
 // ── Response ──────────────────────────────────────────────────────────────────
@@ -338,7 +345,10 @@ mod tests {
 
     #[test]
     fn list_recent_files_request_round_trips() {
-        let req = SearchRequest::ListRecentFiles { limit: 10, dirty_only: true };
+        let req = SearchRequest::ListRecentFiles {
+            limit: 10,
+            dirty_only: true,
+        };
         let rt = round_trip(&req);
         match rt {
             SearchRequest::ListRecentFiles { limit, dirty_only } => {
@@ -351,7 +361,9 @@ mod tests {
 
     #[test]
     fn get_git_status_request_round_trips() {
-        let req = SearchRequest::GetGitStatus { include_clean: false };
+        let req = SearchRequest::GetGitStatus {
+            include_clean: false,
+        };
         let rt = round_trip(&req);
         match rt {
             SearchRequest::GetGitStatus { include_clean } => assert!(!include_clean),
@@ -371,7 +383,9 @@ mod tests {
 
     #[test]
     fn master_handshake_round_trips() {
-        let req = MasterRequest::Handshake { base_path: "/home/user/project".into() };
+        let req = MasterRequest::Handshake {
+            base_path: "/home/user/project".into(),
+        };
         let rt = round_trip(&req);
         match rt {
             MasterRequest::Handshake { base_path } => assert_eq!(base_path, "/home/user/project"),
@@ -381,7 +395,10 @@ mod tests {
 
     #[test]
     fn master_response_worker_socket_round_trips() {
-        let resp = MasterResponse::WorkerSocket { path: "/tmp/fff/workers/worker-0.sock".into(), worker_index: 0 };
+        let resp = MasterResponse::WorkerSocket {
+            path: "/tmp/fff/workers/worker-0.sock".into(),
+            worker_index: 0,
+        };
         let rt = round_trip(&resp);
         match rt {
             MasterResponse::WorkerSocket { path, worker_index } => {
@@ -396,8 +413,18 @@ mod tests {
     fn master_response_worker_list_round_trips() {
         let resp = MasterResponse::WorkerList {
             workers: vec![
-                WorkerInfo { index: 0, socket_path: "worker-0.sock".into(), root_slugs: vec!["abc".into()], pid: 1234 },
-                WorkerInfo { index: 1, socket_path: "worker-1.sock".into(), root_slugs: vec![], pid: 5678 },
+                WorkerInfo {
+                    index: 0,
+                    socket_path: "worker-0.sock".into(),
+                    root_slugs: vec!["abc".into()],
+                    pid: 1234,
+                },
+                WorkerInfo {
+                    index: 1,
+                    socket_path: "worker-1.sock".into(),
+                    root_slugs: vec![],
+                    pid: 5678,
+                },
             ],
         };
         let rt = round_trip(&resp);
@@ -413,23 +440,44 @@ mod tests {
 
     #[test]
     fn master_request_management_variants_round_trip() {
-        assert!(matches!(round_trip(&MasterRequest::ListWorkers), MasterRequest::ListWorkers));
+        assert!(matches!(
+            round_trip(&MasterRequest::ListWorkers),
+            MasterRequest::ListWorkers
+        ));
         let rt = round_trip(&MasterRequest::WorkerStatus { index: 3 });
         assert!(matches!(rt, MasterRequest::WorkerStatus { index: 3 }));
         let rt = round_trip(&MasterRequest::StopWorker { index: 7 });
         assert!(matches!(rt, MasterRequest::StopWorker { index: 7 }));
-        let rt = round_trip(&MasterRequest::EvictedRoot { slug: "abc123".into() });
-        match rt { MasterRequest::EvictedRoot { slug } => assert_eq!(slug, "abc123"), _ => panic!() }
-        let rt = round_trip(&MasterRequest::RouteInfo { base_path: "/project/x".into() });
-        match rt { MasterRequest::RouteInfo { base_path } => assert_eq!(base_path, "/project/x"), _ => panic!() }
+        let rt = round_trip(&MasterRequest::EvictedRoot {
+            slug: "abc123".into(),
+        });
+        match rt {
+            MasterRequest::EvictedRoot { slug } => assert_eq!(slug, "abc123"),
+            _ => panic!(),
+        }
+        let rt = round_trip(&MasterRequest::RouteInfo {
+            base_path: "/project/x".into(),
+        });
+        match rt {
+            MasterRequest::RouteInfo { base_path } => assert_eq!(base_path, "/project/x"),
+            _ => panic!(),
+        }
     }
 
     #[test]
     fn master_response_management_variants_round_trip() {
-        assert!(matches!(round_trip(&MasterResponse::Ack), MasterResponse::Ack));
+        assert!(matches!(
+            round_trip(&MasterResponse::Ack),
+            MasterResponse::Ack
+        ));
         let rt = round_trip(&MasterResponse::Error("oops".into()));
         assert!(matches!(rt, MasterResponse::Error(e) if e == "oops"));
-        let info = WorkerInfo { index: 2, socket_path: "w.sock".into(), root_slugs: vec!["s".into()], pid: 42 };
+        let info = WorkerInfo {
+            index: 2,
+            socket_path: "w.sock".into(),
+            root_slugs: vec!["s".into()],
+            pid: 42,
+        };
         let rt = round_trip(&MasterResponse::WorkerInfo(info.clone()));
         match rt {
             MasterResponse::WorkerInfo(w) => {
@@ -443,7 +491,9 @@ mod tests {
 
     #[test]
     fn search_request_connect_round_trips() {
-        let req = SearchRequest::Connect { base_path: "/home/user/repo".into() };
+        let req = SearchRequest::Connect {
+            base_path: "/home/user/repo".into(),
+        };
         let rt = round_trip(&req);
         match rt {
             SearchRequest::Connect { base_path } => assert_eq!(base_path, "/home/user/repo"),

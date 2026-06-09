@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs,
-    io,
-    path::Path,
-};
+use std::{collections::HashMap, fs, io, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -55,8 +50,9 @@ impl RoutingTable {
     /// Load from a JSON file. Returns `Ok(Default)` when the file is absent.
     pub fn load(path: &Path) -> io::Result<Self> {
         match fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+            Ok(s) => {
+                serde_json::from_str(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
         }
@@ -94,7 +90,9 @@ mod tests {
         let mut rt = RoutingTable::default();
         rt.workers.insert(0, make_entry(0, &["abc", "def"]));
         rt.workers.insert(1, make_entry(1, &[]));
-        rt.ring_state = SerializableRing { nodes: vec![(100, 0), (500, 1)] };
+        rt.ring_state = SerializableRing {
+            nodes: vec![(100, 0), (500, 1)],
+        };
 
         let json = serde_json::to_string(&rt).unwrap();
         let rt2: RoutingTable = serde_json::from_str(&json).unwrap();

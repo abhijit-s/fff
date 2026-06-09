@@ -6,15 +6,15 @@
 //!
 //! Uses `fff-core` directly (zero FFI overhead) for all search operations.
 
+#[cfg(unix)]
+pub(crate) mod client;
 mod cursor;
 mod healthcheck;
 mod output;
-mod server;
-mod update_check;
-#[cfg(unix)]
-pub(crate) mod client;
 #[cfg(unix)]
 mod recovery;
+mod server;
+mod update_check;
 
 use clap::Parser;
 use fff::file_picker::FilePicker;
@@ -305,7 +305,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Err(e) => {
-                tracing::warn!("Failed to connect to fff-engine ({e}), falling back to direct mode");
+                tracing::warn!(
+                    "Failed to connect to fff-engine ({e}), falling back to direct mode"
+                );
             }
         }
     }

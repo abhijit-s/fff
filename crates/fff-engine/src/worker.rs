@@ -9,15 +9,15 @@ use std::{
 };
 
 use fff_ipc::{
-    base_path_slug, master_socket_path,
+    base_path_slug,
     config::FffConfig,
+    master_socket_path,
     types::{MasterRequest, SearchRequest, SearchResponse},
-    worker_lockfile_path, worker_socket_path,
-    write_message_sync,
+    worker_lockfile_path, worker_socket_path, write_message_sync,
 };
+use fff_ipc::{read_message, write_message};
 use parking_lot::{Mutex, RwLock};
 use tokio::{net::UnixListener, sync::Mutex as TokioMutex};
-use fff_ipc::{read_message, write_message};
 
 use crate::state::{EffectiveArgs, EngineState};
 
@@ -67,7 +67,11 @@ impl WorkerState {
         // Slow path: gate serialises concurrent inits for the same slug.
         let gate = {
             let mut gates = self.init_gates.lock();
-            Arc::clone(gates.entry(slug.clone()).or_insert_with(|| Arc::new(TokioMutex::new(()))))
+            Arc::clone(
+                gates
+                    .entry(slug.clone())
+                    .or_insert_with(|| Arc::new(TokioMutex::new(()))),
+            )
         };
         let _gate_guard = gate.lock().await;
 
@@ -99,10 +103,13 @@ impl WorkerState {
         .map_err(|e| format!("spawn_blocking join error: {e}"))??;
 
         let new_state = Arc::new(new_state);
-        self.roots.write().insert(slug, RootEntry {
-            state: Arc::clone(&new_state),
-            last_access_ms: AtomicU64::new(now_ms()),
-        });
+        self.roots.write().insert(
+            slug,
+            RootEntry {
+                state: Arc::clone(&new_state),
+                last_access_ms: AtomicU64::new(now_ms()),
+            },
+        );
 
         Ok(new_state)
     }
@@ -154,7 +161,11 @@ pub async fn run(index: u32, config: FffConfig) -> Result<(), Box<dyn std::error
 
     // Use O_CREAT|O_EXCL so two concurrent workers with the same index cannot
     // both overwrite each other's PID (unlike plain std::fs::write).
-    match OpenOptions::new().write(true).create_new(true).open(&lockfile_path) {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lockfile_path)
+    {
         Ok(_) => {
             std::fs::write(&lockfile_path, format!("{}\n", std::process::id()))?;
         }
@@ -175,15 +186,16 @@ pub async fn run(index: u32, config: FffConfig) -> Result<(), Box<dyn std::error
     let _ = std::fs::remove_file(&socket_path);
 
     let listener = UnixListener::bind(&socket_path)?;
-    tracing::info!("fff-engine worker-{index} listening on {}", socket_path.display());
+    tracing::info!(
+        "fff-engine worker-{index} listening on {}",
+        socket_path.display()
+    );
 
     let worker_state = Arc::new(WorkerState::new(index, config));
 
     let shutdown = async {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .expect("install SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("worker-{index} SIGINT"),
             _ = sigterm.recv() => tracing::info!("worker-{index} SIGTERM"),
@@ -218,7 +230,11 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
     let base_path = match read_message(&mut read_half).await {
         Ok(SearchRequest::Connect { base_path }) => PathBuf::from(base_path),
         Ok(other) => {
-            tracing::warn!("worker-{}: unexpected first message {:?}, closing", ws.index, other);
+            tracing::warn!(
+                "worker-{}: unexpected first message {:?}, closing",
+                ws.index,
+                other
+            );
             return;
         }
         Err(_) => return,
@@ -233,7 +249,10 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
         }
     };
 
-    if write_message(&mut write_half, &SearchResponse::Ack).await.is_err() {
+    if write_message(&mut write_half, &SearchResponse::Ack)
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -248,7 +267,8 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
                 let _ = write_message(
                     &mut write_half,
                     &SearchResponse::Error("unexpected Connect after handshake".into()),
-                ).await;
+                )
+                .await;
                 break;
             }
             SearchRequest::RecordAccess { path } => {

@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use fff_ipc::lockfile::{self, Lockfile};
 use fff_ipc::types::{MasterRequest, MasterResponse};
-use fff_ipc::{master_lockfile_path, master_socket_path, read_message_sync, routing_table_path, write_message_sync};
+use fff_ipc::{
+    master_lockfile_path, master_socket_path, read_message_sync, routing_table_path,
+    write_message_sync,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -98,7 +101,13 @@ fn cmd_list() -> i32 {
         println!("master PID: {master_pid}  workers: {}", workers.len());
         println!("{:<6}  {:<7}  {:<8}  {}", "INDEX", "PID", "ROOTS", "SOCKET");
         for w in &workers {
-            println!("{:<6}  {:<7}  {:<8}  {}", w.index, w.pid, w.root_count(), w.socket_path);
+            println!(
+                "{:<6}  {:<7}  {:<8}  {}",
+                w.index,
+                w.pid,
+                w.root_count(),
+                w.socket_path
+            );
         }
         return 0;
     }
@@ -112,13 +121,18 @@ fn cmd_list() -> i32 {
     }
     println!("{:<10}  {:<7}  {:<16}  BASE-PATH", "PID", "STATE", "SLUG");
     for d in &daemons {
-        let base = d.lock.base_path.as_deref()
+        let base = d
+            .lock
+            .base_path
+            .as_deref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
-        println!("{:<10}  {:<7}  {:<16}  {base}",
+        println!(
+            "{:<10}  {:<7}  {:<16}  {base}",
             d.lock.pid,
             if d.lock.is_alive() { "live" } else { "stale" },
-            d.slug);
+            d.slug
+        );
     }
     0
 }
@@ -128,16 +142,31 @@ fn cmd_list_workers() -> i32 {
         Some(MasterResponse::WorkerList { workers }) => {
             println!("{:<6}  {:<7}  {:<8}  SOCKET", "INDEX", "PID", "ROOTS");
             for w in &workers {
-                println!("{:<6}  {:<7}  {:<8}  {}", w.index, w.pid, w.root_count(), w.socket_path);
+                println!(
+                    "{:<6}  {:<7}  {:<8}  {}",
+                    w.index,
+                    w.pid,
+                    w.root_count(),
+                    w.socket_path
+                );
                 for slug in &w.root_slugs {
                     println!("       slug: {slug}");
                 }
             }
             0
         }
-        Some(MasterResponse::Error(e)) => { eprintln!("master error: {e}"); 1 }
-        None => { eprintln!("master not running"); 1 }
-        _ => { eprintln!("unexpected response"); 1 }
+        Some(MasterResponse::Error(e)) => {
+            eprintln!("master error: {e}");
+            1
+        }
+        None => {
+            eprintln!("master not running");
+            1
+        }
+        _ => {
+            eprintln!("unexpected response");
+            1
+        }
     }
 }
 
@@ -145,7 +174,10 @@ fn cmd_paths(base_path: &Path) -> i32 {
     let slug = fff_ipc::base_path_slug(base_path);
     let socket = fff_ipc::socket_path(base_path);
     let lockfile = fff_ipc::lockfile_path(base_path);
-    let frecency = fff_ipc::xdg_data_dir().join("fff").join("frecency").join(&slug);
+    let frecency = fff_ipc::xdg_data_dir()
+        .join("fff")
+        .join("frecency")
+        .join(&slug);
     let log = fff_ipc::log_path(base_path);
     let master_sock = master_socket_path();
     let master_lock = master_lockfile_path();
@@ -165,11 +197,18 @@ fn cmd_paths(base_path: &Path) -> i32 {
 
 fn cmd_status(base_path: &Path) -> i32 {
     // Use RouteInfo (read-only) when master is running.
-    if let Some(resp) = master_request(MasterRequest::RouteInfo { base_path: base_path.to_string_lossy().into() }) {
+    if let Some(resp) = master_request(MasterRequest::RouteInfo {
+        base_path: base_path.to_string_lossy().into(),
+    }) {
         match resp {
             MasterResponse::WorkerInfo(info) => {
-                println!("Route for {}: worker-{} (pid={}, roots={})",
-                    base_path.display(), info.index, info.pid, info.root_count());
+                println!(
+                    "Route for {}: worker-{} (pid={}, roots={})",
+                    base_path.display(),
+                    info.index,
+                    info.pid,
+                    info.root_count()
+                );
                 println!("  socket: {}", info.socket_path);
                 return 0;
             }
@@ -185,16 +224,26 @@ fn cmd_status(base_path: &Path) -> i32 {
     let lock_path = fff_ipc::lockfile_path(base_path);
     match lockfile::read(&lock_path) {
         Some(lock) if lock.is_alive() => {
-            println!("fff-engine for {} is running (singleton).", base_path.display());
+            println!(
+                "fff-engine for {} is running (singleton).",
+                base_path.display()
+            );
             println!("  PID: {}  lock: {}", lock.pid, lock_path.display());
             0
         }
         Some(lock) => {
-            eprintln!("fff-engine for {} is NOT running (stale PID {}).", base_path.display(), lock.pid);
+            eprintln!(
+                "fff-engine for {} is NOT running (stale PID {}).",
+                base_path.display(),
+                lock.pid
+            );
             1
         }
         None => {
-            eprintln!("fff-engine for {} is NOT running (no lockfile).", base_path.display());
+            eprintln!(
+                "fff-engine for {} is NOT running (no lockfile).",
+                base_path.display()
+            );
             1
         }
     }
@@ -203,16 +252,30 @@ fn cmd_status(base_path: &Path) -> i32 {
 fn cmd_worker_status(index: u32) -> i32 {
     match master_request(MasterRequest::WorkerStatus { index }) {
         Some(MasterResponse::WorkerInfo(info)) => {
-            println!("worker-{}: pid={} roots={}", info.index, info.pid, info.root_count());
+            println!(
+                "worker-{}: pid={} roots={}",
+                info.index,
+                info.pid,
+                info.root_count()
+            );
             println!("  socket: {}", info.socket_path);
             for slug in &info.root_slugs {
                 println!("  slug: {slug}");
             }
             0
         }
-        Some(MasterResponse::Error(e)) => { eprintln!("master error: {e}"); 1 }
-        None => { eprintln!("master not running"); 1 }
-        _ => { eprintln!("unexpected response"); 1 }
+        Some(MasterResponse::Error(e)) => {
+            eprintln!("master error: {e}");
+            1
+        }
+        None => {
+            eprintln!("master not running");
+            1
+        }
+        _ => {
+            eprintln!("unexpected response");
+            1
+        }
     }
 }
 
@@ -236,19 +299,28 @@ fn cmd_stop(base_path: Option<&Path>, all: bool, timeout: Duration) -> i32 {
             }
         }
         // Legacy fallback: stop all per-root daemons.
-        let targets: Vec<_> = discover_daemons().into_iter().filter(|d| d.lock.is_alive()).collect();
+        let targets: Vec<_> = discover_daemons()
+            .into_iter()
+            .filter(|d| d.lock.is_alive())
+            .collect();
         if targets.is_empty() {
             println!("No live daemons to stop.");
             return 0;
         }
         let mut failures = 0;
         for d in targets {
-            let label = d.lock.base_path.as_deref()
+            let label = d
+                .lock
+                .base_path
+                .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| format!("slug={}", d.slug));
             match stop_daemon(&d, timeout) {
                 Ok(()) => println!("Stopped PID {} ({label})", d.lock.pid),
-                Err(e) => { eprintln!("Failed to stop PID {} ({label}): {e}", d.lock.pid); failures += 1; }
+                Err(e) => {
+                    eprintln!("Failed to stop PID {} ({label}): {e}", d.lock.pid);
+                    failures += 1;
+                }
             }
         }
         return if failures > 0 { 1 } else { 0 };
@@ -256,9 +328,13 @@ fn cmd_stop(base_path: Option<&Path>, all: bool, timeout: Duration) -> i32 {
 
     if let Some(bp) = base_path {
         // Try master StopWorker first.
-        let ring_index = master_request(MasterRequest::RouteInfo { base_path: bp.to_string_lossy().into() });
+        let ring_index = master_request(MasterRequest::RouteInfo {
+            base_path: bp.to_string_lossy().into(),
+        });
         if let Some(MasterResponse::WorkerInfo(info)) = ring_index {
-            if let Some(MasterResponse::Ack) = master_request(MasterRequest::StopWorker { index: info.index }) {
+            if let Some(MasterResponse::Ack) =
+                master_request(MasterRequest::StopWorker { index: info.index })
+            {
                 println!("Stopped worker-{} for {}", info.index, bp.display());
                 return 0;
             }
@@ -268,13 +344,26 @@ fn cmd_stop(base_path: Option<&Path>, all: bool, timeout: Duration) -> i32 {
         let lock_path = fff_ipc::lockfile_path(bp);
         match lockfile::read(&lock_path) {
             Some(lock) if lock.is_alive() => {
-                let d = Daemon { slug: fff_ipc::base_path_slug(bp), lock, lockfile_path: lock_path };
+                let d = Daemon {
+                    slug: fff_ipc::base_path_slug(bp),
+                    lock,
+                    lockfile_path: lock_path,
+                };
                 match stop_daemon(&d, timeout) {
-                    Ok(()) => { println!("Stopped PID {}", d.lock.pid); 0 }
-                    Err(e) => { eprintln!("Failed: {e}"); 1 }
+                    Ok(()) => {
+                        println!("Stopped PID {}", d.lock.pid);
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Failed: {e}");
+                        1
+                    }
                 }
             }
-            _ => { eprintln!("No live daemon for {}", bp.display()); 1 }
+            _ => {
+                eprintln!("No live daemon for {}", bp.display());
+                1
+            }
         }
     } else {
         eprintln!("Specify a base-path or pass --all.");
@@ -291,7 +380,9 @@ fn cmd_clean(dry_run: bool) -> i32 {
     // ── Master + worker artifacts ─────────────────────────────────────
     let master_lock = master_lockfile_path();
     if lockfile::read(&master_lock).is_some_and(|l| l.is_alive()) {
-        println!("Note: master is running; skipping master artifacts (use `fffctl stop --all` first).");
+        println!(
+            "Note: master is running; skipping master artifacts (use `fffctl stop --all` first)."
+        );
     } else {
         removed_master = clean_master_artifacts(dry_run);
     }
@@ -383,21 +474,27 @@ fn clean_master_artifacts(dry_run: bool) -> usize {
     let routing = routing_table_path();
     if routing.exists() {
         println!("{action} routing table: {}", routing.display());
-        if !dry_run { let _ = std::fs::remove_file(&routing); }
+        if !dry_run {
+            let _ = std::fs::remove_file(&routing);
+        }
         removed += 1;
     }
 
     let master_sock = master_socket_path();
     if master_sock.exists() {
         println!("{action} master socket: {}", master_sock.display());
-        if !dry_run { let _ = std::fs::remove_file(&master_sock); }
+        if !dry_run {
+            let _ = std::fs::remove_file(&master_sock);
+        }
         removed += 1;
     }
 
     let master_lock = master_lockfile_path();
     if master_lock.exists() {
         println!("{action} master lockfile: {}", master_lock.display());
-        if !dry_run { let _ = std::fs::remove_file(&master_lock); }
+        if !dry_run {
+            let _ = std::fs::remove_file(&master_lock);
+        }
         removed += 1;
     }
 
@@ -405,10 +502,14 @@ fn clean_master_artifacts(dry_run: bool) -> usize {
     if let Ok(entries) = std::fs::read_dir(&workers_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
+            let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if ext == "sock" || ext == "lock" {
                 println!("{action} worker artifact: {}", path.display());
-                if !dry_run { let _ = std::fs::remove_file(&path); }
+                if !dry_run {
+                    let _ = std::fs::remove_file(&path);
+                }
                 removed += 1;
             }
         }

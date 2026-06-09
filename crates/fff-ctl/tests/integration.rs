@@ -15,10 +15,7 @@ const CTL_BIN: &str = env!("CARGO_BIN_EXE_fffctl");
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn engine_bin() -> PathBuf {
-    let mut p = std::env::current_exe()
-        .unwrap()
-        .canonicalize()
-        .unwrap();
+    let mut p = std::env::current_exe().unwrap().canonicalize().unwrap();
     p.pop();
     if p.ends_with("deps") {
         p.pop();
@@ -61,7 +58,12 @@ impl TestEnv {
         )
         .unwrap();
 
-        Self { _dir: dir, cache, runtime, config }
+        Self {
+            _dir: dir,
+            cache,
+            runtime,
+            config,
+        }
     }
 
     fn env_vars(&self) -> [(&'static str, &Path); 3] {
@@ -142,7 +144,6 @@ impl TestEnv {
         let code = out.status.code().unwrap_or(-1);
         (stdout, stderr, code)
     }
-
 }
 
 fn sigterm(child: &Child) {
@@ -161,7 +162,10 @@ fn list_shows_master_pid() {
 
     let (out, _, code) = env.fffctl(&["list"]);
     assert_eq!(code, 0, "fffctl list exit code; stderr: {out}");
-    assert!(out.contains("master PID:"), "expected 'master PID:' in output:\n{out}");
+    assert!(
+        out.contains("master PID:"),
+        "expected 'master PID:' in output:\n{out}"
+    );
 
     sigterm(&master);
     let _ = master.wait();
@@ -209,7 +213,10 @@ fn stop_all_terminates_master() {
     let sock = env.master_socket();
     let (out, _, code) = env.fffctl(&["stop", "--all"]);
     assert_eq!(code, 0, "fffctl stop --all failed:\n{out}");
-    assert!(out.contains("SIGTERM"), "expected SIGTERM mention in output:\n{out}");
+    assert!(
+        out.contains("SIGTERM"),
+        "expected SIGTERM mention in output:\n{out}"
+    );
 
     assert!(
         env.wait_socket_gone(&sock, SOCKET_TIMEOUT),
@@ -233,12 +240,18 @@ fn clean_removes_routing_json_after_master_stopped() {
     let _ = master.wait();
 
     let routing = env.routing_json();
-    assert!(routing.exists(), "routing.json should exist after master ran");
+    assert!(
+        routing.exists(),
+        "routing.json should exist after master ran"
+    );
 
     let (out, _, code) = env.fffctl(&["clean"]);
     assert_eq!(code, 0, "fffctl clean failed:\n{out}");
     assert!(!routing.exists(), "routing.json should be removed by clean");
-    assert!(out.contains("routing table"), "expected routing table mention:\n{out}");
+    assert!(
+        out.contains("routing table"),
+        "expected routing table mention:\n{out}"
+    );
 }
 
 /// U8.6 — `fffctl clean --dry-run` prints what would be removed but leaves files intact.
@@ -255,12 +268,21 @@ fn clean_dry_run_does_not_remove() {
     let _ = master.wait();
 
     let routing = env.routing_json();
-    assert!(routing.exists(), "routing.json should exist after master ran");
+    assert!(
+        routing.exists(),
+        "routing.json should exist after master ran"
+    );
 
     let (out, _, code) = env.fffctl(&["clean", "--dry-run"]);
     assert_eq!(code, 0, "fffctl clean --dry-run failed:\n{out}");
-    assert!(routing.exists(), "routing.json must NOT be removed by --dry-run");
-    assert!(out.contains("would remove"), "expected 'would remove' in output:\n{out}");
+    assert!(
+        routing.exists(),
+        "routing.json must NOT be removed by --dry-run"
+    );
+    assert!(
+        out.contains("would remove"),
+        "expected 'would remove' in output:\n{out}"
+    );
 }
 
 /// U8.7 — `fffctl paths <path>` prints all expected fields.
@@ -269,7 +291,17 @@ fn paths_shows_all_fields() {
     let env = TestEnv::new();
     let (out, _, code) = env.fffctl(&["paths", "/tmp/fff-test-project"]);
     assert_eq!(code, 0, "fffctl paths failed");
-    for field in &["base_path", "slug", "socket", "lockfile", "master.sock", "routing.json"] {
-        assert!(out.contains(field), "missing field '{field}' in output:\n{out}");
+    for field in &[
+        "base_path",
+        "slug",
+        "socket",
+        "lockfile",
+        "master.sock",
+        "routing.json",
+    ] {
+        assert!(
+            out.contains(field),
+            "missing field '{field}' in output:\n{out}"
+        );
     }
 }

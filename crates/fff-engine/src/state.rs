@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use fff::{FFFMode, FilePickerOptions, SharedFilePicker, SharedFrecency};
 use fff::file_picker::FilePicker;
 use fff::frecency::FrecencyTracker;
+use fff::{FFFMode, FilePickerOptions, SharedFilePicker, SharedFrecency};
 use git2::Repository;
 
 /// Resolved arguments after merging CLI flags with config file values.
@@ -41,7 +41,10 @@ pub fn init(args: &EffectiveArgs) -> Result<EngineState, Box<dyn std::error::Err
             let _ = shared_frecency.init(tracker);
         }
         Err(e) => {
-            tracing::warn!("frecency DB unavailable at {}: {e}", frecency_path.display());
+            tracing::warn!(
+                "frecency DB unavailable at {}: {e}",
+                frecency_path.display()
+            );
         }
     }
 

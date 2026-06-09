@@ -198,10 +198,7 @@ pub async fn handle_list_recent_files(
     }
 }
 
-pub async fn handle_get_git_status(
-    state: &EngineState,
-    include_clean: bool,
-) -> SearchResponse {
+pub async fn handle_get_git_status(state: &EngineState, include_clean: bool) -> SearchResponse {
     use fff::git::format_git_status_opt;
     use fff_ipc::types::WireGitFile;
 
@@ -240,10 +237,7 @@ pub async fn handle_get_git_status(
     }
 }
 
-pub async fn handle_list_directories(
-    state: &EngineState,
-    limit: usize,
-) -> SearchResponse {
+pub async fn handle_list_directories(state: &EngineState, limit: usize) -> SearchResponse {
     use fff_ipc::types::WireDirEntry;
 
     let picker_arc = state.shared_picker.clone();
@@ -310,21 +304,21 @@ fn project_grep_result(
     result: &fff::grep::GrepResult<'_>,
     picker: &fff::file_picker::FilePicker,
 ) -> Vec<fff_ipc::types::WireGrepFileMatches> {
-    use std::collections::HashMap;
     use fff_ipc::types::{WireGrepFileMatches, WireGrepMatch};
+    use std::collections::HashMap;
 
     let mut by_file: HashMap<usize, WireGrepFileMatches> = HashMap::new();
     for m in &result.matches {
         let file = result.files[m.file_index];
-        let entry = by_file.entry(m.file_index).or_insert_with(|| {
-            WireGrepFileMatches {
+        let entry = by_file
+            .entry(m.file_index)
+            .or_insert_with(|| WireGrepFileMatches {
                 path: file.relative_path(picker),
                 size: file.size,
                 git_status: file.git_status.map(|s| s.bits()),
                 frecency_score: file.total_frecency_score(),
                 matches: Vec::new(),
-            }
-        });
+            });
         entry.matches.push(WireGrepMatch {
             line_number: m.line_number,
             col: m.col,
