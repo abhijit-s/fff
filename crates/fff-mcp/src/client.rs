@@ -12,7 +12,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use fff_ipc::types::{MasterRequest, MasterResponse, SearchRequest, SearchResponse};
-use fff_ipc::{lockfile, master_lockfile_path, master_socket_path, IpcError};
+use fff_ipc::{IpcError, lockfile, master_lockfile_path, master_socket_path};
 use fff_ipc::{read_message_sync, write_message_sync};
 
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -20,7 +20,6 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct EngineClient {
     reader: BufReader<UnixStream>,
     writer: BufWriter<UnixStream>,
-    /// Stored for reconnect — passed back on two-phase re-handshake.
     pub(crate) base_path: PathBuf,
 }
 
@@ -44,7 +43,12 @@ impl EngineClient {
         let mut writer = BufWriter::new(stream.try_clone()?);
         let mut reader = BufReader::new(stream);
 
-        write_message_sync(&mut writer, &SearchRequest::Connect { base_path: base_path_str.clone() })?;
+        write_message_sync(
+            &mut writer,
+            &SearchRequest::Connect {
+                base_path: base_path_str.clone(),
+            },
+        )?;
         use std::io::Write;
         writer.flush().map_err(IpcError::Io)?;
 
@@ -55,7 +59,11 @@ impl EngineClient {
             other => return Err(format!("unexpected worker response: {other:?}").into()),
         }
 
-        Ok(Self { reader, writer, base_path: base_path.to_path_buf() })
+        Ok(Self {
+            reader,
+            writer,
+            base_path: base_path.to_path_buf(),
+        })
     }
 
     /// The base path this client is connected to.
@@ -83,12 +91,17 @@ impl EngineClient {
     }
 
     /// Re-run the two-phase handshake and return a fresh client. Used by recovery.
+    #[allow(dead_code)]
     pub fn reconnect(&self) -> Result<Self, Box<dyn std::error::Error>> {
         Self::connect(&self.base_path)
     }
 
     /// Send a search request, with transparent crash recovery.
-    pub fn search_with_recovery(&mut self, req: &SearchRequest, base_path: &Path) -> SearchResponse {
+    pub fn search_with_recovery(
+        &mut self,
+        req: &SearchRequest,
+        base_path: &Path,
+    ) -> SearchResponse {
         match self.search(req) {
             Ok(resp) => return resp,
             Err(e) => tracing::warn!("worker socket error: {e}; attempting recovery"),
@@ -100,7 +113,9 @@ impl EngineClient {
                 *self = new_client;
                 match self.search(req) {
                     Ok(resp) => resp,
-                    Err(e) => SearchResponse::Error(format!("fff-engine unavailable after recovery: {e}")),
+                    Err(e) => {
+                        SearchResponse::Error(format!("fff-engine unavailable after recovery: {e}"))
+                    }
                 }
             }
             Err(e) => SearchResponse::Error(format!("fff-engine recovery failed: {e}")),
@@ -117,13 +132,17 @@ impl EngineClient {
 
     /// Hot-reload the daemon's log filter.
     pub fn set_log_level(&mut self, level: &str) -> Result<SearchResponse, IpcError> {
-        self.search(&SearchRequest::SetLogLevel { level: level.to_owned() })
+        self.search(&SearchRequest::SetLogLevel {
+            level: level.to_owned(),
+        })
     }
 
     /// Fire-and-forget frecency write.
     #[allow(dead_code)]
     pub fn record_access(&mut self, path: &str) {
-        let req = SearchRequest::RecordAccess { path: path.to_owned() };
+        let req = SearchRequest::RecordAccess {
+            path: path.to_owned(),
+        };
         let _ = write_message_sync(&mut self.writer, &req);
         let _ = {
             use std::io::Write;
@@ -149,9 +168,7 @@ impl EngineClient {
                     base_path: base_path.to_string_lossy().into(),
                 };
                 use std::io::Write;
-                if write_message_sync(&mut writer, &req).is_err()
-                    || writer.flush().is_err()
-                {
+                if write_message_sync(&mut writer, &req).is_err() || writer.flush().is_err() {
                     return HealthStatus::ConnRefused("send failed".into());
                 }
                 let resp: Result<MasterResponse, _> = read_message_sync(&mut reader);
@@ -196,7 +213,12 @@ fn master_handshake(base_path: &Path) -> Result<PathBuf, Box<dyn std::error::Err
     let mut reader = BufReader::new(stream);
 
     let base_str = base_path.to_string_lossy().into_owned();
-    write_message_sync(&mut writer, &MasterRequest::Handshake { base_path: base_str })?;
+    write_message_sync(
+        &mut writer,
+        &MasterRequest::Handshake {
+            base_path: base_str,
+        },
+    )?;
     use std::io::Write;
     writer.flush().map_err(IpcError::Io)?;
 
@@ -210,7 +232,8 @@ fn master_handshake(base_path: &Path) -> Result<PathBuf, Box<dyn std::error::Err
                 return Err(format!(
                     "master returned unexpected worker socket path: {path:?} \
                      (expected {expected:?})"
-                ).into());
+                )
+                .into());
             }
             Ok(actual)
         }
@@ -244,7 +267,11 @@ fn ensure_master_running() -> Result<(), Box<dyn std::error::Error>> {
 
     // Race to spawn master: O_CREAT|O_EXCL via create_new.
     use std::fs::OpenOptions;
-    match OpenOptions::new().write(true).create_new(true).open(&lockfile) {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lockfile)
+    {
         Ok(_) => {
             // We won. Write our PID so concurrent losers see a live holder and
             // call wait_for_socket instead of also trying to spawn.
@@ -282,7 +309,8 @@ fn ensure_master_running() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!(
                 "failed to start fff-engine --master ({}): {e}",
                 engine_bin.display()
-            ).into());
+            )
+            .into());
         }
     };
 
@@ -298,12 +326,16 @@ fn ensure_master_running() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Wait for `path` to accept connections, then connect. Delegates to the
 /// canonical fff_ipc::wait_for_socket (polls UnixStream::connect, not path.exists).
-fn wait_and_connect(path: &Path, timeout: Duration) -> Result<UnixStream, Box<dyn std::error::Error>> {
+fn wait_and_connect(
+    path: &Path,
+    timeout: Duration,
+) -> Result<UnixStream, Box<dyn std::error::Error>> {
     fff_ipc::wait_for_socket(path, timeout)
         .map_err(|e| format!("{e}").into())
         .and_then(|()| {
-            UnixStream::connect(path)
-                .map_err(|e| format!("failed to connect to worker socket {}: {e}", path.display()).into())
+            UnixStream::connect(path).map_err(|e| {
+                format!("failed to connect to worker socket {}: {e}", path.display()).into()
+            })
         })
 }
 

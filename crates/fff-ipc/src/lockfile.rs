@@ -21,10 +21,18 @@ pub struct Lockfile {
 }
 
 impl Lockfile {
-    /// Probe whether the PID is still alive. Uses `kill(pid, 0)`.
+    /// Probe whether the PID is still alive. Uses `kill(pid, 0)` on Unix;
+    /// always returns `false` on non-Unix platforms (no daemon support).
     pub fn is_alive(&self) -> bool {
-        // SAFETY: signal 0 only probes existence, never delivers anything.
-        unsafe { libc::kill(self.pid as libc::pid_t, 0) == 0 }
+        #[cfg(unix)]
+        {
+            // SAFETY: signal 0 only probes existence, never delivers anything.
+            unsafe { libc::kill(self.pid as libc::pid_t, 0) == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 }
 
@@ -107,7 +115,11 @@ mod tests {
     fn live_self_pid_not_stale() {
         let dir = tmp();
         let path = dir.path().join("self.lock");
-        std::fs::write(&path, format_contents(std::process::id(), Path::new("/tmp"))).unwrap();
+        std::fs::write(
+            &path,
+            format_contents(std::process::id(), Path::new("/tmp")),
+        )
+        .unwrap();
         assert!(!is_stale(&path));
     }
 

@@ -73,11 +73,17 @@ impl TestEnv {
     }
 
     fn worker_socket(&self, idx: u32) -> PathBuf {
-        self.cache_dir().join("fff").join("workers").join(format!("worker-{idx}.sock"))
+        self.cache_dir()
+            .join("fff")
+            .join("workers")
+            .join(format!("worker-{idx}.sock"))
     }
 
     fn worker_lockfile(&self, idx: u32) -> PathBuf {
-        self.cache_dir().join("fff").join("workers").join(format!("worker-{idx}.lock"))
+        self.cache_dir()
+            .join("fff")
+            .join("workers")
+            .join(format!("worker-{idx}.lock"))
     }
 
     fn routing_json(&self) -> PathBuf {
@@ -148,7 +154,9 @@ impl TestEnv {
     }
 
     fn handshake(&self, base_path: &str) -> MasterResponse {
-        self.send_master_request(&MasterRequest::Handshake { base_path: base_path.into() })
+        self.send_master_request(&MasterRequest::Handshake {
+            base_path: base_path.into(),
+        })
     }
 
     fn list_workers(&self) -> Vec<fff_ipc::types::WorkerInfo> {
@@ -168,7 +176,10 @@ impl TestEnv {
                 return workers;
             }
             if std::time::Instant::now() >= deadline {
-                panic!("timed out waiting for {n} worker(s); only {} registered", workers.len());
+                panic!(
+                    "timed out waiting for {n} worker(s); only {} registered",
+                    workers.len()
+                );
             }
             sleep(POLL_MS);
         }
@@ -185,7 +196,9 @@ impl TestEnv {
     /// Connect to a worker socket, send Connect, receive Ack.
     fn worker_connect(&self, worker_sock: &PathBuf, base_path: &str) -> UnixStream {
         let mut stream = UnixStream::connect(worker_sock).expect("connect to worker");
-        let req = SearchRequest::Connect { base_path: base_path.into() };
+        let req = SearchRequest::Connect {
+            base_path: base_path.into(),
+        };
         write_message_sync(&mut stream, &req).expect("write Connect");
         let resp: SearchResponse = read_message_sync(&mut stream).expect("read Ack");
         assert!(
@@ -237,8 +250,14 @@ fn u3_worker_binds_socket_on_startup() {
     let env = TestEnv::new();
     let mut worker = env.spawn_worker(0);
 
-    assert!(env.wait_worker(0, SOCKET_TIMEOUT), "worker-0 socket not ready in time");
-    assert!(env.worker_socket(0).exists(), "worker-0.sock should exist on disk");
+    assert!(
+        env.wait_worker(0, SOCKET_TIMEOUT),
+        "worker-0 socket not ready in time"
+    );
+    assert!(
+        env.worker_socket(0).exists(),
+        "worker-0.sock should exist on disk"
+    );
 
     sigterm_and_wait(&mut worker, Duration::from_secs(5));
 }
@@ -252,7 +271,9 @@ fn u3_non_connect_first_message_closes_connection() {
     assert!(env.wait_worker(0, SOCKET_TIMEOUT));
 
     let mut stream = UnixStream::connect(env.worker_socket(0)).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     // Send a non-Connect message as the first message on the connection.
     let bad_req = SearchRequest::FindFiles {
         query: "main".into(),
@@ -262,7 +283,10 @@ fn u3_non_connect_first_message_closes_connection() {
 
     // Worker should close the connection (EOF) rather than crash.
     let result: Result<SearchResponse, _> = read_message_sync(&mut stream);
-    assert!(result.is_err(), "expected EOF or error, worker should close connection on bad first msg");
+    assert!(
+        result.is_err(),
+        "expected EOF or error, worker should close connection on bad first msg"
+    );
 
     // Worker itself should still be alive (no crash).
     assert!(
@@ -302,10 +326,14 @@ fn u3_second_connect_same_base_path_gets_ack() {
     let _stream2 = env.worker_connect(&env.worker_socket(0), base_path);
 
     // Worker lockfile PID should be unchanged (no respawn).
-    let lockfile_content = std::fs::read_to_string(env.worker_lockfile(0))
-        .expect("lockfile should exist");
+    let lockfile_content =
+        std::fs::read_to_string(env.worker_lockfile(0)).expect("lockfile should exist");
     let pid: u32 = lockfile_content.trim().parse().expect("pid in lockfile");
-    assert_eq!(pid, worker.id(), "worker PID should not change between two connections");
+    assert_eq!(
+        pid,
+        worker.id(),
+        "worker PID should not change between two connections"
+    );
 
     sigterm_and_wait(&mut worker, Duration::from_secs(5));
 }
@@ -339,10 +367,17 @@ fn u4_master_writes_pid_to_lockfile() {
     let mut master = env.spawn_master();
     assert!(env.wait_master(SOCKET_TIMEOUT));
 
-    let content = std::fs::read_to_string(env.master_lockfile())
-        .expect("master lockfile should exist");
-    let pid: u32 = content.trim().parse().expect("lockfile should contain a valid PID");
-    assert_eq!(pid, master.id(), "lockfile PID should match spawned master PID");
+    let content =
+        std::fs::read_to_string(env.master_lockfile()).expect("master lockfile should exist");
+    let pid: u32 = content
+        .trim()
+        .parse()
+        .expect("lockfile should contain a valid PID");
+    assert_eq!(
+        pid,
+        master.id(),
+        "lockfile PID should match spawned master PID"
+    );
 
     sigterm_and_wait(&mut master, Duration::from_secs(5));
 }
@@ -352,8 +387,14 @@ fn u4_master_writes_pid_to_lockfile() {
 fn u4_master_binds_socket() {
     let env = TestEnv::new();
     let mut master = env.spawn_master();
-    assert!(env.wait_master(SOCKET_TIMEOUT), "master socket not ready in time");
-    assert!(env.master_socket().exists(), "master.sock should exist on disk");
+    assert!(
+        env.wait_master(SOCKET_TIMEOUT),
+        "master socket not ready in time"
+    );
+    assert!(
+        env.master_socket().exists(),
+        "master.sock should exist on disk"
+    );
 
     sigterm_and_wait(&mut master, Duration::from_secs(5));
 }
@@ -378,7 +419,10 @@ fn u4_second_master_exits_cleanly() {
         }
         sleep(POLL_MS);
     };
-    assert!(second_exited, "second master instance should exit when first is alive");
+    assert!(
+        second_exited,
+        "second master instance should exit when first is alive"
+    );
 
     sigterm_and_wait(&mut master1, Duration::from_secs(5));
     kill_and_wait(master2);
@@ -420,7 +464,10 @@ fn u4_list_workers_returns_registered_workers() {
 
     // Workers spawn in background — wait for n_min=1 to register.
     let workers = env.wait_for_workers(1, SOCKET_TIMEOUT);
-    assert!(!workers.is_empty(), "master should have at least n_min=1 worker registered");
+    assert!(
+        !workers.is_empty(),
+        "master should have at least n_min=1 worker registered"
+    );
 
     sigterm_and_wait(&mut master, Duration::from_secs(5));
 }
@@ -437,7 +484,9 @@ fn u4_worker_status_returns_valid_pid() {
     assert!(!workers.is_empty());
     let idx = workers[0].index;
 
-    let info = env.worker_status(idx).expect("WorkerStatus should return info for live worker");
+    let info = env
+        .worker_status(idx)
+        .expect("WorkerStatus should return info for live worker");
     assert!(info.pid > 1, "worker PID should be a valid process ID");
     assert_eq!(info.index, idx);
 
@@ -453,14 +502,23 @@ fn u4_routing_json_written_after_handshake() {
 
     let base_path = env.dir.path().to_str().unwrap();
     let resp = env.handshake(base_path);
-    assert!(matches!(resp, MasterResponse::WorkerSocket { .. }), "handshake failed: {resp:?}");
+    assert!(
+        matches!(resp, MasterResponse::WorkerSocket { .. }),
+        "handshake failed: {resp:?}"
+    );
 
     // routing.json should exist and contain the worker entry.
     let routing_path = env.routing_json();
-    assert!(routing_path.exists(), "routing.json should exist after Handshake");
+    assert!(
+        routing_path.exists(),
+        "routing.json should exist after Handshake"
+    );
 
     let table = RoutingTable::load(&routing_path).expect("parse routing.json");
-    assert!(!table.workers.is_empty(), "routing.json should contain at least one worker");
+    assert!(
+        !table.workers.is_empty(),
+        "routing.json should contain at least one worker"
+    );
 
     sigterm_and_wait(&mut master, Duration::from_secs(5));
 }
@@ -478,12 +536,15 @@ fn u4_startup_skips_dead_pid_in_routing_json() {
     let dead_pid: u32 = 999_999_999;
     let dead_sock = env.worker_socket(99).to_string_lossy().into_owned();
     let mut table = RoutingTable::default();
-    table.workers.insert(99, WorkerEntry {
-        index: 99,
-        socket_path: dead_sock,
-        pid: dead_pid,
-        root_slugs: vec!["some-slug".into()],
-    });
+    table.workers.insert(
+        99,
+        WorkerEntry {
+            index: 99,
+            socket_path: dead_sock,
+            pid: dead_pid,
+            root_slugs: vec!["some-slug".into()],
+        },
+    );
     table.save(&env.routing_json()).expect("save routing.json");
 
     // Start master — it should discard the dead-PID entry and start fresh workers.
@@ -492,7 +553,10 @@ fn u4_startup_skips_dead_pid_in_routing_json() {
 
     let workers = env.list_workers();
     let has_dead = workers.iter().any(|w| w.pid == dead_pid);
-    assert!(!has_dead, "master should have discarded the dead-PID worker from routing.json");
+    assert!(
+        !has_dead,
+        "master should have discarded the dead-PID worker from routing.json"
+    );
 
     sigterm_and_wait(&mut master, Duration::from_secs(5));
 }
@@ -542,7 +606,10 @@ fn u5_second_handshake_same_base_path_hits_routing() {
         other => panic!("expected WorkerSocket, got {other:?}"),
     };
 
-    assert_eq!(idx1, idx2, "same base_path should route to the same worker on repeated Handshakes");
+    assert_eq!(
+        idx1, idx2,
+        "same base_path should route to the same worker on repeated Handshakes"
+    );
 
     sigterm_and_wait(&mut master, Duration::from_secs(5));
 }
@@ -557,7 +624,10 @@ fn u5_scale_out_fires_at_roots_per_worker_max() {
 
     // Workers spawn in background — wait for n_min=1, then confirm exactly 1.
     let initial_count = env.wait_for_workers(1, SOCKET_TIMEOUT).len();
-    assert_eq!(initial_count, 1, "should start with exactly 1 worker (n_min=1)");
+    assert_eq!(
+        initial_count, 1,
+        "should start with exactly 1 worker (n_min=1)"
+    );
 
     // Create 3 distinct real directories so canonicalization produces distinct slugs.
     let root_a = env.dir.path().join("root_a");
@@ -584,7 +654,10 @@ fn u5_scale_out_fires_at_roots_per_worker_max() {
         }
         sleep(Duration::from_millis(200));
     };
-    assert!(scaled, "master should have spawned a second worker after exceeding roots_per_worker_max");
+    assert!(
+        scaled,
+        "master should have spawned a second worker after exceeding roots_per_worker_max"
+    );
 
     sigterm_and_wait(&mut master, Duration::from_secs(5));
 }
@@ -650,14 +723,19 @@ fn u5_routing_json_persisted_after_each_handshake() {
     // Give a brief moment for the async persist to complete.
     sleep(Duration::from_millis(200));
 
-    let table1 = RoutingTable::load(&env.routing_json()).expect("load routing.json after first handshake");
+    let table1 =
+        RoutingTable::load(&env.routing_json()).expect("load routing.json after first handshake");
     let total_slugs1: usize = table1.workers.values().map(|e| e.root_slugs.len()).sum();
-    assert!(total_slugs1 >= 1, "routing.json should have at least 1 slug after first Handshake");
+    assert!(
+        total_slugs1 >= 1,
+        "routing.json should have at least 1 slug after first Handshake"
+    );
 
     env.handshake(root2.to_str().unwrap());
     sleep(Duration::from_millis(200));
 
-    let table2 = RoutingTable::load(&env.routing_json()).expect("load routing.json after second handshake");
+    let table2 =
+        RoutingTable::load(&env.routing_json()).expect("load routing.json after second handshake");
     let total_slugs2: usize = table2.workers.values().map(|e| e.root_slugs.len()).sum();
     assert!(
         total_slugs2 >= total_slugs1,
@@ -683,7 +761,10 @@ fn u6_master_respawns_crashed_worker() {
     let original_pid = workers[0].pid;
 
     // Wait until the worker socket is connectable.
-    assert!(env.wait_worker(idx, SOCKET_TIMEOUT), "initial worker socket should be ready");
+    assert!(
+        env.wait_worker(idx, SOCKET_TIMEOUT),
+        "initial worker socket should be ready"
+    );
 
     // Kill the worker process externally.
     unsafe { libc::kill(original_pid as libc::pid_t, libc::SIGKILL) };
@@ -695,12 +776,18 @@ fn u6_master_respawns_crashed_worker() {
 
     // Wait for master to detect the crash and respawn (within 15s).
     let respawned = env.wait_worker(idx, Duration::from_secs(15));
-    assert!(respawned, "master should respawn worker-{idx} within 15s of crash");
+    assert!(
+        respawned,
+        "master should respawn worker-{idx} within 15s of crash"
+    );
 
     // Verify the respawned worker is alive (socket connectable — the key assertion).
     // PID comparison is omitted: macOS recycles PIDs quickly in test environments,
     // so the new process may legitimately receive the same PID.
-    assert!(env.worker_status(idx).is_some(), "respawned worker should report valid status");
+    assert!(
+        env.worker_status(idx).is_some(),
+        "respawned worker should report valid status"
+    );
 
     sigterm_and_wait(&mut master, Duration::from_secs(5));
 }
@@ -723,18 +810,24 @@ fn u6_startup_reconnects_live_discards_dead() {
     std::fs::create_dir_all(&routing_dir).unwrap();
 
     let mut table = RoutingTable::default();
-    table.workers.insert(5, WorkerEntry {
-        index: 5,
-        socket_path: live_sock,
-        pid: live_pid,
-        root_slugs: vec![],
-    });
-    table.workers.insert(99, WorkerEntry {
-        index: 99,
-        socket_path: env.worker_socket(99).to_string_lossy().into_owned(),
-        pid: dead_pid,
-        root_slugs: vec!["stale-slug".into()],
-    });
+    table.workers.insert(
+        5,
+        WorkerEntry {
+            index: 5,
+            socket_path: live_sock,
+            pid: live_pid,
+            root_slugs: vec![],
+        },
+    );
+    table.workers.insert(
+        99,
+        WorkerEntry {
+            index: 99,
+            socket_path: env.worker_socket(99).to_string_lossy().into_owned(),
+            pid: dead_pid,
+            root_slugs: vec!["stale-slug".into()],
+        },
+    );
     table.save(&env.routing_json()).unwrap();
 
     // Start master — it should adopt worker-5 and discard worker-99.
@@ -749,7 +842,10 @@ fn u6_startup_reconnects_live_discards_dead() {
 
     // Live worker-5 should be adopted (or at least the dead one removed).
     // The master may also spawn additional workers to satisfy n_min=1.
-    assert!(!workers.is_empty(), "at least one worker should be registered");
+    assert!(
+        !workers.is_empty(),
+        "at least one worker should be registered"
+    );
 
     kill_and_wait(live_worker);
     sigterm_and_wait(&mut master, Duration::from_secs(5));

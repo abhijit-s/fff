@@ -1,19 +1,28 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, atomic::{AtomicU32, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use fff_ipc::{
     base_path_slug,
     config::WorkerConfig,
-    master_lockfile_path, master_socket_path, routing_table_path, worker_socket_path,
-    read_message, write_message,
+    master_lockfile_path, master_socket_path, read_message,
     routing::{RoutingTable, WorkerEntry},
+    routing_table_path,
     types::{MasterRequest, MasterResponse, WorkerInfo},
+    worker_socket_path, write_message,
 };
-use tokio::{net::UnixListener, process::Command, sync::Mutex, time::{interval, sleep}};
+use tokio::{
+    net::UnixListener,
+    process::Command,
+    sync::Mutex,
+    time::{interval, sleep},
+};
 
 use crate::ring::HashRing;
 
@@ -98,10 +107,12 @@ impl MasterState {
 
         // Poll until worker socket accepts connections (not just file existence).
         let sock = socket.clone();
-        tokio::task::spawn_blocking(move || fff_ipc::wait_for_socket(&sock, Duration::from_secs(10)))
-            .await
-            .map_err(|e| format!("join error: {e}"))?
-            .map_err(|e| format!("worker-{index} socket timeout: {e}"))?;
+        tokio::task::spawn_blocking(move || {
+            fff_ipc::wait_for_socket(&sock, Duration::from_secs(10))
+        })
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+        .map_err(|e| format!("worker-{index} socket timeout: {e}"))?;
 
         // Update ring (lock then release before locking routing).
         let ring_snapshot = {
@@ -113,12 +124,15 @@ impl MasterState {
         // Update routing table and persist.
         {
             let mut routing = self.routing.lock().await;
-            routing.workers.insert(index, WorkerEntry {
+            routing.workers.insert(
                 index,
-                socket_path: socket.to_string_lossy().into(),
-                pid,
-                root_slugs: vec![],
-            });
+                WorkerEntry {
+                    index,
+                    socket_path: socket.to_string_lossy().into(),
+                    pid,
+                    root_slugs: vec![],
+                },
+            );
             routing.ring_state = ring_snapshot;
             self.persist_routing(&routing);
         }
@@ -131,12 +145,16 @@ impl MasterState {
 
     async fn collect_worker_info(&self) -> Vec<WorkerInfo> {
         let routing = self.routing.lock().await;
-        routing.workers.values().map(|e| WorkerInfo {
-            index: e.index,
-            socket_path: e.socket_path.clone(),
-            root_slugs: e.root_slugs.clone(),
-            pid: e.pid,
-        }).collect()
+        routing
+            .workers
+            .values()
+            .map(|e| WorkerInfo {
+                index: e.index,
+                socket_path: e.socket_path.clone(),
+                root_slugs: e.root_slugs.clone(),
+                pid: e.pid,
+            })
+            .collect()
     }
 
     async fn worker_info(&self, index: u32) -> Option<WorkerInfo> {
@@ -155,7 +173,9 @@ impl MasterState {
         if let Some(c) = child {
             // Get PID before consuming the child, then send SIGTERM for graceful shutdown.
             if let Some(pid) = c.id() {
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
                 // Give the worker up to 5s to exit cleanly before forcing SIGKILL.
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 while tokio::time::Instant::now() < deadline {
@@ -165,11 +185,15 @@ impl MasterState {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 if unsafe { libc::kill(pid as libc::pid_t, 0) == 0 } {
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
                 }
             }
         } else if let Some(&pid) = self.adopted_pids.lock().await.get(&index) {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
         }
         self.adopted_pids.lock().await.remove(&index);
 
@@ -243,8 +267,8 @@ impl MasterState {
                 entry.root_slugs.push(slug.clone());
                 let load = entry.root_slugs.len() as u32;
                 let total_workers = routing.workers.len() as u32;
-                scale_out = load >= self.config.roots_per_worker_max
-                    && total_workers < self.config.n_max;
+                scale_out =
+                    load >= self.config.roots_per_worker_max && total_workers < self.config.n_max;
             }
             // Remove from idle_since: this worker now has work.
             self.idle_since.lock().await.remove(&index);
@@ -273,14 +297,21 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
 
     // O_CREAT|O_EXCL race — exactly one process wins the master authority.
     use std::fs::OpenOptions;
-    match OpenOptions::new().write(true).create_new(true).open(&lockfile) {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lockfile)
+    {
         Ok(_) => {}
         Err(_) => {
             // Check whether the existing lock is stale.
             if fff_ipc::lockfile::is_stale(&lockfile) {
                 tracing::warn!("master: removing stale lockfile");
                 let _ = std::fs::remove_file(&lockfile);
-                OpenOptions::new().write(true).create_new(true).open(&lockfile)
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lockfile)
                     .map_err(|_| "another master is already running")?;
             } else {
                 tracing::info!("master: another instance is already running, exiting");
@@ -507,10 +538,8 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
 
     // Main accept loop.
     let shutdown = async {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .expect("install SIGTERM");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("master: SIGINT"),
             _ = sigterm.recv() => tracing::info!("master: SIGTERM"),
@@ -538,7 +567,9 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
         let mut children = master_state.children.lock().await;
         for (idx, child) in children.drain() {
             if let Some(pid) = child.id() {
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
                 tracing::info!("master: sent SIGTERM to worker-{idx} pid={pid}");
             }
         }
@@ -546,7 +577,9 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
     {
         let adopted = master_state.adopted_pids.lock().await;
         for (&idx, &pid) in adopted.iter() {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
             tracing::info!("master: sent SIGTERM to adopted worker-{idx}");
         }
     }
@@ -573,19 +606,29 @@ async fn handle_connection(stream: tokio::net::UnixStream, ms: Arc<MasterState>)
             let routing_hit = {
                 let routing = ms.routing.lock().await;
                 routing.workers.iter().find_map(|(&idx, e)| {
-                    if e.root_slugs.contains(&slug) { Some(idx) } else { None }
+                    if e.root_slugs.contains(&slug) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
                 })
             };
 
             let resp = if let Some(index) = routing_hit {
                 let socket = worker_socket_path(index).to_string_lossy().into_owned();
-                MasterResponse::WorkerSocket { path: socket, worker_index: index }
+                MasterResponse::WorkerSocket {
+                    path: socket,
+                    worker_index: index,
+                }
             } else {
                 // Routing miss — assign new root (may trigger scale-out).
                 match ms.assign_new_root(&base_path).await {
                     Some(index) => {
                         let socket = worker_socket_path(index).to_string_lossy().into_owned();
-                        MasterResponse::WorkerSocket { path: socket, worker_index: index }
+                        MasterResponse::WorkerSocket {
+                            path: socket,
+                            worker_index: index,
+                        }
                     }
                     None => MasterResponse::Error("no workers available".into()),
                 }
@@ -636,4 +679,3 @@ async fn handle_connection(stream: tokio::net::UnixStream, ms: Arc<MasterState>)
         }
     }
 }
-

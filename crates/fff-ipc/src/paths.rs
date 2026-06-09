@@ -4,21 +4,30 @@ use std::path::{Path, PathBuf};
 /// `<cache_dir>/fff/sockets/<blake3hex(canonical_base_path)>.sock`
 pub fn socket_path(base_path: &Path) -> PathBuf {
     let hash = base_path_slug(base_path);
-    cache_dir().join("fff").join("sockets").join(format!("{hash}.sock"))
+    cache_dir()
+        .join("fff")
+        .join("sockets")
+        .join(format!("{hash}.sock"))
 }
 
 /// Lockfile path for a given project root:
 /// `<cache_dir>/fff/locks/<blake3hex(canonical_base_path)>.lock`
 pub fn lockfile_path(base_path: &Path) -> PathBuf {
     let hash = base_path_slug(base_path);
-    cache_dir().join("fff").join("locks").join(format!("{hash}.lock"))
+    cache_dir()
+        .join("fff")
+        .join("locks")
+        .join(format!("{hash}.lock"))
 }
 
 /// Log file path for a given project root:
 /// `<cache_dir>/fff/logs/<blake3hex(canonical_base_path)>.log`
 pub fn log_path(base_path: &Path) -> PathBuf {
     let hash = base_path_slug(base_path);
-    cache_dir().join("fff").join("logs").join(format!("{hash}.log"))
+    cache_dir()
+        .join("fff")
+        .join("logs")
+        .join(format!("{hash}.log"))
 }
 
 /// Stable 16-hex-char slug for a project root. Used to derive per-base-path
@@ -32,8 +41,7 @@ pub fn log_path(base_path: &Path) -> PathBuf {
 /// Unix socket path limit on macOS is 104 bytes (SUN_LEN). Using 16 hex
 /// chars (64-bit prefix) keeps the full path well under that limit.
 pub fn base_path_slug(base_path: &Path) -> String {
-    let canonical = std::fs::canonicalize(base_path)
-        .unwrap_or_else(|_| base_path.to_path_buf());
+    let canonical = std::fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
     let bytes = canonical.as_os_str().as_encoded_bytes();
     let hash = blake3::hash(bytes);
     hash.to_hex()[..16].to_string()
@@ -51,12 +59,18 @@ pub fn master_lockfile_path() -> PathBuf {
 
 /// Worker Unix socket: `<cache_dir>/fff/workers/worker-{index}.sock`
 pub fn worker_socket_path(index: u32) -> PathBuf {
-    cache_dir().join("fff").join("workers").join(format!("worker-{index}.sock"))
+    cache_dir()
+        .join("fff")
+        .join("workers")
+        .join(format!("worker-{index}.sock"))
 }
 
 /// Worker lockfile: `<cache_dir>/fff/workers/worker-{index}.lock`
 pub fn worker_lockfile_path(index: u32) -> PathBuf {
-    cache_dir().join("fff").join("workers").join(format!("worker-{index}.lock"))
+    cache_dir()
+        .join("fff")
+        .join("workers")
+        .join(format!("worker-{index}.lock"))
 }
 
 /// Routing table JSON: `<runtime_dir>/fff/routing.json`
@@ -115,6 +129,7 @@ fn cache_dir() -> PathBuf {
 /// Polls via `UnixStream::connect` (not `path.exists()`) so a worker that has
 /// bound its socket file but not yet called `accept()` does not produce a false
 /// positive. Returns `Err` with a descriptive message on timeout.
+#[cfg(unix)]
 pub fn wait_for_socket(path: &std::path::Path, timeout: std::time::Duration) -> Result<(), String> {
     use std::os::unix::net::UnixStream;
     let deadline = std::time::Instant::now() + timeout;
@@ -140,9 +155,14 @@ mod tests {
     #[test]
     fn socket_path_under_sockets_dir() {
         let p = socket_path(Path::new("/some/project"));
-        let components: Vec<_> = p.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        let components: Vec<_> = p
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
         assert!(
-            components.windows(2).any(|w| w[0] == "fff" && w[1] == "sockets"),
+            components
+                .windows(2)
+                .any(|w| w[0] == "fff" && w[1] == "sockets"),
             "expected .../fff/sockets/... in {p:?}"
         );
     }
@@ -181,7 +201,10 @@ mod tests {
         let p9 = worker_socket_path(9);
         let s0 = p0.to_string_lossy();
         let s9 = p9.to_string_lossy();
-        assert!(s0.contains("/fff/workers/"), "expected .../fff/workers/... in {p0:?}");
+        assert!(
+            s0.contains("/fff/workers/"),
+            "expected .../fff/workers/... in {p0:?}"
+        );
         assert!(s0.ends_with("worker-0.sock"));
         assert!(s9.ends_with("worker-9.sock"));
     }
@@ -219,9 +242,14 @@ mod tests {
     #[test]
     fn lockfile_under_locks_dir_with_lock_ext() {
         let p = lockfile_path(Path::new("/some/project"));
-        let components: Vec<_> = p.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        let components: Vec<_> = p
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
         assert!(
-            components.windows(2).any(|w| w[0] == "fff" && w[1] == "locks"),
+            components
+                .windows(2)
+                .any(|w| w[0] == "fff" && w[1] == "locks"),
             "expected .../fff/locks/... in {p:?}"
         );
         assert_eq!(p.extension().and_then(|e| e.to_str()), Some("lock"));
