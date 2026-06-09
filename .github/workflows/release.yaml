@@ -341,10 +341,34 @@ jobs:
         run: |
           MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-mcp --features zlob
           cp "${{ matrix.artifact_name }}" "fff-mcp-${{ matrix.target }}"
+          # Build engine and ctl for Homebrew bundle (no zlob needed)
+          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} \
+            -p fff-engine -p fff-ctl --no-default-features
+          cp "target/${{ matrix.target }}/ci/fff-engine" "fff-engine-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/ci/fffctl" "fffctl-${{ matrix.target }}"
 
       - name: Ad-hoc sign macOS binary
         if: contains(matrix.os, 'macos')
-        run: codesign --force --sign - "fff-mcp-${{ matrix.target }}"
+        run: |
+          codesign --force --sign - "fff-mcp-${{ matrix.target }}"
+          codesign --force --sign - "fff-engine-${{ matrix.target }}"
+          codesign --force --sign - "fffctl-${{ matrix.target }}"
+
+      - name: Create Homebrew bundle for macOS
+        if: contains(matrix.os, 'macos')
+        run: |
+          mkdir -p homebrew-bundle
+          cp "fff-mcp-${{ matrix.target }}"    homebrew-bundle/fff-mcp
+          cp "fff-engine-${{ matrix.target }}" homebrew-bundle/fff-engine
+          cp "fffctl-${{ matrix.target }}"     homebrew-bundle/fffctl
+          tar -czf "fff-${{ matrix.target }}.tar.gz" -C homebrew-bundle .
+
+      - name: Upload Homebrew bundle
+        if: contains(matrix.os, 'macos')
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-${{ matrix.target }}
+          path: fff-${{ matrix.target }}.tar.gz
 
       - name: Build for Windows
         if: contains(matrix.os, 'windows')
@@ -411,6 +435,19 @@ jobs:
         working-directory: ./binaries
         run: |
           for dir in mcp-*/; do
+            for file in "$dir"*; do
+              if [ -f "$file" ]; then
+                filename=$(basename "$file")
+                mv "$file" "./$filename"
+              fi
+            done
+            rmdir "$dir" 2>/dev/null || true
+          done
+
+      - name: Flatten Homebrew bundle artifacts
+        working-directory: ./binaries
+        run: |
+          for dir in homebrew-*/; do
             for file in "$dir"*; do
               if [ -f "$file" ]; then
                 filename=$(basename "$file")
@@ -579,3 +616,50 @@ jobs:
 
           cd packages/pi-fff
           npm publish --tag "$TAG" --access public --provenance
+
+  update-homebrew-formula:
+    name: Update Homebrew Formula
+    needs: [release]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Need write access to push the formula update
+          token: ${{ github.token }}
+
+      - name: Install Lua
+        uses: leafo/gh-actions-lua@v12
+
+      - name: Determine version
+        id: version
+        run: lua scripts/determine-version.lua
+
+      - name: Download Homebrew bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: homebrew-*-apple-darwin
+          path: ./homebrew-artifacts
+
+      - name: Compute SHA256 and update formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARM64_TGZ="./homebrew-artifacts/homebrew-aarch64-apple-darwin/fff-aarch64-apple-darwin.tar.gz"
+          X86_TGZ="./homebrew-artifacts/homebrew-x86_64-apple-darwin/fff-x86_64-apple-darwin.tar.gz"
+
+          ARM64_SHA=$(sha256sum "$ARM64_TGZ" | cut -d' ' -f1)
+          X86_SHA=$(sha256sum "$X86_TGZ" | cut -d' ' -f1)
+
+          python3 scripts/update-homebrew-formula.py \
+            packaging/homebrew/Formula/fff.rb \
+            "$VERSION" "$ARM64_SHA" "$X86_SHA"
+
+      - name: Commit and push formula update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packaging/homebrew/Formula/fff.rb
+          git commit -m "chore: bump Homebrew formula to ${{ steps.version.outputs.version }}"
+          git push origin main

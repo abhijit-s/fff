@@ -1,29 +1,42 @@
 class Fff < Formula
   desc "Fast frecency-ranked file finder MCP server for AI code assistants"
   homepage "https://github.com/abhijit-s/fff"
-  url "https://github.com/abhijit-s/fff/archive/refs/tags/v0.13.0.tar.gz"
-  sha256 "ec6d65d517b05a0a32aae338de4eea6a8a6bb2bf896d0d636d0589353c1c6626"
+  version "0.13.0"
   license "MIT"
-  # Local dev: brew install --HEAD abhijit-s/fff/fff
-  head do
-    url "https://github.com/abhijit-s/fff.git", branch: "main"
+
+  # Pre-built binaries — no Rust/LLVM dependency.
+  on_macos do
+    on_arm do
+      url "https://github.com/abhijit-s/fff/releases/download/v0.13.0/fff-aarch64-apple-darwin.tar.gz"
+      sha256 "PLACEHOLDER_ARM64"
+    end
+    on_intel do
+      url "https://github.com/abhijit-s/fff/releases/download/v0.13.0/fff-x86_64-apple-darwin.tar.gz"
+      sha256 "PLACEHOLDER_X86_64"
+    end
   end
 
-  depends_on "rust" => :build
+  # HEAD: build from source (requires Rust via rustup or brew)
+  head do
+    url "https://github.com/abhijit-s/fff.git", branch: "main"
+    depends_on "rust" => :build
+  end
 
   def install
-    # Prevent vendored libgit2's cmake build from linking Homebrew's sqlite.
-    # libgit2 uses sqlite only for credential caching, which fff does not use.
-    ENV["CMAKE_ARGS"] = "-DUSE_SQLITE_CREDENTIAL_CACHING=OFF"
-
-    system "cargo", "build", "--release", "--no-default-features",
-           "-p", "fff-engine", "-p", "fff-mcp", "-p", "fff-ctl"
-
-    # fff-mcp locates fff-engine via current_exe().parent() at runtime,
-    # so both binaries must be installed to the same directory.
-    bin.install "target/release/fff-mcp"
-    bin.install "target/release/fff-engine"
-    bin.install "target/release/fffctl"
+    if build.head?
+      ENV["CMAKE_ARGS"] = "-DUSE_SQLITE_CREDENTIAL_CACHING=OFF"
+      system "cargo", "build", "--release", "--no-default-features",
+             "-p", "fff-engine", "-p", "fff-mcp", "-p", "fff-ctl"
+      bin.install "target/release/fff-mcp"
+      bin.install "target/release/fff-engine"
+      bin.install "target/release/fffctl"
+    else
+      # fff-mcp locates fff-engine via current_exe().parent() at runtime,
+      # so all three must live in the same directory.
+      bin.install "fff-mcp"
+      bin.install "fff-engine"
+      bin.install "fffctl"
+    end
   end
 
   def caveats
