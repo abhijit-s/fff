@@ -648,6 +648,8 @@ dependencies = [
  "clap",
  "fff-ipc",
  "libc",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
