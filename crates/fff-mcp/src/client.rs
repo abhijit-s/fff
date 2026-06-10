@@ -72,6 +72,17 @@ impl EngineClient {
         &self.base_path
     }
 
+    /// Construct from an arbitrary stream — pool tests only.
+    #[cfg(test)]
+    pub(crate) fn from_stream(stream: UnixStream, base_path: PathBuf) -> Self {
+        let writer = BufWriter::new(stream.try_clone().expect("clone stream"));
+        Self {
+            reader: BufReader::new(stream),
+            writer,
+            base_path,
+        }
+    }
+
     /// Connect directly to a legacy per-root singleton engine.
     ///
     /// Uses `fff_ipc::socket_path(base_path)` — the singleton's well-known socket.

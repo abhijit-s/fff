@@ -94,6 +94,11 @@ pub struct FindFilesParams {
     pub max_results: Option<f64>,
     /// Cursor from previous result. Only use if previous results weren't sufficient.
     pub cursor: Option<String>,
+    /// Optional. Target a specific registered root by absolute path. Omit to
+    /// use the default root. Multi-root requires fff-engine in master mode.
+    /// Call `list_roots` to discover available roots.
+    #[serde(default)]
+    pub base_path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -112,6 +117,11 @@ pub struct GrepParams {
     pub cursor: Option<String>,
     /// Output format (default 'content').
     pub output_mode: Option<String>,
+    /// Optional. Target a specific registered root by absolute path. Omit to
+    /// use the default root. Multi-root requires fff-engine in master mode.
+    /// Call `list_roots` to discover available roots.
+    #[serde(default)]
+    pub base_path: Option<String>,
 }
 
 fn deserialize_patterns<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -176,6 +186,11 @@ pub struct MultiGrepParams {
     pub output_mode: Option<String>,
     /// Context lines before/after each match.
     pub context: Option<f64>,
+    /// Optional. Target a specific registered root by absolute path. Omit to
+    /// use the default root. Multi-root requires fff-engine in master mode.
+    /// Call `list_roots` to discover available roots.
+    #[serde(default)]
+    pub base_path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -191,12 +206,20 @@ pub struct ListRecentFilesParams {
     pub max_results: Option<f64>,
     /// When true, only include files with uncommitted changes (default false).
     pub dirty_only: Option<bool>,
+    /// Optional. Target a specific registered root by absolute path. Omit to
+    /// use the default root. Multi-root requires fff-engine in master mode.
+    #[serde(default)]
+    pub base_path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetGitStatusParams {
     /// When true, include clean files as well (default false — only dirty files).
     pub include_clean: Option<bool>,
+    /// Optional. Target a specific registered root by absolute path. Omit to
+    /// use the default root. Multi-root requires fff-engine in master mode.
+    #[serde(default)]
+    pub base_path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -204,7 +227,14 @@ pub struct ListDirectoriesParams {
     /// Maximum results (default 30).
     #[serde(rename = "maxResults")]
     pub max_results: Option<f64>,
+    /// Optional. Target a specific registered root by absolute path. Omit to
+    /// use the default root. Multi-root requires fff-engine in master mode.
+    #[serde(default)]
+    pub base_path: Option<String>,
 }
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ListRootsParams {}
 
 #[derive(Clone)]
 pub struct FffServer {
@@ -212,14 +242,14 @@ pub struct FffServer {
     frecency: SharedFrecency,
     cursor_store: Arc<Mutex<CursorStore>>,
     update_notice_sent: Arc<AtomicBool>,
-    /// Unix proxy path: connects to fff-engine over a socket.
-    /// When Some, all tool handlers route through the engine rather than
-    /// calling fff-core directly.
+    /// Unix proxy path: per-root connection pool. When `Some`, all tool
+    /// handlers route through fff-engine via the pool rather than calling
+    /// fff-core directly.
     #[cfg(unix)]
-    engine_client: Option<Arc<std::sync::Mutex<crate::client::EngineClient>>>,
-    /// Base path used for crash recovery respawn.
+    pool: Option<Arc<crate::pool::ConnectionPool>>,
+    /// Startup-time registry of known roots (default + extras via `--root`).
     #[cfg(unix)]
-    engine_base_path: Option<std::path::PathBuf>,
+    registry: Option<Arc<crate::registry::RootRegistry>>,
 }
 
 impl FffServer {
@@ -230,25 +260,70 @@ impl FffServer {
             cursor_store: Arc::new(Mutex::new(CursorStore::new())),
             update_notice_sent: Arc::new(AtomicBool::new(false)),
             #[cfg(unix)]
-            engine_client: None,
+            pool: None,
             #[cfg(unix)]
-            engine_base_path: None,
+            registry: None,
         }
     }
 
     /// Create a proxy server backed by fff-engine (Unix only).
     #[cfg(unix)]
-    pub fn new_proxy(client: crate::client::EngineClient, base_path: std::path::PathBuf) -> Self {
+    pub fn new_proxy(
+        pool: Arc<crate::pool::ConnectionPool>,
+        registry: Arc<crate::registry::RootRegistry>,
+    ) -> Self {
         use fff::{SharedFilePicker, SharedFrecency};
         Self {
             picker: SharedFilePicker::default(),
             frecency: SharedFrecency::default(),
             cursor_store: Arc::new(Mutex::new(CursorStore::new())),
             update_notice_sent: Arc::new(AtomicBool::new(false)),
-            engine_client: Some(Arc::new(std::sync::Mutex::new(client))),
-            #[cfg(unix)]
-            engine_base_path: Some(base_path),
+            pool: Some(pool),
+            registry: Some(registry),
         }
+    }
+
+    /// Resolve the effective base_path for a tool call. Returns
+    /// `Ok(Some(path))` to dispatch via the pool, `Ok(None)` to fall through
+    /// to direct mode, or `Err(...)` for the multi-root-without-master case.
+    #[cfg(unix)]
+    fn resolve_route(
+        &self,
+        explicit: Option<&str>,
+    ) -> Result<Option<std::path::PathBuf>, ErrorData> {
+        let Some(registry) = self.registry.as_ref() else {
+            return Ok(None);
+        };
+        match explicit {
+            None => Ok(Some(registry.default_root().to_path_buf())),
+            Some(raw) => {
+                let path = std::path::PathBuf::from(raw);
+                if registry.is_default(&path) {
+                    return Ok(Some(registry.default_root().to_path_buf()));
+                }
+                if !master_mode_available() {
+                    return Err(ErrorData::invalid_params(
+                        "multi-root requires master mode; start fff-engine in master mode \
+                         or omit the base_path argument"
+                            .to_string(),
+                        None,
+                    ));
+                }
+                Ok(Some(path))
+            }
+        }
+    }
+
+    /// Dispatch a SearchRequest via the connection pool. Returns None when
+    /// the server is not in proxy mode (no pool configured).
+    #[cfg(unix)]
+    fn dispatch(
+        &self,
+        base_path: &std::path::Path,
+        req: &fff_ipc::types::SearchRequest,
+    ) -> Option<fff_ipc::types::SearchResponse> {
+        let pool = self.pool.as_ref()?;
+        Some(pool.search_with_retry(base_path, req))
     }
 
     #[allow(dead_code)]
@@ -455,14 +530,19 @@ impl FffServer {
         cursor_id: Option<&str>,
         output_mode: OutputMode,
         context: Option<usize>,
+        base_path_arg: Option<&str>,
     ) -> Option<Result<CallToolResult, ErrorData>> {
         use crate::output::wire::WireGrepFormatter;
         use fff::grep::has_regex_metacharacters;
         use fff::{AiGrepConfig, QueryParser};
         use fff_ipc::types::{GrepOptions, SearchRequest, SearchResponse, WireGrepMode};
 
-        let client_arc = self.engine_client.as_ref()?;
-        let base_path = self.engine_base_path.as_deref()?;
+        self.pool.as_ref()?;
+        let base_path = match self.resolve_route(base_path_arg) {
+            Ok(Some(p)) => p,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
 
         let file_offset = cursor_id
             .and_then(|id| self.cursor_store.lock().ok()?.get(id))
@@ -506,10 +586,7 @@ impl FffServer {
             },
         };
 
-        let response = client_arc
-            .lock()
-            .ok()?
-            .search_with_recovery(&req, base_path);
+        let response = self.dispatch(&base_path, &req)?;
 
         match response {
             SearchResponse::GrepResults(wire) => {
@@ -543,12 +620,17 @@ impl FffServer {
         query: &str,
         max_results: usize,
         cursor_id: Option<&str>,
+        base_path_arg: Option<&str>,
     ) -> Option<Result<CallToolResult, ErrorData>> {
         use crate::output::wire::format_wire_find_files;
         use fff_ipc::types::{FindOptions, SearchRequest, SearchResponse};
 
-        let client_arc = self.engine_client.as_ref()?;
-        let base_path = self.engine_base_path.as_deref()?;
+        self.pool.as_ref()?;
+        let base_path = match self.resolve_route(base_path_arg) {
+            Ok(Some(p)) => p,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
 
         let page_offset = cursor_id
             .and_then(|id| self.cursor_store.lock().ok()?.get(id))
@@ -566,10 +648,7 @@ impl FffServer {
             },
         };
 
-        let response = client_arc
-            .lock()
-            .ok()?
-            .search_with_recovery(&req, base_path);
+        let response = self.dispatch(&base_path, &req)?;
 
         match response {
             SearchResponse::SearchResults(items) => {
@@ -593,10 +672,18 @@ impl FffServer {
 
     #[cfg(unix)]
     fn proxy_record_access(&self, path: &str) -> Option<Result<CallToolResult, ErrorData>> {
-        let client_arc = self.engine_client.as_ref()?;
-        if let Ok(mut client) = client_arc.lock() {
-            client.record_access(path);
-        }
+        use fff_ipc::types::SearchRequest;
+
+        let pool = self.pool.as_ref()?;
+        let registry = self.registry.as_ref()?;
+        // Longest-prefix routing: pick the root that owns this file path.
+        let base_path = registry.root_for_path(std::path::Path::new(path));
+        let req = SearchRequest::RecordAccess {
+            path: path.to_owned(),
+        };
+        // Best-effort dispatch — record_access is fire-and-forget in the
+        // single-root path, so swallow errors here too.
+        let _ = pool.search_with_retry(&base_path, &req);
         Some(Ok(CallToolResult::success(vec![Content::text("ok")])))
     }
 
@@ -605,16 +692,18 @@ impl FffServer {
         &self,
         limit: usize,
         dirty_only: bool,
+        base_path_arg: Option<&str>,
     ) -> Option<Result<CallToolResult, ErrorData>> {
         use fff_ipc::types::{SearchRequest, SearchResponse};
 
-        let client_arc = self.engine_client.as_ref()?;
-        let base_path = self.engine_base_path.as_deref()?;
+        self.pool.as_ref()?;
+        let base_path = match self.resolve_route(base_path_arg) {
+            Ok(Some(p)) => p,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
         let req = SearchRequest::ListRecentFiles { limit, dirty_only };
-        let response = client_arc
-            .lock()
-            .ok()?
-            .search_with_recovery(&req, base_path);
+        let response = self.dispatch(&base_path, &req)?;
 
         match response {
             SearchResponse::RecentFiles(items) => {
@@ -638,16 +727,18 @@ impl FffServer {
     fn proxy_get_git_status(
         &self,
         include_clean: bool,
+        base_path_arg: Option<&str>,
     ) -> Option<Result<CallToolResult, ErrorData>> {
         use fff_ipc::types::{SearchRequest, SearchResponse};
 
-        let client_arc = self.engine_client.as_ref()?;
-        let base_path = self.engine_base_path.as_deref()?;
+        self.pool.as_ref()?;
+        let base_path = match self.resolve_route(base_path_arg) {
+            Ok(Some(p)) => p,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
         let req = SearchRequest::GetGitStatus { include_clean };
-        let response = client_arc
-            .lock()
-            .ok()?
-            .search_with_recovery(&req, base_path);
+        let response = self.dispatch(&base_path, &req)?;
 
         match response {
             SearchResponse::GitStatus(items) => {
@@ -668,16 +759,21 @@ impl FffServer {
     }
 
     #[cfg(unix)]
-    fn proxy_list_directories(&self, limit: usize) -> Option<Result<CallToolResult, ErrorData>> {
+    fn proxy_list_directories(
+        &self,
+        limit: usize,
+        base_path_arg: Option<&str>,
+    ) -> Option<Result<CallToolResult, ErrorData>> {
         use fff_ipc::types::{SearchRequest, SearchResponse};
 
-        let client_arc = self.engine_client.as_ref()?;
-        let base_path = self.engine_base_path.as_deref()?;
+        self.pool.as_ref()?;
+        let base_path = match self.resolve_route(base_path_arg) {
+            Ok(Some(p)) => p,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
         let req = SearchRequest::ListDirectories { limit };
-        let response = client_arc
-            .lock()
-            .ok()?
-            .search_with_recovery(&req, base_path);
+        let response = self.dispatch(&base_path, &req)?;
 
         match response {
             SearchResponse::Directories(items) => {
@@ -706,8 +802,12 @@ impl FffServer {
         use crate::output::wire::WireGrepFormatter;
         use fff_ipc::types::{GrepOptions, SearchRequest, SearchResponse, WireGrepMode};
 
-        let client_arc = self.engine_client.as_ref()?;
-        let base_path = self.engine_base_path.as_deref()?;
+        self.pool.as_ref()?;
+        let base_path = match self.resolve_route(params.base_path.as_deref()) {
+            Ok(Some(p)) => p,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
 
         let file_offset = params
             .cursor
@@ -739,10 +839,7 @@ impl FffServer {
             },
         };
 
-        let response = client_arc
-            .lock()
-            .ok()?
-            .search_with_recovery(&req, base_path);
+        let response = self.dispatch(&base_path, &req)?;
 
         match response {
             SearchResponse::GrepResults(wire) => {
@@ -790,7 +887,12 @@ impl FffServer {
         let query = &params.query;
 
         #[cfg(unix)]
-        if let Some(result) = self.proxy_find_files(query, max_results, params.cursor.as_deref()) {
+        if let Some(result) = self.proxy_find_files(
+            query,
+            max_results,
+            params.cursor.as_deref(),
+            params.base_path.as_deref(),
+        ) {
             let mut r = result?;
             self.maybe_append_update_notice(&mut r);
             return Ok(r);
@@ -915,6 +1017,7 @@ impl FffServer {
             params.cursor.as_deref(),
             output_mode,
             None,
+            params.base_path.as_deref(),
         ) {
             let mut r = result?;
             self.maybe_append_update_notice(&mut r);
@@ -1019,7 +1122,9 @@ impl FffServer {
         let dirty_only = params.dirty_only.unwrap_or(false);
 
         #[cfg(unix)]
-        if let Some(result) = self.proxy_list_recent_files(limit, dirty_only) {
+        if let Some(result) =
+            self.proxy_list_recent_files(limit, dirty_only, params.base_path.as_deref())
+        {
             let mut r = result?;
             self.maybe_append_update_notice(&mut r);
             return Ok(r);
@@ -1080,7 +1185,8 @@ impl FffServer {
         let include_clean = params.include_clean.unwrap_or(false);
 
         #[cfg(unix)]
-        if let Some(result) = self.proxy_get_git_status(include_clean) {
+        if let Some(result) = self.proxy_get_git_status(include_clean, params.base_path.as_deref())
+        {
             let mut r = result?;
             self.maybe_append_update_notice(&mut r);
             return Ok(r);
@@ -1137,7 +1243,7 @@ impl FffServer {
         let limit = normalize_max_results(params.max_results, 30);
 
         #[cfg(unix)]
-        if let Some(result) = self.proxy_list_directories(limit) {
+        if let Some(result) = self.proxy_list_directories(limit, params.base_path.as_deref()) {
             let mut r = result?;
             self.maybe_append_update_notice(&mut r);
             return Ok(r);
@@ -1174,6 +1280,49 @@ impl FffServer {
         let mut result = CallToolResult::success(vec![Content::text(lines.join("\n"))]);
         self.maybe_append_update_notice(&mut result);
         Ok(result)
+    }
+
+    /// List the project roots this fff-mcp instance can search.
+    #[tool(
+        name = "list_roots",
+        description = "List the project roots this fff-mcp instance can search. Returns each registered base_path with a `default` flag. Pass a returned `base_path` to other tools to target a specific root. Call this first to discover which repos this fff-mcp instance can search."
+    )]
+    fn list_roots(
+        &self,
+        Parameters(_params): Parameters<ListRootsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        #[cfg(unix)]
+        if let Some(registry) = self.registry.as_ref() {
+            let roots: Vec<serde_json::Value> = registry
+                .all()
+                .into_iter()
+                .map(|(p, is_default)| {
+                    serde_json::json!({
+                        "base_path": p.to_string_lossy(),
+                        "default": is_default,
+                    })
+                })
+                .collect();
+            let body = serde_json::json!({ "roots": roots });
+            return Ok(CallToolResult::success(vec![Content::text(
+                body.to_string(),
+            )]));
+        }
+        // Direct (no engine) mode — report the picker's base path as the
+        // only known root.
+        let guard = self.picker.read().map_err(|e| {
+            ErrorData::internal_error(format!("Failed to acquire picker lock: {e}"), None)
+        })?;
+        let base = guard
+            .as_ref()
+            .map(|p| p.base_path().to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let body = serde_json::json!({
+            "roots": [{ "base_path": base, "default": true }],
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
     }
 }
 
@@ -1363,6 +1512,19 @@ fn format_directories_wire(items: &[fff_ipc::types::WireDirEntry]) -> String {
         .map(|d| format!("{}{}", d.path, file_suffix(None, d.max_frecency)))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// True when the master socket appears alive (file exists and accepts a
+/// connection). Used to gate non-default `base_path` calls — multi-root
+/// requires the master+worker engine.
+#[cfg(unix)]
+fn master_mode_available() -> bool {
+    use std::os::unix::net::UnixStream;
+    let sock = fff_ipc::master_socket_path();
+    if !sock.exists() {
+        return false;
+    }
+    UnixStream::connect(&sock).is_ok()
 }
 
 #[cfg(test)]

@@ -498,3 +498,204 @@ fn u7_6_different_base_paths_may_share_worker() {
     );
     // _guard drops here, killing master.
 }
+
+// ── Multi-root: ConnectionPool reuses one client per base_path ───────────────
+
+use fff_mcp::pool::ConnectionPool;
+use fff_mcp::registry::RootRegistry;
+
+/// Pool caches one EngineClient per canonicalized base_path. Looking up
+/// the same path twice returns the same `Arc`, while distinct paths
+/// produce distinct clients.
+#[test]
+fn pool_get_or_connect_caches_per_base_path() {
+    let env = TestEnv::new();
+    let _guard = KillOnDrop(env.spawn_master());
+
+    let master_sock = env.master_socket();
+    assert!(
+        wait_socket(&master_sock, 10_000),
+        "master socket did not appear"
+    );
+
+    let root_a = env.root.join("pool_a");
+    let root_b = env.root.join("pool_b");
+    std::fs::create_dir_all(&root_a).expect("create pool_a");
+    std::fs::create_dir_all(&root_b).expect("create pool_b");
+
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("XDG_CACHE_HOME", env.cache_dir());
+        std::env::set_var("XDG_RUNTIME_DIR", env.runtime_dir());
+        std::env::set_var("XDG_CONFIG_HOME", env.config_dir());
+    }
+    env.write_config();
+
+    let pool = ConnectionPool::new();
+    let cell_a1 = pool.get_or_connect(&root_a).expect("connect A");
+    let cell_a2 = pool.get_or_connect(&root_a).expect("connect A again");
+    let cell_b = pool.get_or_connect(&root_b).expect("connect B");
+
+    assert!(
+        std::sync::Arc::ptr_eq(&cell_a1, &cell_a2),
+        "two get_or_connect calls for the same root must return the same Arc"
+    );
+    assert!(
+        !std::sync::Arc::ptr_eq(&cell_a1, &cell_b),
+        "different roots must produce distinct clients"
+    );
+
+    unsafe {
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+}
+
+/// After invalidate(), the next get_or_connect re-runs the full handshake
+/// and produces a new Arc — proving the entry was actually evicted.
+#[test]
+fn pool_invalidate_then_reconnect_makes_new_arc() {
+    let env = TestEnv::new();
+    let _guard = KillOnDrop(env.spawn_master());
+
+    assert!(
+        wait_socket(&env.master_socket(), 10_000),
+        "master socket did not appear"
+    );
+
+    let root = env.root.join("pool_invalidate");
+    std::fs::create_dir_all(&root).expect("create root");
+
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("XDG_CACHE_HOME", env.cache_dir());
+        std::env::set_var("XDG_RUNTIME_DIR", env.runtime_dir());
+        std::env::set_var("XDG_CONFIG_HOME", env.config_dir());
+    }
+    env.write_config();
+
+    let pool = ConnectionPool::new();
+    let first = pool.get_or_connect(&root).expect("first connect");
+    pool.invalidate(&root);
+    let second = pool.get_or_connect(&root).expect("second connect");
+    assert!(
+        !std::sync::Arc::ptr_eq(&first, &second),
+        "post-invalidate connect should produce a fresh Arc"
+    );
+
+    unsafe {
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+}
+
+/// FindFiles through the pool against an explicit root routes to that
+/// root's worker — verified by issuing the request and observing a
+/// successful response. With a small TempDir as the root, the only file
+/// present is the worker probe (none), but the worker accepts the request
+/// and returns SearchResults rather than an error.
+#[test]
+fn pool_find_files_with_explicit_root_routes_to_worker() {
+    let env = TestEnv::new();
+    let _guard = KillOnDrop(env.spawn_master());
+
+    assert!(
+        wait_socket(&env.master_socket(), 10_000),
+        "master socket did not appear"
+    );
+
+    let root_a = env.root.join("multi_a");
+    let root_b = env.root.join("multi_b");
+    std::fs::create_dir_all(&root_a).expect("create multi_a");
+    std::fs::create_dir_all(&root_b).expect("create multi_b");
+
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("XDG_CACHE_HOME", env.cache_dir());
+        std::env::set_var("XDG_RUNTIME_DIR", env.runtime_dir());
+        std::env::set_var("XDG_CONFIG_HOME", env.config_dir());
+    }
+    env.write_config();
+
+    let pool = ConnectionPool::new();
+    let req = SearchRequest::FindFiles {
+        query: String::new(),
+        options: FindOptions::default(),
+    };
+    let resp_a = pool.search_with_retry(&root_a, &req);
+    let resp_b = pool.search_with_retry(&root_b, &req);
+
+    match (&resp_a, &resp_b) {
+        (SearchResponse::SearchResults(_), SearchResponse::SearchResults(_)) => {}
+        _ => {
+            unsafe {
+                std::env::remove_var("XDG_CACHE_HOME");
+                std::env::remove_var("XDG_RUNTIME_DIR");
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+            panic!("expected SearchResults from both roots, got {resp_a:?} and {resp_b:?}");
+        }
+    }
+
+    unsafe {
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+}
+
+/// RootRegistry::all() returns the registered roots in stable order
+/// (default first), and is_default() agrees with the original input.
+#[test]
+fn registry_lists_default_then_additional() {
+    let tmp = TempDir::new().expect("tempdir");
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+
+    let reg = RootRegistry::new(&a, vec![b.clone()]);
+    let all = reg.all();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].0, a.canonicalize().unwrap());
+    assert!(all[0].1);
+    assert_eq!(all[1].0, b.canonicalize().unwrap());
+    assert!(!all[1].1);
+
+    assert!(reg.is_default(&a));
+    assert!(!reg.is_default(&b));
+}
+
+/// record_access-style path resolution: longest-prefix wins, with the
+/// default root as the fallback.
+#[test]
+fn registry_path_resolution_matches_longest_prefix() {
+    let tmp = TempDir::new().expect("tempdir");
+    let outer = tmp.path().join("outer");
+    let inner = outer.join("inner");
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(inner.join("src")).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+
+    let reg = RootRegistry::new(&outer, vec![inner.clone(), other.clone()]);
+    // Create the probe file so canonicalize on macOS resolves /var → /private/var,
+    // matching the canonical form of the registered roots.
+    let probe_inner = inner.join("src/x.rs");
+    std::fs::write(&probe_inner, "").expect("write probe file");
+    let resolved = reg.root_for_path(&probe_inner);
+    assert_eq!(
+        resolved,
+        inner.canonicalize().unwrap(),
+        "longest prefix (inner) wins over outer"
+    );
+
+    let unrelated = std::env::temp_dir().join("definitely_not_under_outer_or_other");
+    let fallback = reg.root_for_path(&unrelated);
+    assert_eq!(
+        fallback,
+        outer.canonicalize().unwrap(),
+        "unmatched path must fall back to the default"
+    );
+}
