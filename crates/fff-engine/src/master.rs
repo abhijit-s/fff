@@ -14,7 +14,10 @@ use fff_ipc::{
     master_lockfile_path, master_socket_path, read_message,
     routing::{RoutingTable, WorkerEntry},
     routing_table_path,
-    types::{MasterRequest, MasterResponse, WorkerInfo},
+    types::{
+        HealthReport, MasterRequest, MasterResponse, SearchRequest, SearchResponse, WorkerHealth,
+        WorkerInfo,
+    },
     worker_socket_path, write_message,
 };
 use tokio::{
@@ -41,6 +44,8 @@ struct MasterState {
     idle_since: Mutex<HashMap<u32, Instant>>,
     /// Consecutive routing.json save failure count — resets on success.
     save_fail_count: AtomicU32,
+    /// Master startup time — used to report uptime via `fffctl health`.
+    started_at: Instant,
 }
 
 impl MasterState {
@@ -62,6 +67,7 @@ impl MasterState {
             next_index: Mutex::new(next_index),
             idle_since: Mutex::new(HashMap::new()),
             save_fail_count: AtomicU32::new(0),
+            started_at: Instant::now(),
         }
     }
 
@@ -150,6 +156,48 @@ impl MasterState {
                 pid: e.pid,
             })
             .collect()
+    }
+
+    // Fan out a Health request to every live worker and aggregate the
+    // per-root snapshots. A worker that fails to respond is reported with an
+    // empty roots vec — partial telemetry is still useful for AI consumers.
+    async fn collect_health(&self) -> HealthReport {
+        let targets: Vec<(u32, u32, std::path::PathBuf)> = {
+            let routing = self.routing.lock().await;
+            routing
+                .workers
+                .values()
+                .map(|e| (e.index, e.pid, worker_socket_path(e.index)))
+                .collect()
+        };
+
+        let mut handles = Vec::with_capacity(targets.len());
+        for (index, pid, sock) in targets {
+            handles.push(tokio::spawn(async move {
+                let roots = match query_worker_health(&sock).await {
+                    Ok(resp) => resp.roots,
+                    Err(e) => {
+                        tracing::warn!("master: worker-{index} health query failed: {e}");
+                        Vec::new()
+                    }
+                };
+                WorkerHealth { index, pid, roots }
+            }));
+        }
+
+        let mut workers = Vec::with_capacity(handles.len());
+        for h in handles {
+            if let Ok(w) = h.await {
+                workers.push(w);
+            }
+        }
+        workers.sort_by_key(|w| w.index);
+
+        HealthReport {
+            master_pid: std::process::id(),
+            uptime_sec: self.started_at.elapsed().as_secs(),
+            workers,
+        }
     }
 
     async fn worker_info(&self, index: u32) -> Option<WorkerInfo> {
@@ -285,6 +333,26 @@ impl MasterState {
         }
 
         Some(index)
+    }
+}
+
+// Connect to a worker socket, send Health as the first message, and read the
+// HealthResponse. Worker closes the connection after responding.
+async fn query_worker_health(
+    socket: &std::path::Path,
+) -> Result<fff_ipc::types::HealthResponse, String> {
+    let stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+    write_message(&mut write_half, &SearchRequest::Health)
+        .await
+        .map_err(|e| format!("write failed: {e}"))?;
+    match read_message::<_, SearchResponse>(&mut read_half).await {
+        Ok(SearchResponse::Health(resp)) => Ok(resp),
+        Ok(SearchResponse::Error(msg)) => Err(msg),
+        Ok(other) => Err(format!("unexpected response: {other:?}")),
+        Err(e) => Err(format!("read failed: {e}")),
     }
 }
 
@@ -676,6 +744,11 @@ async fn handle_connection(stream: tokio::net::UnixStream, ms: Arc<MasterState>)
         MasterRequest::EvictedRoot { slug } => {
             // Fire-and-forget: no response sent.
             ms.handle_evicted_root(&slug).await;
+        }
+
+        MasterRequest::Health => {
+            let report = ms.collect_health().await;
+            let _ = write_message(&mut write_half, &MasterResponse::HealthReport(report)).await;
         }
     }
 }

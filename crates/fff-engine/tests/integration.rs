@@ -159,6 +159,13 @@ impl TestEnv {
         })
     }
 
+    fn health(&self) -> fff_ipc::types::HealthReport {
+        match self.send_master_request(&MasterRequest::Health) {
+            MasterResponse::HealthReport(r) => r,
+            other => panic!("expected HealthReport, got {other:?}"),
+        }
+    }
+
     fn list_workers(&self) -> Vec<fff_ipc::types::WorkerInfo> {
         match self.send_master_request(&MasterRequest::ListWorkers) {
             MasterResponse::WorkerList { workers } => workers,
@@ -834,5 +841,78 @@ fn u6_startup_reconnects_live_discards_dead() {
     );
 
     kill_and_wait(live_worker);
+    sigterm_and_wait(&mut master, Duration::from_secs(5));
+}
+
+// ── Health ──────────────────────────────────────────────────────────────────────
+
+/// H1: After a Handshake plus a Connect, master Health reports the loaded root
+/// with `indexed_files >= 1` and the correct slug.
+#[test]
+fn health_reports_indexed_files_after_connect() {
+    use fff_ipc::base_path_slug;
+
+    let env = TestEnv::new();
+    let mut master = env.spawn_master();
+    assert!(env.wait_master(SOCKET_TIMEOUT));
+
+    // Create a project dir with one file so the picker has something to index.
+    let project = env.dir.path().join("h1_project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("hello.txt"), b"hello world").unwrap();
+
+    let base_path = project.to_str().unwrap();
+    let resp = env.handshake(base_path);
+    let (worker_sock, worker_idx) = match resp {
+        MasterResponse::WorkerSocket { path, worker_index } => (PathBuf::from(path), worker_index),
+        other => panic!("expected WorkerSocket, got {other:?}"),
+    };
+
+    // Connect to the worker to trigger picker init for this root.
+    assert!(env.wait_socket(&worker_sock, SOCKET_TIMEOUT));
+    let _stream = env.worker_connect(&worker_sock, base_path);
+
+    // Poll Health until indexed_files >= 1 (scan completes asynchronously).
+    let expected_slug = base_path_slug(&project);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let (report, saw_files) = loop {
+        let report = env.health();
+        let saw = report
+            .workers
+            .iter()
+            .find(|w| w.index == worker_idx)
+            .and_then(|w| w.roots.iter().find(|r| r.slug == expected_slug))
+            .is_some_and(|r| r.indexed_files.unwrap_or(0) >= 1);
+        if saw {
+            break (report, true);
+        }
+        if std::time::Instant::now() >= deadline {
+            break (report, false);
+        }
+        sleep(POLL_MS);
+    };
+
+    assert!(
+        saw_files,
+        "expected indexed_files >= 1 in health report, last report: {report:#?}"
+    );
+
+    assert!(report.master_pid > 0, "master_pid should be set");
+    let worker = report
+        .workers
+        .iter()
+        .find(|w| w.index == worker_idx)
+        .expect("worker present");
+    let root = worker
+        .roots
+        .iter()
+        .find(|r| r.slug == expected_slug)
+        .expect("root present");
+    assert_eq!(root.slug, expected_slug);
+    assert!(
+        root.last_scan_age_sec.is_some(),
+        "last_scan_age_sec should populate for worker-served roots"
+    );
+
     sigterm_and_wait(&mut master, Duration::from_secs(5));
 }

@@ -276,6 +276,45 @@ pub async fn handle_list_directories(state: &EngineState, limit: usize) -> Searc
     }
 }
 
+pub async fn handle_health(state: &EngineState) -> SearchResponse {
+    use fff_ipc::types::{HealthResponse, RootHealth};
+
+    let picker_arc = state.shared_picker.clone();
+    let base_path = state.base_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let guard = picker_arc.read().map_err(|e| e.to_string())?;
+        let picker = guard
+            .as_ref()
+            .ok_or_else(|| "File picker not yet initialized".to_string())?;
+
+        let indexed = picker.live_file_count() as u64;
+        let dirty = picker
+            .get_files()
+            .iter()
+            .filter(|f| !f.is_deleted() && f.git_status.is_some_and(fff::git::is_modified_status))
+            .count() as u64;
+
+        Ok::<_, String>(HealthResponse {
+            roots: vec![RootHealth {
+                slug: fff_ipc::base_path_slug(&base_path),
+                base_path: base_path.to_string_lossy().into_owned(),
+                indexed_files: Some(indexed),
+                // Singleton has no per-root load timestamp — workers report this.
+                last_scan_age_sec: None,
+                watcher_backlog: None,
+                dirty_count: Some(dirty),
+            }],
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => SearchResponse::Health(resp),
+        Ok(Err(msg)) => SearchResponse::Error(msg),
+        Err(e) => SearchResponse::Error(format!("spawn_blocking join error: {e}")),
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn to_core_grep_options(options: &GrepOptions) -> fff::grep::GrepSearchOptions {
