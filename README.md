@@ -41,39 +41,24 @@ The scripts live at [`install-mcp.sh`](./install-mcp.sh) and [`install-mcp.ps1`]
 
 Installs `fff-mcp`, `fff-engine`, and `fffctl` to the same Homebrew `bin/` directory. Co-location is required: `fff-mcp` finds `fff-engine` via its own executable path at runtime.
 
-The Homebrew formula lives in this repo at `Formula/fff.rb`, so the main repo doubles as a Homebrew tap.
+The Homebrew formula lives in a dedicated tap, [`abhijit-s/homebrew-tap`](https://github.com/abhijit-s/homebrew-tap); tagged releases here auto-update its formula.
 
 **Stable release:**
 
 ```bash
-brew tap abhijit-s/fff https://github.com/abhijit-s/fff
-brew install abhijit-s/fff/fff
+brew install abhijit-s/tap/fff
 ```
 
 **HEAD build** (builds from the current `main` branch):
 
 ```bash
-brew install --HEAD abhijit-s/fff/fff
+brew install --HEAD abhijit-s/tap/fff
 ```
 
 **Upgrade after a new release:**
 
 ```bash
 brew update && brew upgrade fff
-```
-
-**From a local clone** (for development iteration — formula stays in sync with your working tree):
-
-```bash
-# Symlink this repo's Formula directory into a brew tap directory
-brew tap-new abhijit-s/fff
-rm -rf /opt/homebrew/Library/Taps/abhijit-s/homebrew-fff/Formula
-ln -s /path/to/fff/Formula \
-      /opt/homebrew/Library/Taps/abhijit-s/homebrew-fff/Formula
-
-# Then install HEAD; subsequent reinstalls pick up your local changes
-brew install --HEAD abhijit-s/fff/fff
-brew reinstall --HEAD abhijit-s/fff/fff   # after edits
 ```
 
 **Register with Claude Code** after install:

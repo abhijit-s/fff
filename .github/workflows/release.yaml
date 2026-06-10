@@ -625,19 +625,26 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
-      contents: write
+      contents: read
     steps:
-      - uses: actions/checkout@v5
+      # Formula lives in the dedicated tap repo; this repo only owns the
+      # update script. HOMEBREW_TAP_TOKEN is a PAT with write access to
+      # abhijit-s/homebrew-tap (github.token can't reach another repo).
+      - name: Checkout fff (for the update script)
+        uses: actions/checkout@v5
         with:
-          # Need write access to push the formula update
-          token: ${{ github.token }}
+          path: src
 
-      - name: Install Lua
-        uses: leafo/gh-actions-lua@v12
+      - name: Checkout tap repo
+        uses: actions/checkout@v5
+        with:
+          repository: abhijit-s/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
 
-      - name: Determine version
+      - name: Compute version from tag
         id: version
-        run: lua scripts/determine-version.lua
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Download Homebrew bundles
         uses: actions/download-artifact@v4
@@ -645,7 +652,7 @@ jobs:
           pattern: homebrew-*-apple-darwin
           path: ./homebrew-artifacts
 
-      - name: Compute SHA256 and update formula
+      - name: Compute SHA256 and update tap formula
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           ARM64_TGZ="./homebrew-artifacts/homebrew-aarch64-apple-darwin/fff-aarch64-apple-darwin.tar.gz"
@@ -654,14 +661,19 @@ jobs:
           ARM64_SHA=$(sha256sum "$ARM64_TGZ" | cut -d' ' -f1)
           X86_SHA=$(sha256sum "$X86_TGZ" | cut -d' ' -f1)
 
-          python3 scripts/update-homebrew-formula.py \
-            Formula/fff.rb \
+          python3 src/scripts/update-homebrew-formula.py \
+            tap/Formula/fff.rb \
             "$VERSION" "$ARM64_SHA" "$X86_SHA"
 
-      - name: Commit and push formula update
+      - name: Commit and push formula update to tap
+        working-directory: tap
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/fff.rb
-          git commit -m "chore: bump Homebrew formula to ${{ steps.version.outputs.version }}"
-          git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo "Formula already up to date."
+          else
+            git commit -m "chore: bump fff to ${{ steps.version.outputs.version }}"
+            git push origin HEAD:main
+          fi
