@@ -18,7 +18,9 @@ use fff_ipc::{
 use fff_ipc::{read_message, write_message};
 use parking_lot::{Mutex, RwLock};
 use std::time::Instant;
-use tokio::{net::UnixListener, sync::Mutex as TokioMutex};
+#[cfg(unix)]
+use tokio::net::UnixListener;
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::state::{EffectiveArgs, EngineState};
 
@@ -172,6 +174,7 @@ impl WorkerState {
     // Fire-and-forget EvictedRoot to master socket.
     // Uses spawn_blocking because std::os::unix::net::UnixStream::connect is blocking.
     // Failure is benign — idle TTL will clean up the routing entry.
+    #[cfg(unix)]
     async fn notify_evicted(&self, slug: String) {
         let master = master_socket_path();
         let msg = MasterRequest::EvictedRoot { slug };
@@ -184,6 +187,9 @@ impl WorkerState {
             }
         });
     }
+
+    #[cfg(not(unix))]
+    async fn notify_evicted(&self, _slug: String) {}
 }
 
 // Read indexed_files and dirty_count off the shared picker without blocking
@@ -205,6 +211,7 @@ fn read_picker_freshness(state: &EngineState) -> (Option<u64>, Option<u64>) {
 }
 
 /// Entry point for worker mode. Binds the worker socket and serves connections.
+#[cfg(unix)]
 pub async fn run(index: u32, config: FffConfig) -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = worker_socket_path(index);
     let lockfile_path = worker_lockfile_path(index);
@@ -278,6 +285,12 @@ pub async fn run(index: u32, config: FffConfig) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub async fn run(_index: u32, _config: FffConfig) -> Result<(), Box<dyn std::error::Error>> {
+    Err("fff-engine worker mode is not supported on this platform".into())
+}
+
+#[cfg(unix)]
 async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<WorkerState>) {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 

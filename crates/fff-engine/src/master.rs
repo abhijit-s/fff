@@ -20,8 +20,9 @@ use fff_ipc::{
     },
     worker_socket_path, write_message,
 };
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::{
-    net::UnixListener,
     process::Command,
     sync::Mutex,
     time::{interval, sleep},
@@ -29,6 +30,7 @@ use tokio::{
 
 use crate::ring::HashRing;
 
+#[cfg(unix)]
 struct MasterState {
     config: WorkerConfig,
     exe_path: PathBuf,
@@ -48,6 +50,7 @@ struct MasterState {
     started_at: Instant,
 }
 
+#[cfg(unix)]
 impl MasterState {
     fn new(
         config: WorkerConfig,
@@ -338,6 +341,7 @@ impl MasterState {
 
 // Connect to a worker socket, send Health as the first message, and read the
 // HealthResponse. Worker closes the connection after responding.
+#[cfg(unix)]
 async fn query_worker_health(
     socket: &std::path::Path,
 ) -> Result<fff_ipc::types::HealthResponse, String> {
@@ -356,7 +360,23 @@ async fn query_worker_health(
     }
 }
 
+#[cfg(not(unix))]
+async fn query_worker_health(
+    _socket: &std::path::Path,
+) -> Result<fff_ipc::types::HealthResponse, String> {
+    Err("master mode is not supported on this platform".into())
+}
+
 /// Entry point for master mode.
+#[cfg(not(unix))]
+pub async fn run(
+    _config: fff_ipc::config::FffConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("fff-engine master mode is not supported on this platform".into())
+}
+
+/// Entry point for master mode.
+#[cfg(unix)]
 pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::error::Error>> {
     let lockfile = master_lockfile_path();
     if let Some(parent) = lockfile.parent() {
@@ -658,6 +678,7 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+#[cfg(unix)]
 async fn handle_connection(stream: tokio::net::UnixStream, ms: Arc<MasterState>) {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
