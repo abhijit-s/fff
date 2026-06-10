@@ -653,13 +653,13 @@ jobs:
           X86_SHA=$(sha256sum "$X86_TGZ" | cut -d' ' -f1)
 
           python3 scripts/update-homebrew-formula.py \
-            packaging/homebrew/Formula/fff.rb \
+            Formula/fff.rb \
             "$VERSION" "$ARM64_SHA" "$X86_SHA"
 
       - name: Commit and push formula update
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add packaging/homebrew/Formula/fff.rb
+          git add Formula/fff.rb
           git commit -m "chore: bump Homebrew formula to ${{ steps.version.outputs.version }}"
           git push origin HEAD:main
