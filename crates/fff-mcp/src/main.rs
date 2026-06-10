@@ -130,6 +130,12 @@ pub(crate) struct Args {
     #[arg(long = "root", value_name = "PATH")]
     root: Vec<std::path::PathBuf>,
 
+    /// Path to a TOML config file describing roots and the default root.
+    /// See docs for the schema. CLI `--base-path` overrides the config's
+    /// default; `--root` flags merge with config-declared roots.
+    #[arg(long = "config", value_name = "PATH")]
+    config_file: Option<std::path::PathBuf>,
+
     /// Path to the frecency database.
     #[arg(long = "frecency-db")]
     frecency_db_path: Option<String>,
@@ -186,6 +192,40 @@ pub(crate) struct Args {
     /// Accepts any RUST_LOG-style string: "debug", "info", "fff_engine=debug,info".
     #[arg(long = "set-log-level", value_name = "LEVEL")]
     pub(crate) set_log_level: Option<String>,
+}
+
+/// Assemble a `RootRegistry` from CLI args + an optional `--config` TOML.
+///
+/// `base_path` is already resolved (CLI > config.default > cwd). Named
+/// roots from the config file populate the registry alongside `--root`
+/// extras; duplicates by canonical path are dropped.
+fn build_registry(
+    base_path: &std::path::Path,
+    cli_extras: &[std::path::PathBuf],
+    config_file: Option<&registry::ConfigFile>,
+) -> registry::RootRegistry {
+    // Default name: matches when config.default selected a named root, OR
+    // when the resolved base_path equals one of the config roots' paths.
+    let default_name = config_file.and_then(|cfg| {
+        if let Some(def) = cfg.default.as_deref()
+            && cfg.roots.iter().any(|r| r.name.as_deref() == Some(def))
+        {
+            return Some(def.to_string());
+        }
+        cfg.name_for_path(base_path)
+    });
+
+    let mut extras: Vec<(Option<String>, std::path::PathBuf)> = Vec::new();
+    if let Some(cfg) = config_file {
+        for r in &cfg.roots {
+            extras.push((r.name.clone(), r.path.clone()));
+        }
+    }
+    for p in cli_extras {
+        extras.push((None, p.clone()));
+    }
+
+    registry::RootRegistry::with_named(base_path, default_name, extras)
 }
 
 /// Merge CLI args with config file, then apply hardcoded defaults for anything
@@ -269,12 +309,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: Failed to init tracing: {}", e);
     }
 
-    let base_path = args.base_path.unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-    });
+    // Load --config TOML up front so its `default` can feed `base_path` when
+    // the CLI did not pass `--base-path`.
+    let config_file = match args.config_file.as_deref() {
+        Some(path) => match registry::ConfigFile::load(path) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                eprintln!("fff-mcp: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    let base_path = args
+        .base_path
+        .clone()
+        .or_else(|| {
+            config_file
+                .as_ref()
+                .and_then(|c| c.resolve_default_path())
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        });
 
     let base_path = match Repository::discover(&base_path) {
         Ok(repo) => {
@@ -305,7 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !args.no_update_check {
                     update_check::spawn_update_check();
                 }
-                let registry = registry::RootRegistry::new(base_path_ref, args.root.clone());
+                let registry = build_registry(base_path_ref, &args.root, config_file.as_ref());
                 let pool = pool::ConnectionPool::new();
                 pool.insert(base_path_ref, engine_client);
                 let server =

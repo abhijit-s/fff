@@ -286,6 +286,8 @@ impl FffServer {
     /// Resolve the effective base_path for a tool call. Returns
     /// `Ok(Some(path))` to dispatch via the pool, `Ok(None)` to fall through
     /// to direct mode, or `Err(...)` for the multi-root-without-master case.
+    ///
+    /// Accepts either a registered root **name** (matched first) or a path.
     #[cfg(unix)]
     fn resolve_route(
         &self,
@@ -297,7 +299,30 @@ impl FffServer {
         match explicit {
             None => Ok(Some(registry.default_root().to_path_buf())),
             Some(raw) => {
+                if let Some(by_name) = registry.resolve_name(raw) {
+                    if registry.is_default(by_name) {
+                        return Ok(Some(registry.default_root().to_path_buf()));
+                    }
+                    if !master_mode_available() {
+                        return Err(ErrorData::invalid_params(
+                            "multi-root requires master mode; start fff-engine in master mode \
+                             or omit the base_path argument"
+                                .to_string(),
+                            None,
+                        ));
+                    }
+                    return Ok(Some(by_name.to_path_buf()));
+                }
                 let path = std::path::PathBuf::from(raw);
+                if !path.is_absolute() {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "base_path {raw:?} is neither a registered root name nor an absolute path; \
+                             call list_roots to see available roots"
+                        ),
+                        None,
+                    ));
+                }
                 if registry.is_default(&path) {
                     return Ok(Some(registry.default_root().to_path_buf()));
                 }
@@ -1285,7 +1310,7 @@ impl FffServer {
     /// List the project roots this fff-mcp instance can search.
     #[tool(
         name = "list_roots",
-        description = "List the project roots this fff-mcp instance can search. Returns each registered base_path with a `default` flag. Pass a returned `base_path` to other tools to target a specific root. Call this first to discover which repos this fff-mcp instance can search."
+        description = "List the project roots this fff-mcp instance can search. Returns each registered root as `{ base_path, name?, default }`. The `name` field is present only for roots declared with a name in the config file. Pass either a returned `base_path` or `name` to other tools' `base_path` argument to target that root. Call this first to discover which repos this fff-mcp instance can search."
     )]
     fn list_roots(
         &self,
@@ -1294,13 +1319,19 @@ impl FffServer {
         #[cfg(unix)]
         if let Some(registry) = self.registry.as_ref() {
             let roots: Vec<serde_json::Value> = registry
-                .all()
+                .all_with_names()
                 .into_iter()
-                .map(|(p, is_default)| {
-                    serde_json::json!({
-                        "base_path": p.to_string_lossy(),
-                        "default": is_default,
-                    })
+                .map(|(name, p, is_default)| {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert(
+                        "base_path".to_string(),
+                        serde_json::Value::String(p.to_string_lossy().into_owned()),
+                    );
+                    if let Some(n) = name {
+                        obj.insert("name".to_string(), serde_json::Value::String(n.to_string()));
+                    }
+                    obj.insert("default".to_string(), serde_json::Value::Bool(is_default));
+                    serde_json::Value::Object(obj)
                 })
                 .collect();
             let body = serde_json::json!({ "roots": roots });
@@ -1583,5 +1614,88 @@ mod tests {
         let via_pattern: FindFilesParams =
             serde_json::from_str(r#"{"pattern":"foo"}"#).expect("pattern alias");
         assert_eq!(via_pattern.query, "foo");
+    }
+
+    // ── resolve_route: name lookup + bad-input errors ──────────────────────
+
+    #[cfg(unix)]
+    fn server_with_registry(reg: crate::registry::RootRegistry) -> FffServer {
+        FffServer::new_proxy(Arc::new(crate::pool::ConnectionPool::new()), Arc::new(reg))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_route_unknown_name_returns_invalid_params() {
+        use crate::registry::RootRegistry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let reg = RootRegistry::with_named(tmp.path(), None, Vec::new());
+        let server = server_with_registry(reg);
+        let err = server
+            .resolve_route(Some("not-a-known-name"))
+            .expect_err("must reject");
+        assert!(
+            err.message
+                .contains("neither a registered root name nor an absolute path"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_route_relative_path_returns_invalid_params() {
+        use crate::registry::RootRegistry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let reg = RootRegistry::with_named(tmp.path(), None, Vec::new());
+        let server = server_with_registry(reg);
+        let err = server
+            .resolve_route(Some("./relative"))
+            .expect_err("must reject relative paths");
+        assert!(
+            err.message.contains("absolute path"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_route_known_name_returns_path() {
+        use crate::registry::RootRegistry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let reg = RootRegistry::with_named(tmp.path(), None, vec![(Some("ay".into()), a.clone())]);
+        let server = server_with_registry(reg);
+        // Without master mode active this returns Err (multi-root requires
+        // master), but the error tells us name lookup succeeded — different
+        // from the "neither name nor path" error.
+        match server.resolve_route(Some("ay")) {
+            Ok(Some(p)) => assert_eq!(p, a.canonicalize().unwrap()),
+            Ok(None) => panic!("expected resolved path"),
+            Err(e) => {
+                // Name was recognised — error must be the multi-root master
+                // gate, not the "unknown name" message.
+                assert!(
+                    e.message.contains("master mode"),
+                    "expected multi-root gate, got: {}",
+                    e.message
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_route_default_name_returns_default_path() {
+        use crate::registry::RootRegistry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let reg = RootRegistry::with_named(tmp.path(), Some("primary".into()), Vec::new());
+        let server = server_with_registry(reg);
+        let resolved = server
+            .resolve_route(Some("primary"))
+            .expect("default-by-name routes back to default")
+            .expect("Some path");
+        assert_eq!(resolved, tmp.path().canonicalize().unwrap());
     }
 }

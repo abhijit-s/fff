@@ -227,10 +227,10 @@ fn u7_2_connect_spawns_master_if_not_running() {
     // Clean up — connect spawns master as a detached child, so we reach into
     // the socket directory for its pid from the lockfile.
     let lockfile = env.cache_dir().join("fff").join("master.lock");
-    if let Ok(content) = std::fs::read_to_string(&lockfile) {
-        if let Ok(pid) = content.trim().parse::<libc::pid_t>() {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
+    if let Ok(content) = std::fs::read_to_string(&lockfile)
+        && let Ok(pid) = content.trim().parse::<libc::pid_t>()
+    {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
     }
 }
 
@@ -292,10 +292,10 @@ fn u7_3_connect_returns_error_not_hang_when_socket_missing() {
             assert_eq!(client.base_path(), nonexistent);
             // Clean up the spawned master.
             let lockfile = env.cache_dir().join("fff").join("master.lock");
-            if let Ok(content) = std::fs::read_to_string(&lockfile) {
-                if let Ok(pid) = content.trim().parse::<libc::pid_t>() {
-                    unsafe { libc::kill(pid, libc::SIGTERM) };
-                }
+            if let Ok(content) = std::fs::read_to_string(&lockfile)
+                && let Ok(pid) = content.trim().parse::<libc::pid_t>()
+            {
+                unsafe { libc::kill(pid, libc::SIGTERM) };
             }
         }
         Err(_) => {
@@ -666,6 +666,175 @@ fn registry_lists_default_then_additional() {
 
     assert!(reg.is_default(&a));
     assert!(!reg.is_default(&b));
+}
+
+// ── Config file: load & merge with CLI extras ─────────────────────────────────
+
+use fff_mcp::registry::{ConfigError, ConfigFile};
+
+fn write_config_file(dir: &Path, body: &str) -> PathBuf {
+    let p = dir.join("mcp.toml");
+    std::fs::write(&p, body).expect("write config");
+    p
+}
+
+/// Valid TOML config loads, populates registry, and the `default` field
+/// (a name) resolves to the correct path.
+#[test]
+fn config_default_by_name_selects_root() {
+    let tmp = TempDir::new().expect("tempdir");
+    let primary = tmp.path().join("primary");
+    let secondary = tmp.path().join("secondary");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::create_dir_all(&secondary).unwrap();
+    let body = format!(
+        r#"
+default = "primary"
+
+[[roots]]
+name = "primary"
+path = "{}"
+
+[[roots]]
+name = "secondary"
+path = "{}"
+"#,
+        primary.display(),
+        secondary.display()
+    );
+    let path = write_config_file(tmp.path(), &body);
+    let cfg = ConfigFile::load(&path).expect("load ok");
+
+    let default_path = cfg.resolve_default_path().expect("has default");
+    assert_eq!(default_path, primary);
+
+    // Build registry as main.rs would: default == primary, additional = both
+    // declared roots (the default one will dedupe out).
+    let extras: Vec<(Option<String>, PathBuf)> = cfg
+        .roots
+        .iter()
+        .map(|r| (r.name.clone(), r.path.clone()))
+        .collect();
+    let reg = RootRegistry::with_named(&default_path, Some("primary".into()), extras);
+    let all = reg.all_with_names();
+    assert_eq!(all.len(), 2, "default + 1 additional after dedupe");
+    assert_eq!(all[0].0, Some("primary"));
+    assert!(all[0].2);
+    assert_eq!(all[1].0, Some("secondary"));
+    assert!(!all[1].2);
+
+    // Name lookup resolves both.
+    assert_eq!(
+        reg.resolve_name("primary").unwrap(),
+        primary.canonicalize().unwrap()
+    );
+    assert_eq!(
+        reg.resolve_name("secondary").unwrap(),
+        secondary.canonicalize().unwrap()
+    );
+    assert!(reg.resolve_name("not-a-root").is_none());
+}
+
+/// Bad TOML returns a Parse error mentioning the offending file.
+#[test]
+fn config_parse_error_carries_file_path() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = write_config_file(tmp.path(), "this = = ill-formed\n");
+    let err = ConfigFile::load(&path).expect_err("must fail");
+    assert!(matches!(err, ConfigError::Parse { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains(path.to_str().unwrap()),
+        "error must mention the config path; got: {msg}"
+    );
+}
+
+/// `default` set to an absolute path also works without any named root.
+#[test]
+fn config_default_as_absolute_path_anonymous() {
+    let tmp = TempDir::new().expect("tempdir");
+    let alpha = tmp.path().join("alpha");
+    std::fs::create_dir_all(&alpha).unwrap();
+    let body = format!(
+        r#"
+default = "{p}"
+
+[[roots]]
+path = "{p}"
+"#,
+        p = alpha.display()
+    );
+    let path = write_config_file(tmp.path(), &body);
+    let cfg = ConfigFile::load(&path).expect("ok");
+    assert_eq!(cfg.resolve_default_path(), Some(alpha.clone()));
+
+    // No declared name → registry's default has no name.
+    let reg = RootRegistry::with_named(&alpha, None, Vec::new());
+    let all = reg.all_with_names();
+    assert_eq!(all.len(), 1);
+    assert!(all[0].0.is_none());
+}
+
+/// CLI `--root` flags are additive to config roots; dedupe by canonical path.
+#[test]
+fn config_plus_cli_extras_merge_and_dedupe() {
+    let tmp = TempDir::new().expect("tempdir");
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    let c = tmp.path().join("c");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::create_dir_all(&c).unwrap();
+
+    let body = format!(
+        r#"
+[[roots]]
+name = "ay"
+path = "{}"
+
+[[roots]]
+path = "{}"
+"#,
+        a.display(),
+        b.display()
+    );
+    let path = write_config_file(tmp.path(), &body);
+    let cfg = ConfigFile::load(&path).expect("ok");
+
+    // Simulate main.rs building extras: config-declared + CLI --root c + duplicate b
+    let mut extras: Vec<(Option<String>, PathBuf)> = cfg
+        .roots
+        .iter()
+        .map(|r| (r.name.clone(), r.path.clone()))
+        .collect();
+    extras.push((None, c.clone()));
+    extras.push((None, b.clone()));
+
+    let reg = RootRegistry::with_named(&a, Some("ay".into()), extras);
+    let all = reg.all_with_names();
+    // default(a) + b + c — second b deduped, default-a deduped out of extras.
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].1, a.canonicalize().unwrap());
+    assert_eq!(all[1].1, b.canonicalize().unwrap());
+    assert_eq!(all[2].1, c.canonicalize().unwrap());
+}
+
+/// Config's `default` set to an unknown name is rejected at load time.
+#[test]
+fn config_default_unknown_name_rejected_at_load() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = write_config_file(
+        tmp.path(),
+        r#"
+default = "phantom"
+
+[[roots]]
+name = "ay"
+path = "/tmp/whatever"
+"#,
+    );
+    let err = ConfigFile::load(&path).expect_err("must fail");
+    assert!(matches!(err, ConfigError::UnresolvedDefault { .. }));
 }
 
 /// record_access-style path resolution: longest-prefix wins, with the
