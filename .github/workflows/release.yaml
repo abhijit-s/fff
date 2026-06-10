@@ -507,7 +507,8 @@ jobs:
     name: Publish Rust crates
     needs: [build-nvim, build-c, build-mcp]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/use-trusted-publishing' || startsWith(github.ref, 'refs/tags/v'))
+    # Disabled: crates.io publishing not used — releases are Homebrew-only.
+    if: false
     permissions:
       contents: read
       id-token: write
@@ -538,7 +539,8 @@ jobs:
     name: Publish npm packages
     needs: [build-c]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/use-trusted-publishing' || startsWith(github.ref, 'refs/tags/v'))
+    # Disabled: npm publishing not used — releases are Homebrew-only.
+    if: false
     permissions:
       contents: read
       id-token: write
