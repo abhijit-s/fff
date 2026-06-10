@@ -692,6 +692,12 @@ impl FileItem {
     ///
     /// The caller provides a reusable `path_buf` (pre-filled with `base_path/`)
     /// and its `base_len` to avoid allocations when constructing the absolute path.
+    /// `recheck` is set ONLY for roots with degraded watch coverage. When set,
+    /// the file is stat'd and, if on-disk `(mtime, size)` disagree with the
+    /// cached `FileItem`, fresh bytes are read into the caller-owned `buf` /
+    /// `mmap_slot` (never the shared `OnceLock`), so a dropped watcher event
+    /// cannot serve stale/truncated content. Healthy roots pass `false` and
+    /// keep the byte-for-byte zero-syscall fast path.
     #[inline]
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
@@ -700,9 +706,31 @@ impl FileItem {
         arena: ArenaPtr,
         base_path: &Path,
         budget: &ContentCacheBudget,
+        recheck: bool,
     ) -> Option<&'a [u8]> {
+        let abs = self.absolute_path(arena, base_path);
+
+        // Degraded-root backstop: a single stat catches append, shrink, AND
+        // same-size in-place edits (mtime advances). On mismatch we bypass the
+        // cached slice and read FRESH bytes bounded by the on-disk size below.
+        let fresh_meta = if recheck {
+            let meta = std::fs::metadata(&abs).ok()?;
+            let disk_secs = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            if meta.len() == self.size && disk_secs == self.modified {
+                None
+            } else {
+                Some(meta.len())
+            }
+        } else {
+            None
+        };
+
         #[cfg(not(target_os = "windows"))]
-        {
+        if fresh_meta.is_none() {
             // Fast path: persistent cache hit (zero-copy). Safe here because
             // grep callers hold the picker read lock for the lifetime of the
             // returned slice — see [`Self::get_cached_content`] safety note.
@@ -712,14 +740,14 @@ impl FileItem {
         }
 
         let max_file_size = budget.max_file_size;
-        if self.is_binary() || self.size == 0 || self.size > max_file_size {
+        // Bound by the fresh size when stale, otherwise the cached size.
+        let effective_size = fresh_meta.unwrap_or(self.size);
+        if self.is_binary() || effective_size == 0 || effective_size > max_file_size {
             return None;
         }
 
-        let abs = self.absolute_path(arena, base_path);
-
         #[cfg(not(target_os = "windows"))]
-        if self.size >= FRESH_MMAP_THRESHOLD {
+        if effective_size >= FRESH_MMAP_THRESHOLD {
             let file = std::fs::File::open(&abs).ok()?;
             let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
             let stored = mmap_slot.insert(mmap);
@@ -728,7 +756,7 @@ impl FileItem {
             let _ = (mmap_slot, arena);
         }
 
-        let len = self.size as usize;
+        let len = effective_size as usize;
         buf.resize(len, 0);
 
         let mut file = std::fs::File::open(&abs).ok()?;

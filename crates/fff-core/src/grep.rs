@@ -394,6 +394,9 @@ struct GrepContext<'a, 'b> {
     prefilter: Option<&'a memchr::memmem::Finder<'b>>,
     prefilter_case_insensitive: bool,
     abort_signal: &'a AtomicBool,
+    // True only when the root has degraded watch coverage; forces the read
+    // path to re-stat cached candidates instead of trusting stale state.
+    recheck: bool,
 }
 
 impl GrepContext<'_, '_> {
@@ -955,6 +958,7 @@ pub(crate) fn multi_grep_search<'a>(
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
+    recheck: bool,
 ) -> GrepResult<'a> {
     let total_files = files.live_count();
 
@@ -1078,6 +1082,7 @@ pub(crate) fn multi_grep_search<'a>(
             prefilter: None, // no memmem prefilter for multi-pattern search
             prefilter_case_insensitive: false,
             abort_signal,
+            recheck,
         },
         |file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {
@@ -1269,6 +1274,7 @@ where
                         ctx.arena_for_file(file),
                         ctx.base_path,
                         ctx.budget,
+                        ctx.recheck,
                     )?;
 
                     // Fast whole-file memmem check before entering the
@@ -1594,6 +1600,7 @@ fn fuzzy_grep_search<'a>(
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
+    recheck: bool,
 ) -> GrepResult<'a> {
     // max_typos controls how many *needle* characters can be unmatched.
     // A transposition (e.g. "shcema" → "schema") costs ~1 typo with
@@ -1714,8 +1721,9 @@ fn fuzzy_grep_search<'a>(
                     arena
                 };
 
-                let file_bytes =
-                    file.get_content_for_search(buf, mmap_slot, file_arena, base_path, budget)?;
+                let file_bytes = file.get_content_for_search(
+                    buf, mmap_slot, file_arena, base_path, budget, recheck,
+                )?;
 
                 // File-level prefilter: check if enough distinct needle chars
                 // exist anywhere in the file bytes.  Uses memchr for speed.
@@ -1918,6 +1926,7 @@ pub(crate) fn grep_search<'a>(
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
+    recheck: bool,
 ) -> GrepResult<'a> {
     let total_files = files.live_count();
 
@@ -2049,6 +2058,7 @@ pub(crate) fn grep_search<'a>(
                 base_path,
                 arena,
                 overflow_arena,
+                recheck,
             );
         }
         GrepMode::Regex => build_regex(&grep_text, options.smart_case)
@@ -2195,6 +2205,7 @@ pub(crate) fn grep_search<'a>(
             prefilter: should_prefilter.then_some(&finder),
             prefilter_case_insensitive: case_insensitive,
             abort_signal,
+            recheck,
         },
         |file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {
@@ -2432,6 +2443,7 @@ mod tests {
             dir.path(),
             arena,
             arena,
+            false,
         );
 
         assert!(
@@ -2472,6 +2484,7 @@ mod tests {
             dir.path(),
             arena,
             arena,
+            false,
         );
         assert_eq!(
             result2.matches.len(),
@@ -2492,6 +2505,7 @@ mod tests {
             dir.path(),
             arena,
             arena,
+            false,
         );
         assert_eq!(
             result3.matches.len(),

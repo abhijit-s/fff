@@ -145,6 +145,9 @@ mod ignore;
 /// and [`QueryTracker`].
 pub mod shared;
 
+#[cfg(test)]
+mod content_staleness_recheck;
+
 pub use bigram_filter::*;
 pub use dbs::db_healthcheck::{DbHealth, DbHealthChecker};
 pub use error::{Error, Result};
