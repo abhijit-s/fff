@@ -1,3 +1,6 @@
+use fff_ipc::config::FffConfig;
+
+#[cfg(unix)]
 use std::{
     collections::HashMap,
     fs::OpenOptions,
@@ -8,22 +11,27 @@ use std::{
     },
 };
 
+#[cfg(unix)]
 use fff_ipc::{
-    base_path_slug,
-    config::FffConfig,
-    master_socket_path,
+    base_path_slug, master_socket_path,
     types::{HealthResponse, MasterRequest, RootHealth, SearchRequest, SearchResponse},
     worker_lockfile_path, worker_socket_path, write_message_sync,
 };
+#[cfg(unix)]
 use fff_ipc::{read_message, write_message};
+#[cfg(unix)]
 use parking_lot::{Mutex, RwLock};
+#[cfg(unix)]
 use std::time::Instant;
 #[cfg(unix)]
 use tokio::net::UnixListener;
+#[cfg(unix)]
 use tokio::sync::Mutex as TokioMutex;
 
+#[cfg(unix)]
 use crate::state::{EffectiveArgs, EngineState};
 
+#[cfg(unix)]
 struct RootEntry {
     state: Arc<EngineState>,
     // Milliseconds since Unix epoch; updated atomically on every access.
@@ -34,6 +42,7 @@ struct RootEntry {
     loaded_at: Instant,
 }
 
+#[cfg(unix)]
 pub(crate) struct WorkerState {
     pub index: u32,
     config: FffConfig,
@@ -43,6 +52,7 @@ pub(crate) struct WorkerState {
     init_gates: Mutex<HashMap<String, Arc<TokioMutex<()>>>>,
 }
 
+#[cfg(unix)]
 impl WorkerState {
     pub fn new(index: u32, config: FffConfig) -> Self {
         Self {
@@ -194,6 +204,7 @@ impl WorkerState {
 
 // Read indexed_files and dirty_count off the shared picker without blocking
 // for long: returns (None, None) when the picker is mid-init or contended.
+#[cfg(unix)]
 fn read_picker_freshness(state: &EngineState) -> (Option<u64>, Option<u64>) {
     let Ok(guard) = state.shared_picker.read() else {
         return (None, None);
@@ -379,6 +390,7 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
     }
 }
 
+#[cfg(unix)]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

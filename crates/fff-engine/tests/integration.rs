@@ -1,10 +1,12 @@
-/// Integration tests for fff-engine covering:
-/// - U3: Worker socket binding, protocol enforcement, Connect/Ack, cleanup on SIGTERM
-/// - U4: Master lockfile, socket, single-instance guard, Handshake, ListWorkers,
-///       WorkerStatus, routing.json persistence, startup with dead-PID routing.json, cleanup
-/// - U5: Routing table fast path, scale-out on roots_per_worker_max, stable re-routing,
-///       routing.json updated after each Handshake mutation
-/// - U6: Worker crash detection and respawn, startup dead-vs-live PID recovery
+#![cfg(unix)]
+//! Integration tests for fff-engine covering:
+//! - U3: Worker socket binding, protocol enforcement, Connect/Ack, cleanup on SIGTERM
+//! - U4: Master lockfile, socket, single-instance guard, Handshake, ListWorkers,
+//!       WorkerStatus, routing.json persistence, startup with dead-PID routing.json, cleanup
+//! - U5: Routing table fast path, scale-out on roots_per_worker_max, stable re-routing,
+//!       routing.json updated after each Handshake mutation
+//! - U6: Worker crash detection and respawn, startup dead-vs-live PID recovery
+
 use std::{
     os::unix::net::UnixStream,
     path::PathBuf,

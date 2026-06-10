@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -8,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
 use fff_ipc::{
     base_path_slug,
     config::WorkerConfig,
@@ -21,13 +23,14 @@ use fff_ipc::{
     worker_socket_path, write_message,
 };
 #[cfg(unix)]
-use tokio::net::UnixListener;
 use tokio::{
+    net::UnixListener,
     process::Command,
     sync::Mutex,
     time::{interval, sleep},
 };
 
+#[cfg(unix)]
 use crate::ring::HashRing;
 
 #[cfg(unix)]

@@ -7,6 +7,7 @@ mod state;
 pub(crate) mod worker;
 
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::Arc;
 
 use clap::Parser;
