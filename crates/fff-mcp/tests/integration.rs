@@ -670,16 +670,16 @@ fn registry_lists_default_then_additional() {
 
 // ── Config file: load & merge with CLI extras ─────────────────────────────────
 
-use fff_mcp::registry::{ConfigError, ConfigFile};
+use fff_ipc::config::{self, McpConfigError};
 
 fn write_config_file(dir: &Path, body: &str) -> PathBuf {
-    let p = dir.join("mcp.toml");
+    let p = dir.join("config.toml");
     std::fs::write(&p, body).expect("write config");
     p
 }
 
-/// Valid TOML config loads, populates registry, and the `default` field
-/// (a name) resolves to the correct path.
+/// Valid `[mcp]` config loads, populates registry, and `default` (a name)
+/// resolves to the correct path.
 #[test]
 fn config_default_by_name_selects_root() {
     let tmp = TempDir::new().expect("tempdir");
@@ -689,13 +689,14 @@ fn config_default_by_name_selects_root() {
     std::fs::create_dir_all(&secondary).unwrap();
     let body = format!(
         r#"
+[mcp]
 default = "primary"
 
-[[roots]]
+[[mcp.roots]]
 name = "primary"
 path = "{}"
 
-[[roots]]
+[[mcp.roots]]
 name = "secondary"
 path = "{}"
 "#,
@@ -703,14 +704,16 @@ path = "{}"
         secondary.display()
     );
     let path = write_config_file(tmp.path(), &body);
-    let cfg = ConfigFile::load(&path).expect("load ok");
+    let cfg = config::load_from(&path).expect("load ok");
+    cfg.mcp.validate().expect("valid");
 
-    let default_path = cfg.resolve_default_path().expect("has default");
+    let default_path = cfg.mcp.default_path().expect("has default");
     assert_eq!(default_path, primary);
 
     // Build registry as main.rs would: default == primary, additional = both
     // declared roots (the default one will dedupe out).
     let extras: Vec<(Option<String>, PathBuf)> = cfg
+        .mcp
         .roots
         .iter()
         .map(|r| (r.name.clone(), r.path.clone()))
@@ -735,14 +738,12 @@ path = "{}"
     assert!(reg.resolve_name("not-a-root").is_none());
 }
 
-/// Bad TOML returns a Parse error mentioning the offending file.
+/// Bad TOML returns an error mentioning the offending file.
 #[test]
 fn config_parse_error_carries_file_path() {
     let tmp = TempDir::new().expect("tempdir");
     let path = write_config_file(tmp.path(), "this = = ill-formed\n");
-    let err = ConfigFile::load(&path).expect_err("must fail");
-    assert!(matches!(err, ConfigError::Parse { .. }));
-    let msg = err.to_string();
+    let msg = config::load_from(&path).expect_err("must fail");
     assert!(
         msg.contains(path.to_str().unwrap()),
         "error must mention the config path; got: {msg}"
@@ -757,16 +758,18 @@ fn config_default_as_absolute_path_anonymous() {
     std::fs::create_dir_all(&alpha).unwrap();
     let body = format!(
         r#"
+[mcp]
 default = "{p}"
 
-[[roots]]
+[[mcp.roots]]
 path = "{p}"
 "#,
         p = alpha.display()
     );
     let path = write_config_file(tmp.path(), &body);
-    let cfg = ConfigFile::load(&path).expect("ok");
-    assert_eq!(cfg.resolve_default_path(), Some(alpha.clone()));
+    let cfg = config::load_from(&path).expect("ok");
+    cfg.mcp.validate().expect("valid");
+    assert_eq!(cfg.mcp.default_path(), Some(alpha.clone()));
 
     // No declared name → registry's default has no name.
     let reg = RootRegistry::with_named(&alpha, None, Vec::new());
@@ -788,21 +791,22 @@ fn config_plus_cli_extras_merge_and_dedupe() {
 
     let body = format!(
         r#"
-[[roots]]
+[[mcp.roots]]
 name = "ay"
 path = "{}"
 
-[[roots]]
+[[mcp.roots]]
 path = "{}"
 "#,
         a.display(),
         b.display()
     );
     let path = write_config_file(tmp.path(), &body);
-    let cfg = ConfigFile::load(&path).expect("ok");
+    let cfg = config::load_from(&path).expect("ok");
 
     // Simulate main.rs building extras: config-declared + CLI --root c + duplicate b
     let mut extras: Vec<(Option<String>, PathBuf)> = cfg
+        .mcp
         .roots
         .iter()
         .map(|r| (r.name.clone(), r.path.clone()))
@@ -819,22 +823,26 @@ path = "{}"
     assert_eq!(all[2].1, c.canonicalize().unwrap());
 }
 
-/// Config's `default` set to an unknown name is rejected at load time.
+/// `[mcp].default` set to an unknown name is rejected by validate().
 #[test]
 fn config_default_unknown_name_rejected_at_load() {
     let tmp = TempDir::new().expect("tempdir");
     let path = write_config_file(
         tmp.path(),
         r#"
+[mcp]
 default = "phantom"
 
-[[roots]]
+[[mcp.roots]]
 name = "ay"
 path = "/tmp/whatever"
 "#,
     );
-    let err = ConfigFile::load(&path).expect_err("must fail");
-    assert!(matches!(err, ConfigError::UnresolvedDefault { .. }));
+    let cfg = config::load_from(&path).expect("parses");
+    assert!(matches!(
+        cfg.mcp.validate().expect_err("must fail"),
+        McpConfigError::UnresolvedDefault(_)
+    ));
 }
 
 /// record_access-style path resolution: longest-prefix wins, with the

@@ -84,6 +84,35 @@ claude mcp add -s user fff -- $(brew --prefix)/bin/fff-mcp
 
 It prints the exact wiring instructions for your client. Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
 
+### Multiple project roots
+
+To search several projects from one server, declare them under `[mcp]` in `~/.config/fff/config.toml`:
+
+```toml
+[mcp]
+# default: root used when a tool call omits base_path (a name or an absolute path)
+default = "app"
+
+[[mcp.roots]]
+name = "app"
+path = "/Users/you/work/app"
+
+[[mcp.roots]]
+name = "lib"
+path = "/Users/you/work/lib"
+
+[[mcp.roots]]            # name is optional
+path = "/Users/you/scratch"
+```
+
+The config auto-loads — the registration needs no extra flags:
+
+```bash
+claude mcp add -s user fff -- $(brew --prefix)/bin/fff-mcp
+```
+
+Tools accept an optional `base_path` matching a root's `name` or path; omitting it targets `default`. A positional argument (`fff-mcp /path/to/project`) overrides `[mcp].default` for a single root, `--root <PATH>` merges extra roots, and `--config <PATH>` points at an alternate `config.toml`.
+
 ### Managing daemons with `fffctl`
 
 `fff-mcp` spawns one `fff-engine` daemon per project root the first time it's queried. They keep running in the background; manage them with `fffctl`:

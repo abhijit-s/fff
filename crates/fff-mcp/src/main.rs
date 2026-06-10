@@ -120,7 +120,8 @@ pub const MCP_INSTRUCTIONS: &str = concat!(
 #[derive(Parser)]
 #[command(name = "fff-mcp", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("FFF_GIT_HASH"), ")"))]
 pub(crate) struct Args {
-    /// Base directory to index. Defaults to the current working directory.
+    /// Base directory to index. Defaults to `[mcp].default` from config, then
+    /// the current working directory.
     #[arg(value_name = "PATH")]
     base_path: Option<String>,
 
@@ -130,9 +131,8 @@ pub(crate) struct Args {
     #[arg(long = "root", value_name = "PATH")]
     root: Vec<std::path::PathBuf>,
 
-    /// Path to a TOML config file describing roots and the default root.
-    /// See docs for the schema. CLI `--base-path` overrides the config's
-    /// default; `--root` flags merge with config-declared roots.
+    /// Path to a config file, overriding the default `~/.config/fff/config.toml`.
+    /// Roots live under its `[mcp]` section; `--root` flags merge on top.
     #[arg(long = "config", value_name = "PATH")]
     config_file: Option<std::path::PathBuf>,
 
@@ -202,30 +202,38 @@ pub(crate) struct Args {
 fn build_registry(
     base_path: &std::path::Path,
     cli_extras: &[std::path::PathBuf],
-    config_file: Option<&registry::ConfigFile>,
+    mcp: &fff_ipc::config::McpConfig,
 ) -> registry::RootRegistry {
-    // Default name: matches when config.default selected a named root, OR
-    // when the resolved base_path equals one of the config roots' paths.
-    let default_name = config_file.and_then(|cfg| {
-        if let Some(def) = cfg.default.as_deref()
-            && cfg.roots.iter().any(|r| r.name.as_deref() == Some(def))
-        {
-            return Some(def.to_string());
-        }
-        cfg.name_for_path(base_path)
-    });
+    // Default name: the explicit `default` when it names a root, else a
+    // canonical-path match against the declared roots.
+    let default_name = if let Some(def) = mcp.default.as_deref()
+        && mcp.roots.iter().any(|r| r.name.as_deref() == Some(def))
+    {
+        Some(def.to_string())
+    } else {
+        name_for_path(mcp, base_path)
+    };
 
     let mut extras: Vec<(Option<String>, std::path::PathBuf)> = Vec::new();
-    if let Some(cfg) = config_file {
-        for r in &cfg.roots {
-            extras.push((r.name.clone(), r.path.clone()));
-        }
+    for r in &mcp.roots {
+        extras.push((r.name.clone(), r.path.clone()));
     }
     for p in cli_extras {
         extras.push((None, p.clone()));
     }
 
     registry::RootRegistry::with_named(base_path, default_name, extras)
+}
+
+// Name of the declared root whose canonical path matches `path`. Both sides are
+// canonicalized: base_path arrives git-discovered/symlink-resolved, so a literal
+// compare would silently miss.
+fn name_for_path(mcp: &fff_ipc::config::McpConfig, path: &std::path::Path) -> Option<String> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    mcp.roots
+        .iter()
+        .find(|r| std::fs::canonicalize(&r.path).unwrap_or_else(|_| r.path.clone()) == target)
+        .and_then(|r| r.name.clone())
 }
 
 /// Merge CLI args with config file, then apply hardcoded defaults for anything
@@ -269,7 +277,22 @@ fn resolve_defaults(args: &mut Args, cfg: &fff_ipc::config::FffConfig) {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = Args::parse();
-    let cfg = fff_ipc::config::load();
+    // `--config` names an explicit file (fatal on failure); otherwise load the
+    // default XDG path best-effort. One `cfg` feeds everything downstream.
+    let cfg = match args.config_file.as_deref() {
+        Some(path) => fff_ipc::config::load_from(path).unwrap_or_else(|e| {
+            eprintln!("fff-mcp: {e}");
+            std::process::exit(1);
+        }),
+        None => fff_ipc::config::load(),
+    };
+    if let Err(e) = cfg.mcp.validate() {
+        eprintln!("fff-mcp: {e}");
+        std::process::exit(1);
+    }
+    if args.config_file.is_some() && cfg.mcp.roots.is_empty() {
+        eprintln!("fff-mcp: --config given but no [mcp].roots declared");
+    }
     resolve_defaults(&mut args, &cfg);
 
     if args.healthcheck {
@@ -309,26 +332,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: Failed to init tracing: {}", e);
     }
 
-    // Load --config TOML up front so its `default` can feed `base_path` when
-    // the CLI did not pass `--base-path`.
-    let config_file = match args.config_file.as_deref() {
-        Some(path) => match registry::ConfigFile::load(path) {
-            Ok(cfg) => Some(cfg),
-            Err(e) => {
-                eprintln!("fff-mcp: {e}");
-                std::process::exit(1);
-            }
-        },
-        None => None,
-    };
-
+    // base_path: positional arg > [mcp].default > cwd.
     let base_path = args
         .base_path
         .clone()
         .or_else(|| {
-            config_file
-                .as_ref()
-                .and_then(|c| c.resolve_default_path())
+            cfg.mcp
+                .default_path()
                 .map(|p| p.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| {
@@ -367,7 +377,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !args.no_update_check {
                     update_check::spawn_update_check();
                 }
-                let registry = build_registry(base_path_ref, &args.root, config_file.as_ref());
+                let registry = build_registry(base_path_ref, &args.root, &cfg.mcp);
                 let pool = pool::ConnectionPool::new();
                 pool.insert(base_path_ref, engine_client);
                 let server =

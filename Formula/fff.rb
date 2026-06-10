@@ -57,6 +57,13 @@ class Fff < Formula
       Configuration (optional): ~/.config/fff/config.toml
         [log]
         level = "fff_engine=info,fff_mcp=info,warn"
+
+        # Search multiple projects from one server:
+        [mcp]
+        default = "app"
+        [[mcp.roots]]
+        name = "app"
+        path = "/Users/you/work/app"
     EOS
   end
 

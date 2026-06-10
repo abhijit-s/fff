@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// [frecency]
 /// # db = "~/.local/share/fff/frecency/"  # set to share one DB across projects
+///
+/// [mcp]
+/// default = "app"   # root used when a tool call omits base_path (name or path)
+///
+/// [[mcp.roots]]
+/// name = "app"
+/// path = "/Users/you/work/app"
 /// ```
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct FffConfig {
@@ -31,6 +38,63 @@ pub struct FffConfig {
     pub frecency: FrecencyConfig,
     #[serde(default)]
     pub worker: WorkerConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
+}
+
+/// Project roots fff-mcp searches. Ignored by fff-engine and fffctl.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct McpConfig {
+    /// Default root selector: a declared name or an absolute path.
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub roots: Vec<McpRoot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpRoot {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum McpConfigError {
+    #[error("duplicate root name {0:?} in [mcp].roots")]
+    DuplicateName(String),
+    #[error("[mcp].default {0:?} matched no root name and is not an absolute path")]
+    UnresolvedDefault(String),
+}
+
+impl McpConfig {
+    /// Reject duplicate root names and a `default` that resolves to nothing.
+    pub fn validate(&self) -> Result<(), McpConfigError> {
+        let mut seen: Vec<&str> = Vec::new();
+        for name in self.roots.iter().filter_map(|r| r.name.as_deref()) {
+            if seen.contains(&name) {
+                return Err(McpConfigError::DuplicateName(name.to_string()));
+            }
+            seen.push(name);
+        }
+        if let Some(def) = self.default.as_deref() {
+            let known = self.roots.iter().any(|r| r.name.as_deref() == Some(def));
+            if !known && !Path::new(def).is_absolute() {
+                return Err(McpConfigError::UnresolvedDefault(def.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve `default` to a concrete path (name → declared path, or an
+    /// absolute path as-is). `None` when no default is set.
+    pub fn default_path(&self) -> Option<PathBuf> {
+        let def = self.default.as_deref()?;
+        if let Some(r) = self.roots.iter().find(|r| r.name.as_deref() == Some(def)) {
+            return Some(r.path.clone());
+        }
+        Path::new(def).is_absolute().then(|| PathBuf::from(def))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,30 +182,29 @@ pub fn config_path() -> PathBuf {
     base.join("fff").join("config.toml")
 }
 
-/// Load the config file. Returns `FffConfig::default()` when the file is absent.
-/// Logs a warning to stderr (not tracing — tracing may not be initialised yet)
-/// if the file exists but cannot be parsed.
+/// Load the config from the default XDG path. Returns `FffConfig::default()`
+/// when the file is absent or unreadable/unparseable, warning to stderr
+/// (tracing may not be initialised yet). The implicit path is best-effort;
+/// for an explicitly-named file use [`load_from`], which errors instead.
 pub fn load() -> FffConfig {
     let path = config_path();
     if !path.exists() {
         return FffConfig::default();
     }
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
-            eprintln!(
-                "Warning: failed to parse fff config at {}: {e}",
-                path.display()
-            );
-            FffConfig::default()
-        }),
-        Err(e) => {
-            eprintln!(
-                "Warning: failed to read fff config at {}: {e}",
-                path.display()
-            );
-            FffConfig::default()
-        }
-    }
+    load_from(&path).unwrap_or_else(|e| {
+        eprintln!("Warning: {e}");
+        FffConfig::default()
+    })
+}
+
+/// Load the config from an explicit path. Unlike [`load`], read/parse failures
+/// are returned as errors — the caller named this file, so silently falling
+/// back to defaults would hide their mistake.
+pub fn load_from(path: &Path) -> Result<FffConfig, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read fff config at {}: {e}", path.display()))?;
+    toml::from_str(&contents)
+        .map_err(|e| format!("failed to parse fff config at {}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -174,5 +237,63 @@ mod tests {
         assert_eq!(cfg.worker.n_max, 8);
         assert_eq!(cfg.worker.roots_per_worker_max, 16);
         assert_eq!(cfg.worker.idle_ttl_secs, 600);
+    }
+
+    #[test]
+    fn mcp_section_parses_roots_and_default() {
+        let toml = r#"
+[mcp]
+default = "fff"
+
+[[mcp.roots]]
+name = "fff"
+path = "/tmp/fff"
+
+[[mcp.roots]]
+path = "/tmp/anon"
+"#;
+        let cfg: FffConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.mcp.roots.len(), 2);
+        assert_eq!(cfg.mcp.default.as_deref(), Some("fff"));
+        cfg.mcp.validate().unwrap();
+        assert_eq!(cfg.mcp.default_path(), Some(PathBuf::from("/tmp/fff")));
+    }
+
+    #[test]
+    fn mcp_default_as_absolute_path_resolves() {
+        let cfg: McpConfig = toml::from_str("default = \"/tmp/x\"\n").unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.default_path(), Some(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn mcp_missing_section_is_empty() {
+        let cfg: FffConfig = toml::from_str("[log]\nlevel = \"info\"\n").unwrap();
+        assert!(cfg.mcp.roots.is_empty());
+        assert!(cfg.mcp.default.is_none());
+    }
+
+    #[test]
+    fn mcp_duplicate_names_rejected() {
+        let cfg: McpConfig = toml::from_str(
+            "[[roots]]\nname = \"a\"\npath = \"/tmp/a\"\n\n[[roots]]\nname = \"a\"\npath = \"/tmp/b\"\n",
+        )
+        .unwrap();
+        match cfg.validate().unwrap_err() {
+            McpConfigError::DuplicateName(n) => assert_eq!(n, "a"),
+            other => panic!("expected DuplicateName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_default_unknown_name_rejected() {
+        let cfg: McpConfig = toml::from_str(
+            "default = \"ghost\"\n\n[[roots]]\nname = \"real\"\npath = \"/tmp/real\"\n",
+        )
+        .unwrap();
+        match cfg.validate().unwrap_err() {
+            McpConfigError::UnresolvedDefault(v) => assert_eq!(v, "ghost"),
+            other => panic!("expected UnresolvedDefault, got {other:?}"),
+        }
     }
 }
