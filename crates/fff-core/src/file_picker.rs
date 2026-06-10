@@ -440,6 +440,13 @@ pub struct FilePicker {
     cache_budget: Arc<ContentCacheBudget>,
     has_explicit_cache_budget: bool,
     scanned_files_count: Arc<AtomicUsize>,
+    // Set when a watch (re)setup leaves directories unwatched (e.g. inotify
+    // ENOSPC abort). While set, the grep read path re-stats cached candidates
+    // so a dropped watcher event cannot serve stale/truncated content. Self-
+    // clearing: a later full re-watch that completes WITHOUT aborting stores
+    // `false`, proving kernel watch capacity recovered. Shared via `Arc` so the
+    // watcher thread can update it without the picker write lock.
+    watch_coverage_degraded: Arc<AtomicBool>,
     enable_mmap_cache: bool,
     enable_content_indexing: bool,
     watch: bool,
@@ -517,6 +524,20 @@ impl FilePicker {
 
     pub fn cache_budget(&self) -> &ContentCacheBudget {
         &self.cache_budget
+    }
+
+    pub(crate) fn watch_coverage_degraded(&self) -> bool {
+        self.watch_coverage_degraded.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn watch_coverage_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.watch_coverage_degraded)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_watch_coverage_degraded(&self, degraded: bool) {
+        self.watch_coverage_degraded
+            .store(degraded, Ordering::Relaxed);
     }
 
     pub fn bigram_index(&self) -> Option<&BigramFilter> {
@@ -706,6 +727,7 @@ impl FilePicker {
             signals: crate::scan::ScanSignals::default(),
             mode: options.mode,
             scanned_files_count: Arc::new(AtomicUsize::new(0)),
+            watch_coverage_degraded: Arc::new(AtomicBool::new(false)),
             sync_data: FileSync::new(),
             enable_mmap_cache: options.enable_mmap_cache,
             enable_content_indexing: options.enable_content_indexing,
@@ -1191,6 +1213,7 @@ impl FilePicker {
                 &self.base_path,
                 arena,
                 overflow_arena,
+                self.watch_coverage_degraded(),
             )
         })
     }
@@ -1223,6 +1246,7 @@ impl FilePicker {
                 &self.base_path,
                 arena,
                 overflow_arena,
+                self.watch_coverage_degraded(),
             )
         })
     }

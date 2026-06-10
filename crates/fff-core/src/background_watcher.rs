@@ -137,6 +137,24 @@ impl BackgroundWatcher {
                                 "Failed to init watcher for new directory"
                             );
                         }
+
+                        // Self-clearing recovery: if coverage is currently
+                        // degraded, retry the full watch loop. A clean pass
+                        // (no abort) proves the kernel watch table recovered
+                        // capacity, so we clear the flag and grep returns to
+                        // the zero-syscall fast path. Holding debouncer-mutex
+                        // then picker-read is deadlock-free: the event handler
+                        // never acquires the debouncer mutex.
+                        if let Ok(picker_guard) = strong_picker.read()
+                            && let Some(picker) = picker_guard.as_ref()
+                            && picker.watch_coverage_degraded()
+                        {
+                            let still_degraded =
+                                watch_all_dirs(debouncer, picker, picker.base_path());
+                            picker
+                                .watch_coverage_handle()
+                                .store(still_degraded, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
 
                     track_files_from_new_directories(
@@ -272,58 +290,18 @@ impl BackgroundWatcher {
             // `inotify_add_watch()` is fast-fail: on ENOSPC it returns
             // immediately, no kernel retry loop, so holding the read
             // lock across the stream is O(ms) even for large repos.
-            //
-            // Abort the loop after a run of failures. Once ENOSPC hits,
-            // further calls won't succeed until the user raises
-            // `fs.inotify.max_user_watches`, so there's no value in
-            // continuing.
-            const MAX_CONSECUTIVE_WATCH_FAILURES: usize = 16;
-
-            let mut watched = 0usize;
-            let mut consecutive_failures = 0usize;
-            let mut aborted_early = false;
-
             if let Some(guard) = shared_picker_for_watching.read().ok()
                 && let Some(picker) = guard.as_ref()
             {
-                use std::ops::ControlFlow;
-                picker.for_each_dir(|dir| {
-                    match debouncer.watch(dir, RecursiveMode::NonRecursive) {
-                        Ok(()) => {
-                            watched += 1;
-                            consecutive_failures = 0;
-                            ControlFlow::Continue(())
-                        }
-                        Err(e) => {
-                            consecutive_failures += 1;
-                            if consecutive_failures <= 4 {
-                                warn!("Failed to watch directory {}: {}", dir.display(), e);
-                            }
-
-                            if consecutive_failures >= MAX_CONSECUTIVE_WATCH_FAILURES {
-                                warn!(
-                                    consecutive_failures,
-                                    watched,
-                                    "Aborting NonRecursive watch loop — per-process \
-                                 watch cap exhausted, further dirs would just burn \
-                                 kernel time for no coverage"
-                                );
-                                aborted_early = true;
-                                ControlFlow::Break(())
-                            } else {
-                                ControlFlow::Continue(())
-                            }
-                        }
-                    }
-                });
+                // Store the loop's result on the picker: `true` marks coverage
+                // degraded (grep re-stats cached candidates), `false` clears it.
+                // Self-clearing fires when a later full re-watch completes
+                // without aborting — see `watch_all_dirs`.
+                let aborted_early = watch_all_dirs(&mut debouncer, picker, &base_path);
+                picker
+                    .watch_coverage_handle()
+                    .store(aborted_early, std::sync::atomic::Ordering::Relaxed);
             }
-
-            info!(
-                "File watcher initialized for {} directories (NonRecursive) under {} (aborted_early={})",
-                watched,
-                base_path.display(),
-                aborted_early,
-            );
         }
 
         // The .git directory is excluded from the file list but we still need
@@ -389,6 +367,66 @@ impl Drop for BackgroundWatcher {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Register a NonRecursive inotify watch on every indexed directory.
+/// Returns `true` if the loop aborted early after a run of failures (the
+/// per-process watch cap is exhausted, e.g. ENOSPC) — meaning coverage is
+/// incomplete. A `false` return proves every directory was registered, which
+/// is the self-clearing recovery signal for `watch_coverage_degraded`.
+fn watch_all_dirs(
+    debouncer: &mut Debouncer,
+    picker: &crate::file_picker::FilePicker,
+    base_path: &Path,
+) -> bool {
+    use std::ops::ControlFlow;
+
+    // Once ENOSPC hits, further calls won't succeed until the user raises
+    // `fs.inotify.max_user_watches`, so there's no value in continuing.
+    const MAX_CONSECUTIVE_WATCH_FAILURES: usize = 16;
+
+    let mut watched = 0usize;
+    let mut consecutive_failures = 0usize;
+    let mut aborted_early = false;
+
+    picker.for_each_dir(
+        |dir| match debouncer.watch(dir, RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                watched += 1;
+                consecutive_failures = 0;
+                ControlFlow::Continue(())
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                if consecutive_failures <= 4 {
+                    warn!("Failed to watch directory {}: {}", dir.display(), e);
+                }
+                if consecutive_failures >= MAX_CONSECUTIVE_WATCH_FAILURES {
+                    warn!(
+                        consecutive_failures,
+                        watched,
+                        "Aborting NonRecursive watch loop — per-process watch cap \
+                     exhausted, further dirs would just burn kernel time for no \
+                     coverage. Raise fs.inotify.max_user_watches to restore \
+                     full coverage."
+                    );
+                    aborted_early = true;
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }
+        },
+    );
+
+    info!(
+        "Watch loop registered {} directories (NonRecursive) under {} (aborted_early={})",
+        watched,
+        base_path.display(),
+        aborted_early,
+    );
+
+    aborted_early
 }
 
 #[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency), level = Level::DEBUG)]
