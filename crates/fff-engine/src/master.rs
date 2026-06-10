@@ -365,9 +365,7 @@ async fn query_worker_health(
 
 /// Entry point for master mode.
 #[cfg(not(unix))]
-pub async fn run(
-    _config: fff_ipc::config::FffConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(_config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::error::Error>> {
     Err("fff-engine master mode is not supported on this platform".into())
 }
 
