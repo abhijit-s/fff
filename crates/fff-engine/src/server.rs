@@ -3,11 +3,13 @@ use std::sync::Arc;
 
 use fff_ipc::types::SearchRequest;
 use fff_ipc::{read_message, write_message};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 
 use crate::state::EngineState;
 
 /// Bind a UnixListener at `socket_path` and accept connections until SIGTERM/SIGINT.
+#[cfg(unix)]
 pub async fn run(
     state: Arc<EngineState>,
     socket_path: PathBuf,
@@ -58,6 +60,15 @@ pub async fn run(
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub async fn run(
+    _state: Arc<EngineState>,
+    _socket_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("fff-engine singleton mode is not supported on this platform".into())
+}
+
+#[cfg(unix)]
 async fn handle_connection(stream: tokio::net::UnixStream, state: Arc<EngineState>) {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
