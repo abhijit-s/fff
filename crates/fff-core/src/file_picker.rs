@@ -1601,6 +1601,17 @@ impl FilePicker {
             .load(Ordering::Acquire)
     }
 
+    /// True once the initial scan has committed the file list AND the content
+    /// index (bigram) is built. Until this holds, content grep can return
+    /// silently-incomplete results: an empty file list before `commit_new_sync`,
+    /// or a not-yet-built bigram index during the post-scan window. Engine grep
+    /// handlers gate on this to avoid cold-start partial results.
+    pub fn is_index_ready(&self) -> bool {
+        !self.is_scan_active()
+            && !self.is_post_scan_active()
+            && (!self.enable_content_indexing || self.sync_data.bigram_index.is_some())
+    }
+
     /// Return a clone of the watcher-ready flag so callers can poll it without
     /// holding a lock on the picker.
     pub fn watcher_signal(&self) -> Arc<AtomicBool> {

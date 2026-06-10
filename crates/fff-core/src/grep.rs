@@ -2634,4 +2634,138 @@ mod tests {
             result.matches.len()
         );
     }
+
+    // Cold-start readiness seam: reproduces the partial-result race that the
+    // engine grep gate guards against, then proves the gate predicate flips
+    // exactly when results become correct.
+    fn ready_gate_options() -> super::GrepSearchOptions {
+        super::GrepSearchOptions {
+            max_file_size: MAX_FFFILE_SIZE,
+            max_matches_per_file: 10,
+            smart_case: true,
+            file_offset: 0,
+            page_limit: 50,
+            mode: super::GrepMode::PlainText,
+            time_budget_ms: 0,
+            before_context: 0,
+            after_context: 0,
+            classify_definitions: true,
+            trim_whitespace: true,
+            abort_signal: None,
+        }
+    }
+
+    #[test]
+    fn test_index_ready_false_before_filelist_committed() {
+        // Empty-file-list window: picker constructed with content indexing but
+        // before any scan committed files. grep returns EMPTY (the live bug);
+        // is_index_ready() reports false so the engine gate would block.
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let mut f = std::fs::File::create(base.join("a.txt")).unwrap();
+        writeln!(f, "needle in the haystack").unwrap();
+
+        let picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            enable_content_indexing: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(
+            !picker.is_index_ready(),
+            "fresh picker with content indexing must report not-ready"
+        );
+        assert_eq!(picker.get_files().len(), 0);
+
+        let query = super::parse_grep_query("needle");
+        let result = picker.grep(&query, &ready_gate_options());
+        assert_eq!(
+            result.matches.len(),
+            0,
+            "empty file list yields silently-empty grep — the bug the gate prevents"
+        );
+    }
+
+    #[test]
+    fn test_index_ready_flips_when_bigram_built() {
+        // Post-scan window: file list committed but bigram index not yet built.
+        // The None-bigram fallback already returns CORRECT results here, but
+        // the gate still treats it as not-ready until the index lands, so the
+        // first query never observes a half-built index.
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let contents: &[(&str, &str)] = &[
+            ("a.txt", "hello needle world"),
+            ("b.txt", "another needle line"),
+            ("c.txt", "nothing relevant here"),
+        ];
+        for (name, content) in contents {
+            let mut f = std::fs::File::create(base.join(name)).unwrap();
+            writeln!(f, "{}", content).unwrap();
+        }
+
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            enable_content_indexing: true,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        assert_eq!(picker.get_files().len(), 3);
+
+        // File list present, bigram index absent: NOT ready yet.
+        assert!(
+            !picker.is_index_ready(),
+            "content-indexing picker without bigram index must report not-ready"
+        );
+
+        let base_count = 3usize;
+        let consec = BigramIndexBuilder::new(base_count);
+        let skip = BigramIndexBuilder::new(base_count);
+        for (i, (_, content)) in contents.iter().enumerate() {
+            consec.add_file_content(&skip, i, content.as_bytes());
+        }
+        let mut index = consec.compress(Some(0));
+        index.set_skip_index(skip.compress(Some(0)));
+        picker.set_bigram_index(index);
+
+        // Index built → ready flips true and grep returns the real matches.
+        assert!(
+            picker.is_index_ready(),
+            "picker must report ready once the bigram index is set"
+        );
+        let query = super::parse_grep_query("needle");
+        let result = picker.grep(&query, &ready_gate_options());
+        assert_eq!(
+            result.matches.len(),
+            2,
+            "warm index must return both needle matches"
+        );
+    }
+
+    #[test]
+    fn test_index_ready_true_without_content_indexing() {
+        // With content indexing disabled the bigram index is never built, so
+        // readiness must hinge only on scan completion, not on the index.
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+        std::fs::File::create(base.join("a.txt")).unwrap();
+
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            enable_content_indexing: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        assert!(
+            picker.is_index_ready(),
+            "non-content-indexing picker is ready once the scan completes"
+        );
+    }
 }

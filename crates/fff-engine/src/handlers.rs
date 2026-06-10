@@ -1,6 +1,35 @@
+use std::time::Duration;
+
 use fff_ipc::types::{FindOptions, GrepOptions, SearchResponse, WireGrepMode};
 
 use crate::state::EngineState;
+
+// Cold-start grep readiness gate. The initial scan runs on a background thread
+// after the engine accepts connections, so the file list and content (bigram)
+// index can both be incomplete when the first grep lands — yielding empty or
+// partial results that look authoritative. Block grep until the picker reports
+// the initial index ready, bounded so a pathologically slow scan never hangs a
+// query indefinitely (callers then get correct-but-possibly-partial results
+// rather than a stall).
+const GREP_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+const GREP_READINESS_POLL: Duration = Duration::from_millis(20);
+
+// Poll the picker's readiness flag without holding the read lock across the
+// sleep: take the lock briefly each tick, then drop it before awaiting.
+async fn await_index_ready(state: &EngineState) {
+    let picker_arc = state.shared_picker.clone();
+    let deadline = tokio::time::Instant::now() + GREP_READINESS_TIMEOUT;
+    loop {
+        let ready = match picker_arc.read() {
+            Ok(guard) => guard.as_ref().is_none_or(|p| p.is_index_ready()),
+            Err(_) => true,
+        };
+        if ready || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(GREP_READINESS_POLL).await;
+    }
+}
 
 pub async fn handle_grep(
     state: &EngineState,
@@ -9,6 +38,8 @@ pub async fn handle_grep(
 ) -> SearchResponse {
     use fff::{AiGrepConfig, QueryParser};
     use fff_ipc::types::WireGrepResponse;
+
+    await_index_ready(state).await;
 
     let picker_arc = state.shared_picker.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -108,6 +139,8 @@ pub async fn handle_multi_grep(
 ) -> SearchResponse {
     use fff::{AiGrepConfig, QueryParser};
     use fff_ipc::types::WireGrepResponse;
+
+    await_index_ready(state).await;
 
     let picker_arc = state.shared_picker.clone();
     let result = tokio::task::spawn_blocking(move || {
