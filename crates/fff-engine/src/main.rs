@@ -1,6 +1,7 @@
 mod handlers;
 mod lifecycle;
 pub(crate) mod master;
+#[cfg(unix)]
 pub(crate) mod ring;
 mod server;
 mod state;
