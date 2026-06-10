@@ -2,4 +2,7 @@
 #[cfg(unix)]
 pub mod client;
 #[cfg(unix)]
+pub mod pool;
+#[cfg(unix)]
 mod recovery;
+pub mod registry;

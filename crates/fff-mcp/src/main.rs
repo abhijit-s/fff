@@ -12,7 +12,10 @@ mod cursor;
 mod healthcheck;
 mod output;
 #[cfg(unix)]
+pub(crate) mod pool;
+#[cfg(unix)]
 mod recovery;
+pub(crate) mod registry;
 mod server;
 mod update_check;
 
@@ -120,6 +123,12 @@ pub(crate) struct Args {
     /// Base directory to index. Defaults to the current working directory.
     #[arg(value_name = "PATH")]
     base_path: Option<String>,
+
+    /// Pre-register an additional project root for multi-root mode (repeatable).
+    /// Tools accept an optional `base_path` argument matching one of these.
+    /// Requires master mode.
+    #[arg(long = "root", value_name = "PATH")]
+    root: Vec<std::path::PathBuf>,
 
     /// Path to the frecency database.
     #[arg(long = "frecency-db")]
@@ -296,7 +305,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !args.no_update_check {
                     update_check::spawn_update_check();
                 }
-                let server = FffServer::new_proxy(engine_client, base_path_ref.to_path_buf());
+                let registry = registry::RootRegistry::new(base_path_ref, args.root.clone());
+                let pool = pool::ConnectionPool::new();
+                pool.insert(base_path_ref, engine_client);
+                let server =
+                    FffServer::new_proxy(std::sync::Arc::new(pool), std::sync::Arc::new(registry));
                 let service = server
                     .serve(stdio())
                     .await
