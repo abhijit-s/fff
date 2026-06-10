@@ -168,6 +168,13 @@ pub(crate) async fn dispatch_request(
                 ),
             )
         }
+        SearchRequest::Health => {
+            // Health is only valid as the first message on a worker socket
+            // (handled in worker.rs). The singleton server reports per-root
+            // health for its single loaded root.
+            let resp = crate::handlers::handle_health(state).await;
+            ("health".to_string(), resp)
+        }
     };
 
     let elapsed = start.elapsed();
@@ -179,6 +186,7 @@ pub(crate) async fn dispatch_request(
         | fff_ipc::types::SearchResponse::RecentFiles(r) => r.len(),
         fff_ipc::types::SearchResponse::GitStatus(r) => r.len(),
         fff_ipc::types::SearchResponse::Directories(r) => r.len(),
+        fff_ipc::types::SearchResponse::Health(r) => r.roots.len(),
         fff_ipc::types::SearchResponse::Error(_) | fff_ipc::types::SearchResponse::Ack => 0,
     };
     tracing::info!("request: {label}");

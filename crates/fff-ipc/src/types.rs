@@ -19,6 +19,9 @@ pub enum MasterRequest {
     EvictedRoot { slug: String },
     /// Read-only route query for fffctl — does not mutate state or trigger scale-out.
     RouteInfo { base_path: String },
+    /// Aggregate per-root index-freshness telemetry across every live worker.
+    /// Appended last to preserve bincode variant indices for existing variants.
+    Health,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +39,8 @@ pub enum MasterResponse {
     WorkerInfo(WorkerInfo),
     Ack,
     Error(String),
+    /// Returned for Health — per-worker index-freshness snapshot.
+    HealthReport(HealthReport),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +107,10 @@ pub enum SearchRequest {
     Connect {
         base_path: String,
     },
+    /// Worker-level health snapshot across every loaded root. Sent as the first
+    /// message on a worker socket (bypasses Connect); the worker responds with
+    /// SearchResponse::Health and closes the connection.
+    Health,
 }
 
 // ── Response ──────────────────────────────────────────────────────────────────
@@ -115,6 +124,9 @@ pub enum SearchResponse {
     RecentFiles(Vec<WireSearchResult>),
     GitStatus(Vec<WireGitFile>),
     Directories(Vec<WireDirEntry>),
+    /// Per-worker index-freshness snapshot. Appended last to preserve bincode
+    /// variant indices for existing variants.
+    Health(HealthResponse),
 }
 
 // ── Grep result types ─────────────────────────────────────────────────────────
@@ -251,6 +263,43 @@ impl Default for FindOptions {
             limit: 20,
         }
     }
+}
+
+// ── Health telemetry ──────────────────────────────────────────────────────────
+
+/// Per-root freshness signals. All numeric fields are `Option<u64>` so a worker
+/// can report only the signals it tracks — `None` means "not measured" rather
+/// than zero. AI agents use this to decide whether to trust the index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootHealth {
+    pub slug: String,
+    pub base_path: String,
+    pub indexed_files: Option<u64>,
+    pub last_scan_age_sec: Option<u64>,
+    pub watcher_backlog: Option<u64>,
+    pub dirty_count: Option<u64>,
+}
+
+/// Response to `SearchRequest::Health` — all roots loaded by a single worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub roots: Vec<RootHealth>,
+}
+
+/// One worker's slice of `HealthReport`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerHealth {
+    pub index: u32,
+    pub pid: u32,
+    pub roots: Vec<RootHealth>,
+}
+
+/// Master-aggregated freshness telemetry across every live worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthReport {
+    pub master_pid: u32,
+    pub uptime_sec: u64,
+    pub workers: Vec<WorkerHealth>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -509,6 +558,77 @@ mod tests {
         let rt = round_trip(&req);
         match rt {
             SearchRequest::Connect { base_path } => assert_eq!(base_path, "/home/user/repo"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn health_request_round_trips() {
+        assert!(matches!(
+            round_trip(&MasterRequest::Health),
+            MasterRequest::Health
+        ));
+        assert!(matches!(
+            round_trip(&SearchRequest::Health),
+            SearchRequest::Health
+        ));
+    }
+
+    #[test]
+    fn health_response_round_trips() {
+        let resp = SearchResponse::Health(HealthResponse {
+            roots: vec![RootHealth {
+                slug: "abc123".into(),
+                base_path: "/proj/a".into(),
+                indexed_files: Some(8421),
+                last_scan_age_sec: Some(12),
+                watcher_backlog: None,
+                dirty_count: Some(47),
+            }],
+        });
+        let rt = round_trip(&resp);
+        match rt {
+            SearchResponse::Health(r) => {
+                assert_eq!(r.roots.len(), 1);
+                assert_eq!(r.roots[0].slug, "abc123");
+                assert_eq!(r.roots[0].base_path, "/proj/a");
+                assert_eq!(r.roots[0].indexed_files, Some(8421));
+                assert_eq!(r.roots[0].last_scan_age_sec, Some(12));
+                assert_eq!(r.roots[0].watcher_backlog, None);
+                assert_eq!(r.roots[0].dirty_count, Some(47));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn health_report_round_trips() {
+        let resp = MasterResponse::HealthReport(HealthReport {
+            master_pid: 41166,
+            uptime_sec: 1200,
+            workers: vec![WorkerHealth {
+                index: 0,
+                pid: 22,
+                roots: vec![RootHealth {
+                    slug: "abc".into(),
+                    base_path: "/proj/a".into(),
+                    indexed_files: Some(100),
+                    last_scan_age_sec: Some(5),
+                    watcher_backlog: None,
+                    dirty_count: Some(2),
+                }],
+            }],
+        });
+        let rt = round_trip(&resp);
+        match rt {
+            MasterResponse::HealthReport(r) => {
+                assert_eq!(r.master_pid, 41166);
+                assert_eq!(r.uptime_sec, 1200);
+                assert_eq!(r.workers.len(), 1);
+                assert_eq!(r.workers[0].index, 0);
+                assert_eq!(r.workers[0].roots[0].slug, "abc");
+                assert_eq!(r.workers[0].roots[0].indexed_files, Some(100));
+            }
             _ => panic!("wrong variant"),
         }
     }

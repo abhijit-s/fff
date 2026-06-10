@@ -15,7 +15,7 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use fff_ipc::lockfile::{self, Lockfile};
 use fff_ipc::routing::RootEntry;
-use fff_ipc::types::{MasterRequest, MasterResponse, WorkerInfo};
+use fff_ipc::types::{HealthReport, MasterRequest, MasterResponse, RootHealth, WorkerInfo};
 use fff_ipc::{master_lockfile_path, master_socket_path, routing_table_path};
 #[cfg(unix)]
 use fff_ipc::{read_message_sync, write_message_sync};
@@ -79,6 +79,8 @@ enum Cmd {
     },
     /// List all workers managed by the master.
     ListWorkers,
+    /// Report per-root index freshness for every loaded worker.
+    Health,
 }
 
 fn main() {
@@ -101,6 +103,7 @@ fn main() {
             json,
         ),
         Cmd::Clean { dry_run } => cmd_clean(dry_run, json),
+        Cmd::Health => cmd_health(json),
     };
     std::process::exit(exit);
 }
@@ -171,6 +174,20 @@ struct PathsJson {
 struct StopOkJson {
     ok: bool,
     stopped: usize,
+}
+
+#[derive(Serialize)]
+struct HealthJson<'a> {
+    master_pid: u32,
+    uptime_sec: u64,
+    workers: &'a [WorkerHealthJson<'a>],
+}
+
+#[derive(Serialize)]
+struct WorkerHealthJson<'a> {
+    index: u32,
+    pid: u32,
+    roots: &'a [RootHealth],
 }
 
 #[derive(Serialize)]
@@ -324,6 +341,99 @@ fn cmd_list_workers(json: bool) -> i32 {
             1
         }
     }
+}
+
+fn cmd_health(json: bool) -> i32 {
+    match master_request(MasterRequest::Health) {
+        Some(MasterResponse::HealthReport(report)) => {
+            if json {
+                print_health_json(&report);
+                return 0;
+            }
+            print_health_text(&report);
+            0
+        }
+        Some(MasterResponse::Error(e)) => {
+            if json {
+                print_error_json(&e);
+            } else {
+                eprintln!("master error: {e}");
+            }
+            1
+        }
+        None => {
+            if json {
+                print_error_json("master not running");
+            } else {
+                eprintln!("master not running");
+            }
+            1
+        }
+        _ => {
+            if json {
+                print_error_json("unexpected response");
+            } else {
+                eprintln!("unexpected response");
+            }
+            1
+        }
+    }
+}
+
+fn print_health_json(report: &HealthReport) {
+    let workers: Vec<WorkerHealthJson> = report
+        .workers
+        .iter()
+        .map(|w| WorkerHealthJson {
+            index: w.index,
+            pid: w.pid,
+            roots: &w.roots,
+        })
+        .collect();
+    print_json(&HealthJson {
+        master_pid: report.master_pid,
+        uptime_sec: report.uptime_sec,
+        workers: &workers,
+    });
+}
+
+fn print_health_text(report: &HealthReport) {
+    println!(
+        "master PID: {}  uptime: {}s  workers: {}",
+        report.master_pid,
+        report.uptime_sec,
+        report.workers.len()
+    );
+    for w in &report.workers {
+        println!("WORKER-{} (pid={})", w.index, w.pid);
+        if w.roots.is_empty() {
+            println!("  <no roots loaded>");
+            continue;
+        }
+        for r in &w.roots {
+            println!(
+                "  {}  (slug: {})  files={}  scan_age={}  watcher_backlog={}  dirty={}",
+                if r.base_path.is_empty() {
+                    "<unknown>"
+                } else {
+                    r.base_path.as_str()
+                },
+                r.slug,
+                opt_u64(r.indexed_files),
+                opt_secs(r.last_scan_age_sec),
+                opt_u64(r.watcher_backlog),
+                opt_u64(r.dirty_count),
+            );
+        }
+    }
+}
+
+fn opt_u64(v: Option<u64>) -> String {
+    v.map_or_else(|| "n/a".to_string(), |n| n.to_string())
+}
+
+fn opt_secs(v: Option<u64>) -> String {
+    v.map_or_else(|| "n/a".to_string(), |n| format!("{n}s"))
 }
 
 fn cmd_paths(base_path: &Path, json: bool) -> i32 {
@@ -1109,6 +1219,39 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v, json!({"ok": true, "stopped": 3}));
+    }
+
+    #[test]
+    fn health_json_shape_is_correct() {
+        let roots = vec![RootHealth {
+            slug: "abc".into(),
+            base_path: "/proj/a".into(),
+            indexed_files: Some(8421),
+            last_scan_age_sec: Some(12),
+            watcher_backlog: None,
+            dirty_count: Some(47),
+        }];
+        let workers = vec![WorkerHealthJson {
+            index: 0,
+            pid: 22,
+            roots: &roots,
+        }];
+        let v: Value = serde_json::to_value(HealthJson {
+            master_pid: 41166,
+            uptime_sec: 1200,
+            workers: &workers,
+        })
+        .unwrap();
+        assert_eq!(v["master_pid"], 41166);
+        assert_eq!(v["uptime_sec"], 1200);
+        assert_eq!(v["workers"][0]["index"], 0);
+        assert_eq!(v["workers"][0]["pid"], 22);
+        assert_eq!(v["workers"][0]["roots"][0]["slug"], "abc");
+        assert_eq!(v["workers"][0]["roots"][0]["base_path"], "/proj/a");
+        assert_eq!(v["workers"][0]["roots"][0]["indexed_files"], 8421);
+        assert_eq!(v["workers"][0]["roots"][0]["last_scan_age_sec"], 12);
+        assert_eq!(v["workers"][0]["roots"][0]["watcher_backlog"], Value::Null);
+        assert_eq!(v["workers"][0]["roots"][0]["dirty_count"], 47);
     }
 
     #[test]

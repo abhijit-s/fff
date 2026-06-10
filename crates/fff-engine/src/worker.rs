@@ -12,11 +12,12 @@ use fff_ipc::{
     base_path_slug,
     config::FffConfig,
     master_socket_path,
-    types::{MasterRequest, SearchRequest, SearchResponse},
+    types::{HealthResponse, MasterRequest, RootHealth, SearchRequest, SearchResponse},
     worker_lockfile_path, worker_socket_path, write_message_sync,
 };
 use fff_ipc::{read_message, write_message};
 use parking_lot::{Mutex, RwLock};
+use std::time::Instant;
 use tokio::{net::UnixListener, sync::Mutex as TokioMutex};
 
 use crate::state::{EffectiveArgs, EngineState};
@@ -26,6 +27,9 @@ struct RootEntry {
     // Milliseconds since Unix epoch; updated atomically on every access.
     // Allows fast-path reads to hold roots.read() instead of roots.write().
     last_access_ms: AtomicU64,
+    // Set once when the root finishes its initial scan. Acts as the
+    // last-full-scan timestamp surfaced via `fffctl health`.
+    loaded_at: Instant,
 }
 
 pub(crate) struct WorkerState {
@@ -108,10 +112,42 @@ impl WorkerState {
             RootEntry {
                 state: Arc::clone(&new_state),
                 last_access_ms: AtomicU64::new(now_ms()),
+                loaded_at: Instant::now(),
             },
         );
 
         Ok(new_state)
+    }
+
+    // Snapshot freshness signals for every loaded root.
+    // Read lock is held only long enough to clone the per-root metadata —
+    // the actual file count / dirty count read happens after dropping the
+    // worker-level lock by going through each EngineState's picker.
+    fn collect_health(&self) -> HealthResponse {
+        let snapshot: Vec<(String, Arc<EngineState>, Instant)> = {
+            let map = self.roots.read();
+            map.iter()
+                .map(|(slug, entry)| (slug.clone(), Arc::clone(&entry.state), entry.loaded_at))
+                .collect()
+        };
+
+        let now = Instant::now();
+        let roots = snapshot
+            .into_iter()
+            .map(|(slug, state, loaded_at)| {
+                let (indexed_files, dirty_count) = read_picker_freshness(&state);
+                RootHealth {
+                    slug,
+                    base_path: state.base_path.to_string_lossy().into_owned(),
+                    indexed_files,
+                    last_scan_age_sec: Some(now.duration_since(loaded_at).as_secs()),
+                    watcher_backlog: None,
+                    dirty_count,
+                }
+            })
+            .collect();
+
+        HealthResponse { roots }
     }
 
     // Evict the LRU root with no active connections (Arc::strong_count == 1).
@@ -148,6 +184,24 @@ impl WorkerState {
             }
         });
     }
+}
+
+// Read indexed_files and dirty_count off the shared picker without blocking
+// for long: returns (None, None) when the picker is mid-init or contended.
+fn read_picker_freshness(state: &EngineState) -> (Option<u64>, Option<u64>) {
+    let Ok(guard) = state.shared_picker.read() else {
+        return (None, None);
+    };
+    let Some(picker) = guard.as_ref() else {
+        return (None, None);
+    };
+    let indexed = picker.live_file_count() as u64;
+    let dirty = picker
+        .get_files()
+        .iter()
+        .filter(|f| !f.is_deleted() && f.git_status.is_some_and(fff::git::is_modified_status))
+        .count() as u64;
+    (Some(indexed), Some(dirty))
 }
 
 /// Entry point for worker mode. Binds the worker socket and serves connections.
@@ -229,6 +283,11 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
 
     let base_path = match read_message(&mut read_half).await {
         Ok(SearchRequest::Connect { base_path }) => PathBuf::from(base_path),
+        Ok(SearchRequest::Health) => {
+            let health = ws.collect_health();
+            let _ = write_message(&mut write_half, &SearchResponse::Health(health)).await;
+            return;
+        }
         Ok(other) => {
             tracing::warn!(
                 "worker-{}: unexpected first message {:?}, closing",
