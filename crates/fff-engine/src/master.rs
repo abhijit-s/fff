@@ -363,13 +363,6 @@ async fn query_worker_health(
     }
 }
 
-#[cfg(not(unix))]
-async fn query_worker_health(
-    _socket: &std::path::Path,
-) -> Result<fff_ipc::types::HealthResponse, String> {
-    Err("master mode is not supported on this platform".into())
-}
-
 /// Entry point for master mode.
 #[cfg(not(unix))]
 pub async fn run(

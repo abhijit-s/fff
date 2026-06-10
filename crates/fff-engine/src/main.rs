@@ -6,10 +6,12 @@ mod server;
 mod state;
 pub(crate) mod worker;
 
+#[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::Arc;
 
+#[cfg(unix)]
 use clap::Parser;
 use mimalloc::MiMalloc;
 
@@ -17,6 +19,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 /// fff search engine daemon — singleton, master, or worker mode.
+#[cfg(unix)]
 #[derive(Parser, Debug)]
 #[command(name = "fff-engine", version)]
 pub(crate) struct Args {
