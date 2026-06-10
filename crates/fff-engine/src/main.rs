@@ -1,4 +1,5 @@
 mod handlers;
+#[cfg(unix)]
 mod lifecycle;
 pub(crate) mod master;
 #[cfg(unix)]
