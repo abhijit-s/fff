@@ -30,3 +30,6 @@ scripts/benchmark-results/
 
 # Test logs
 fff-test.log
+
+# Agent worktrees (created by Claude Code background agents)
+.claude/worktrees/
