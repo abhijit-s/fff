@@ -1545,17 +1545,13 @@ fn format_directories_wire(items: &[fff_ipc::types::WireDirEntry]) -> String {
         .join("\n")
 }
 
-/// True when the master socket appears alive (file exists and accepts a
-/// connection). Used to gate non-default `base_path` calls — multi-root
-/// requires the master+worker engine.
+/// True when master mode is usable. Actively (re)spawns `fff-engine --master`
+/// if its socket is gone — so a master that died while the MCP server kept
+/// running is recovered here instead of failing every multi-root call until
+/// restart. Gates non-default `base_path` calls; multi-root needs master mode.
 #[cfg(unix)]
 fn master_mode_available() -> bool {
-    use std::os::unix::net::UnixStream;
-    let sock = fff_ipc::master_socket_path();
-    if !sock.exists() {
-        return false;
-    }
-    UnixStream::connect(&sock).is_ok()
+    crate::client::EngineClient::ensure_master().is_ok()
 }
 
 #[cfg(test)]

@@ -646,6 +646,83 @@ fn pool_find_files_with_explicit_root_routes_to_worker() {
     }
 }
 
+// ── U7-7 — master respawns after death so multi-root recovers ────────────────
+
+/// Reproduces the "multi-root requires master mode" never-recovers bug: a
+/// targeted-root call must work, survive the master dying, and work again after
+/// `ensure_master()` respawns it — without restarting the harness.
+#[test]
+fn u7_7_master_respawns_after_death_via_gate() {
+    let env = TestEnv::new();
+    let master = env.spawn_master();
+    let mut guard = KillOnDrop(master);
+
+    assert!(
+        wait_socket(&env.master_socket(), 10_000),
+        "master socket did not appear"
+    );
+
+    let root = env.root.join("respawn_root");
+    std::fs::create_dir_all(&root).expect("create respawn_root");
+
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("XDG_CACHE_HOME", env.cache_dir());
+        std::env::set_var("XDG_RUNTIME_DIR", env.runtime_dir());
+        std::env::set_var("XDG_CONFIG_HOME", env.config_dir());
+    }
+    env.write_config();
+
+    let pool = ConnectionPool::new();
+    let req = SearchRequest::FindFiles {
+        query: String::new(),
+        options: FindOptions::default(),
+    };
+
+    let before = pool.search_with_retry(&root, &req);
+    assert!(
+        matches!(before, SearchResponse::SearchResults(_)),
+        "expected SearchResults before master death, got {before:?}"
+    );
+
+    // Kill the master and drop the pool's now-stale client + socket.
+    guard.0.kill().ok();
+    guard.0.wait().ok();
+    pool.invalidate(&root);
+    let _ = std::fs::remove_file(env.master_socket());
+    assert!(
+        UnixStream::connect(env.master_socket()).is_err(),
+        "master socket must be dead before recovery"
+    );
+
+    // The gate's active recovery: ensure_master respawns the dead master.
+    EngineClient::ensure_master().expect("ensure_master should respawn the dead master");
+    assert!(
+        wait_socket(&env.master_socket(), 10_000),
+        "respawned master socket did not appear"
+    );
+
+    let after = pool.search_with_retry(&root, &req);
+
+    // Clean up the respawned master (detached child) before asserting.
+    let lockfile = env.cache_dir().join("fff").join("master.lock");
+    if let Ok(content) = std::fs::read_to_string(&lockfile)
+        && let Ok(pid) = content.trim().parse::<libc::pid_t>()
+    {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    unsafe {
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    assert!(
+        matches!(after, SearchResponse::SearchResults(_)),
+        "expected SearchResults after master respawn, got {after:?}"
+    );
+}
+
 /// RootRegistry::all() returns the registered roots in stable order
 /// (default first), and is_default() agrees with the original input.
 #[test]

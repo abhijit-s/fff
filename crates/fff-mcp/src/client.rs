@@ -72,6 +72,12 @@ impl EngineClient {
         &self.base_path
     }
 
+    /// Ensure `fff-engine --master` is running, spawning it if absent.
+    /// Lets callers (re)attach to master mode without a full two-phase connect.
+    pub fn ensure_master() -> Result<(), Box<dyn std::error::Error>> {
+        ensure_master_running()
+    }
+
     /// Construct from an arbitrary stream — pool tests only.
     #[cfg(test)]
     pub(crate) fn from_stream(stream: UnixStream, base_path: PathBuf) -> Self {
@@ -271,10 +277,16 @@ fn ensure_master_running() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Check whether a live master holds the lockfile (slow start or another
-    // spawner is in progress).
-    if lockfile.exists() && !lockfile::is_stale(&lockfile) {
-        return fff_ipc::wait_for_socket(&master, SPAWN_TIMEOUT).map_err(Into::into);
+    // A live master holds the lockfile (slow start or another spawner in
+    // progress) — just wait. A stale lockfile means the previous master died
+    // uncleanly; remove it so our O_EXCL acquire below can win instead of
+    // failing and waiting forever for a socket that will never appear.
+    if lockfile.exists() {
+        if lockfile::is_stale(&lockfile) {
+            let _ = std::fs::remove_file(&lockfile);
+        } else {
+            return fff_ipc::wait_for_socket(&master, SPAWN_TIMEOUT).map_err(Into::into);
+        }
     }
 
     // Race to spawn master: O_CREAT|O_EXCL via create_new.
