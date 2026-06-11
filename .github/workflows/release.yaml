@@ -627,19 +627,29 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Formula lives in the dedicated tap repo; this repo only owns the
-      # update script. HOMEBREW_TAP_TOKEN is a PAT with write access to
-      # abhijit-s/homebrew-tap (github.token can't reach another repo).
+      # Formula lives in the dedicated tap repo; this repo only owns the update
+      # script. github.token can't reach another repo, so a GitHub App
+      # (installed on abhijit-s/homebrew-tap with Contents: write) mints a
+      # short-lived, tap-scoped token here.
       - name: Checkout fff (for the update script)
         uses: actions/checkout@v5
         with:
           path: src
 
+      - name: Generate tap token
+        id: tap_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          owner: abhijit-s
+          repositories: homebrew-tap
+
       - name: Checkout tap repo
         uses: actions/checkout@v5
         with:
           repository: abhijit-s/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ steps.tap_token.outputs.token }}
           path: tap
 
       - name: Compute version from tag
