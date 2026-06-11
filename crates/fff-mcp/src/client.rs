@@ -38,6 +38,10 @@ impl EngineClient {
 
         // Phase 2: connect to the worker and send Connect{base_path}.
         let stream = wait_and_connect(&worker_socket, SPAWN_TIMEOUT)?;
+        // Bound reads so a missing or slow worker reply degrades to an error
+        // instead of hanging the client (mirrors connect_legacy/check_health).
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let base_path_str = base_path.to_string_lossy().into_owned();
 
         let mut writer = BufWriter::new(stream.try_clone()?);
@@ -155,8 +159,8 @@ impl EngineClient {
         })
     }
 
-    /// Fire-and-forget frecency write.
-    #[allow(dead_code)]
+    /// Fire-and-forget frecency write. Writes and flushes without reading a
+    /// reply — the engine sends none for `RecordAccess`.
     pub fn record_access(&mut self, path: &str) {
         let req = SearchRequest::RecordAccess {
             path: path.to_owned(),
