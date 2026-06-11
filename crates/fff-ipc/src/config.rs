@@ -57,6 +57,10 @@ pub struct McpRoot {
     pub path: PathBuf,
     #[serde(default)]
     pub name: Option<String>,
+    /// Gitignore-style glob patterns excluded from this root's index and
+    /// watcher (e.g. `["target/", "**/*.log", "!keep/"]`). Empty by default.
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +88,26 @@ impl McpConfig {
             }
         }
         Ok(())
+    }
+
+    /// Gitignore-style ignore patterns for the registered root that best
+    /// contains `base_path` (canonical longest-prefix match — same identity
+    /// discipline as name resolution). Empty when no configured root matches.
+    pub fn ignore_for(&self, base_path: &Path) -> Vec<String> {
+        let target = std::fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
+        let mut best: Option<&McpRoot> = None;
+        let mut best_len = 0usize;
+        for root in &self.roots {
+            if root.ignore.is_empty() {
+                continue;
+            }
+            let rp = std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone());
+            if target.starts_with(&rp) && rp.as_os_str().len() > best_len {
+                best_len = rp.as_os_str().len();
+                best = Some(root);
+            }
+        }
+        best.map(|r| r.ignore.clone()).unwrap_or_default()
     }
 
     /// Resolve `default` to a concrete path (name → declared path, or an
@@ -295,5 +319,46 @@ path = "/tmp/anon"
             McpConfigError::UnresolvedDefault(v) => assert_eq!(v, "ghost"),
             other => panic!("expected UnresolvedDefault, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mcp_root_ignore_parses_and_defaults_empty() {
+        let toml = r#"
+[[mcp.roots]]
+path = "/tmp/proj"
+ignore = ["target/", "**/*.log"]
+
+[[mcp.roots]]
+path = "/tmp/other"
+"#;
+        let cfg: FffConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.mcp.roots[0].ignore, vec!["target/", "**/*.log"]);
+        assert!(
+            cfg.mcp.roots[1].ignore.is_empty(),
+            "ignore defaults to empty when omitted"
+        );
+    }
+
+    #[test]
+    fn mcp_ignore_for_matches_containing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("proj");
+        let child = parent.join("src").join("deep");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let mut cfg = McpConfig::default();
+        cfg.roots.push(McpRoot {
+            path: parent.clone(),
+            name: None,
+            ignore: vec!["target/".into()],
+        });
+
+        // A sub-path resolves to the containing root's patterns.
+        assert_eq!(cfg.ignore_for(&child), vec!["target/".to_string()]);
+        // An unrelated path matches nothing.
+        assert!(
+            cfg.ignore_for(Path::new("/nonexistent/unrelated"))
+                .is_empty()
+        );
     }
 }
