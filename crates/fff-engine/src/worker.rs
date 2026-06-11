@@ -176,8 +176,14 @@ impl WorkerState {
                 map.get(merge_into_slug).map(|e| Arc::clone(&e.state)),
             )
         };
-        if let (Some(child), Some(parent)) = (&child, &parent) {
-            merge_child_frecency(parent, child);
+        match (&child, &parent) {
+            (Some(child), Some(parent)) => merge_child_frecency(parent, child),
+            (Some(_), None) => tracing::warn!(
+                "worker-{}: subsuming {slug} but parent {merge_into_slug} is not loaded here \
+                 — frecency not merged (parent re-accrues signal as it is used)",
+                self.index
+            ),
+            _ => {}
         }
         if self.roots.write().remove(slug).is_some() {
             tracing::info!("worker-{}: dropped subsumed root {slug}", self.index);
@@ -411,6 +417,17 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
                 let _ = write_message(
                     &mut write_half,
                     &SearchResponse::Error("unexpected Connect after handshake".into()),
+                )
+                .await;
+                break;
+            }
+            SearchRequest::DropRoot { .. } => {
+                // DropRoot is only valid as a first message on a fresh
+                // connection; reject mid-session rather than reaching the
+                // dispatch_request unreachable.
+                let _ = write_message(
+                    &mut write_half,
+                    &SearchResponse::Error("unexpected DropRoot mid-session".into()),
                 )
                 .await;
                 break;

@@ -408,23 +408,29 @@ async fn send_drop_root(
     slug: String,
     merge_into_slug: String,
 ) -> Result<(), String> {
-    let stream = tokio::net::UnixStream::connect(socket)
+    // Bound the whole round-trip so a wedged or version-skewed worker can't
+    // hang this background task (mirrors the client-side timeout discipline).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (mut read_half, mut write_half) = tokio::io::split(stream);
+        write_message(
+            &mut write_half,
+            &SearchRequest::DropRoot {
+                slug,
+                merge_into_slug,
+            },
+        )
         .await
         .map_err(|e| e.to_string())?;
-    let (mut read_half, mut write_half) = tokio::io::split(stream);
-    write_message(
-        &mut write_half,
-        &SearchRequest::DropRoot {
-            slug,
-            merge_into_slug,
-        },
-    )
+        let _: SearchResponse = read_message(&mut read_half)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    })
     .await
-    .map_err(|e| e.to_string())?;
-    let _: SearchResponse = read_message(&mut read_half)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    .map_err(|_| "DropRoot timed out".to_string())?
 }
 
 // Connect to a worker socket, send Health as the first message, and read the

@@ -310,6 +310,13 @@ impl FrecencyTracker {
     /// Keys are `blake3(absolute_path)`, identical across roots, so a child
     /// root's signal merges into an ancestor with no path rewriting.
     pub fn merge_from(&self, other: &FrecencyTracker) -> Result<usize> {
+        // Same env (e.g. a shared config.frecency.db): nothing to merge, and
+        // opening read+write txns against one env from a single path is a no-op
+        // at best — skip.
+        if self.db_path() == other.db_path() {
+            return Ok(0);
+        }
+
         // Snapshot the source under a read txn, then apply under one write txn.
         let incoming: Vec<(Vec<u8>, VecDeque<u64>)> = {
             let rtxn = other
@@ -582,6 +589,21 @@ mod tests {
         assert!(parent.access_count(shared).unwrap() >= 1);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_from_same_env_is_skipped() {
+        let dir = std::env::temp_dir().join("fff_merge_same_env");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = FrecencyTracker::open(dir.to_str().unwrap()).unwrap();
+        t.track_access(Path::new("/abs/x.rs")).unwrap();
+
+        // Merging an env into itself (same db_path, e.g. a shared frecency DB)
+        // is a guarded no-op.
+        assert_eq!(t.merge_from(&t).unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
