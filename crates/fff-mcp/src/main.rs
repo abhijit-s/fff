@@ -166,6 +166,7 @@ pub(crate) struct Args {
 
     /// Disable the content index built after the initial scan.
     /// This makes grep calls slower but consumes less RAM (recommended to not turn off)
+    #[arg(long = "no-content-indexing")]
     no_content_indexing: bool,
 
     /// Explicitly enable content indexing even when `--no-warmup` is set.
@@ -192,6 +193,10 @@ pub(crate) struct Args {
     /// Accepts any RUST_LOG-style string: "debug", "info", "fff_engine=debug,info".
     #[arg(long = "set-log-level", value_name = "LEVEL")]
     pub(crate) set_log_level: Option<String>,
+
+    /// Print a shell completion script to stdout and exit.
+    #[arg(long = "completions", value_name = "SHELL")]
+    completions: Option<clap_complete::Shell>,
 }
 
 /// Assemble a `RootRegistry` from CLI args + an optional `--config` TOML.
@@ -277,6 +282,14 @@ fn resolve_defaults(args: &mut Args, cfg: &fff_ipc::config::FffConfig) {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = Args::parse();
+
+    if let Some(shell) = args.completions {
+        use clap::CommandFactory;
+        let mut cmd = Args::command();
+        clap_complete::generate(shell, &mut cmd, "fff-mcp", &mut std::io::stdout());
+        return Ok(());
+    }
+
     // `--config` names an explicit file (fatal on failure); otherwise load the
     // default XDG path best-effort. One `cfg` feeds everything downstream.
     let cfg = match args.config_file.as_deref() {
