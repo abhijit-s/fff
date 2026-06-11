@@ -109,6 +109,15 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: Arc<EngineStat
                     break;
                 }
             }
+            SearchRequest::DropRoot { .. } => {
+                // Singleton mode has no multi-root map to subsume — no-op Ack.
+                if write_message(&mut write_half, &fff_ipc::types::SearchResponse::Ack)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
             req => {
                 let response = dispatch_request(&state, req).await;
                 if write_message(&mut write_half, &response).await.is_err() {
@@ -166,7 +175,9 @@ pub(crate) async fn dispatch_request(
             let label = format!("list_directories(limit={limit})");
             (label, handle_list_directories(state, limit).await)
         }
-        SearchRequest::RecordAccess { .. } | SearchRequest::SetLogLevel { .. } => {
+        SearchRequest::RecordAccess { .. }
+        | SearchRequest::SetLogLevel { .. }
+        | SearchRequest::DropRoot { .. } => {
             unreachable!("handled before dispatch")
         }
         SearchRequest::Connect { .. } => {

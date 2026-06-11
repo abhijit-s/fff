@@ -164,6 +164,26 @@ impl WorkerState {
         })
     }
 
+    // Subsume a child root: merge its frecency into the parent when both are
+    // co-resident on this worker, then remove the child's EngineState. Sent by
+    // the master during containment subsumption. Arcs are cloned under a brief
+    // read lock; the merge runs lock-free; removal takes the write lock.
+    fn drop_root(&self, slug: &str, merge_into_slug: &str) {
+        let (child, parent) = {
+            let map = self.roots.read();
+            (
+                map.get(slug).map(|e| Arc::clone(&e.state)),
+                map.get(merge_into_slug).map(|e| Arc::clone(&e.state)),
+            )
+        };
+        if let (Some(child), Some(parent)) = (&child, &parent) {
+            merge_child_frecency(parent, child);
+        }
+        if self.roots.write().remove(slug).is_some() {
+            tracing::info!("worker-{}: dropped subsumed root {slug}", self.index);
+        }
+    }
+
     // Snapshot freshness signals for every loaded root.
     // Read lock is held only long enough to clone the per-root metadata —
     // the actual file count / dirty count read happens after dropping the
@@ -345,6 +365,14 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
             let _ = write_message(&mut write_half, &SearchResponse::Health(health)).await;
             return;
         }
+        Ok(SearchRequest::DropRoot {
+            slug,
+            merge_into_slug,
+        }) => {
+            ws.drop_root(&slug, &merge_into_slug);
+            let _ = write_message(&mut write_half, &SearchResponse::Ack).await;
+            return;
+        }
         Ok(other) => {
             tracing::warn!(
                 "worker-{}: unexpected first message {:?}, closing",
@@ -419,6 +447,21 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
                     break;
                 }
             }
+        }
+    }
+}
+
+// Merge a subsumed child's frecency history into the parent's DB, in-process,
+// using the already-open trackers (no cross-process LMDB env aliasing). Keys
+// are absolute-path hashes, identical across roots, so the union is direct.
+#[cfg(unix)]
+fn merge_child_frecency(parent: &EngineState, child: &EngineState) {
+    if let (Ok(pg), Ok(cg)) = (parent.shared_frecency.read(), child.shared_frecency.read())
+        && let (Some(p), Some(c)) = (pg.as_ref(), cg.as_ref())
+    {
+        match p.merge_from(c) {
+            Ok(n) => tracing::info!(merged = n, "subsumption: merged child frecency into parent"),
+            Err(e) => tracing::warn!("subsumption: frecency merge failed: {e}"),
         }
     }
 }

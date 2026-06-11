@@ -111,6 +111,15 @@ pub enum SearchRequest {
     /// message on a worker socket (bypasses Connect); the worker responds with
     /// SearchResponse::Health and closes the connection.
     Health,
+    /// Subsume a child root: merge its frecency into the parent (when both are
+    /// co-resident on this worker), then drop the child's EngineState. Sent by
+    /// the master during containment subsumption as the first message on a
+    /// worker socket; the worker responds with Ack. Appended last to preserve
+    /// bincode variant indices for existing variants.
+    DropRoot {
+        slug: String,
+        merge_into_slug: String,
+    },
 }
 
 // ── Response ──────────────────────────────────────────────────────────────────
@@ -558,6 +567,25 @@ mod tests {
         let rt = round_trip(&req);
         match rt {
             SearchRequest::Connect { base_path } => assert_eq!(base_path, "/home/user/repo"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn drop_root_request_round_trips() {
+        let req = SearchRequest::DropRoot {
+            slug: "childslug".into(),
+            merge_into_slug: "parentslug".into(),
+        };
+        let rt = round_trip(&req);
+        match rt {
+            SearchRequest::DropRoot {
+                slug,
+                merge_into_slug,
+            } => {
+                assert_eq!(slug, "childslug");
+                assert_eq!(merge_into_slug, "parentslug");
+            }
             _ => panic!("wrong variant"),
         }
     }

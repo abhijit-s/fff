@@ -737,6 +737,58 @@ fn u5_containment_routes_subpath_to_parent_root() {
     sigterm_and_wait(&mut master, Duration::from_secs(5));
 }
 
+/// U3 (subsumption): registering a parent over an already-registered child
+/// subsumes the child — the async background task removes the child's routing
+/// entry, leaving only the parent.
+#[test]
+fn u5_parent_registration_subsumes_existing_child() {
+    let env = TestEnv::new();
+    let mut master = env.spawn_master();
+    assert!(env.wait_master(SOCKET_TIMEOUT));
+    env.wait_for_workers(1, SOCKET_TIMEOUT);
+
+    let parent = env.dir.path().join("project");
+    let child = parent.join("nested").join("child");
+    std::fs::create_dir_all(&child).unwrap();
+
+    // Child registered first as its own root.
+    env.handshake(child.to_str().unwrap());
+    let before: usize = RoutingTable::load(&env.routing_json())
+        .expect("routing")
+        .workers
+        .values()
+        .map(|w| w.roots.len())
+        .sum();
+    assert_eq!(before, 1, "child should be registered as its own root");
+
+    // Registering the parent triggers async subsumption of the child.
+    env.handshake(parent.to_str().unwrap());
+
+    // Poll until the background task has evicted the child: one root, the parent.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let subsumed = loop {
+        let bases: Vec<String> = RoutingTable::load(&env.routing_json())
+            .expect("routing")
+            .workers
+            .values()
+            .flat_map(|w| w.roots.iter().map(|r| r.base_path.clone()))
+            .collect();
+        if bases.len() == 1 && bases[0].ends_with("project") {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        sleep(Duration::from_millis(200));
+    };
+    assert!(
+        subsumed,
+        "parent registration should subsume the pre-existing child root"
+    );
+
+    sigterm_and_wait(&mut master, Duration::from_secs(5));
+}
+
 /// U5-3: After scale-out, existing routing entries are not remapped.
 /// The root assigned before scale-out must still map to the original worker.
 #[test]
