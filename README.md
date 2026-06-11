@@ -120,9 +120,10 @@ fffctl paths  /path/to/project    # show socket, lockfile, frecency dir, log
 fffctl stop   /path/to/project    # graceful SIGTERM (SIGKILL after --timeout)
 fffctl stop --all                 # stop every daemon
 fffctl clean [--dry-run]          # remove stale lockfiles and orphan sockets
+fffctl restart                    # stop --all + clean (run after upgrading fff)
 ```
 
-`fffctl stop` triggers a clean shutdown: the engine removes its lockfile and socket on exit. `fffctl clean` exists for the case where a daemon crashed without cleanup.
+`fffctl stop` triggers a clean shutdown: the engine removes its lockfile and socket on exit. `fffctl clean` exists for the case where a daemon crashed without cleanup. `fffctl restart` combines the two — run it after `brew upgrade fff` so the old daemon is replaced by the new binary on the next request.
 
 ### Recommended agent prompt
 

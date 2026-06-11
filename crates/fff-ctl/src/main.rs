@@ -70,6 +70,13 @@ enum Cmd {
         #[arg(long, default_value_t = 5)]
         timeout: u64,
     },
+    /// Stop every daemon and sweep stale artifacts — run after upgrading fff.
+    /// The new binary is picked up when the daemon respawns on the next request.
+    Restart {
+        /// Seconds to wait for graceful exit before SIGKILL. 0 disables KILL.
+        #[arg(long, default_value_t = 5)]
+        timeout: u64,
+    },
     /// Remove stale lockfiles, orphan sockets, and unreferenced frecency dirs.
     Clean {
         /// Print actions without performing them.
@@ -118,6 +125,7 @@ fn main() {
             Duration::from_secs(timeout),
             json,
         ),
+        Cmd::Restart { timeout } => cmd_restart(Duration::from_secs(timeout), json),
         Cmd::Clean { dry_run } => cmd_clean(dry_run, json),
         Cmd::Health => cmd_health(json),
     };
@@ -798,6 +806,16 @@ fn cmd_stop(base_path: Option<&Path>, all: bool, timeout: Duration, json: bool) 
         }
         2
     }
+}
+
+// Stop the whole daemon tree, then sweep stale artifacts. Intended for use
+// after upgrading fff — the new binary is picked up when the daemon respawns
+// on the next request. Composes `stop --all` + `clean`; exit code is non-zero
+// if either phase failed.
+fn cmd_restart(timeout: Duration, json: bool) -> i32 {
+    let stopped = cmd_stop(None, true, timeout, json);
+    let cleaned = cmd_clean(false, json);
+    stopped.max(cleaned)
 }
 
 fn cmd_clean(dry_run: bool, json: bool) -> i32 {
