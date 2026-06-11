@@ -286,17 +286,31 @@ impl MasterState {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| base_path.to_string());
 
+        // Git working-tree root of the candidate, resolved outside any lock
+        // (filesystem I/O). A linked worktree / submodule / nested repo
+        // resolves to its own workdir, distinct from a lexical ancestor.
+        let candidate_wt = fff::git::working_tree_root(std::path::Path::new(&canonical));
+
         // Containment: if an already-registered root is an ancestor of this
         // path, route to its worker instead of minting a new slug/index/
         // frecency DB/watcher. Checked before ring assignment so a contained
-        // sub-path never triggers a worker spawn.
+        // sub-path never triggers a worker spawn. Only honored when the
+        // ancestor shares the candidate's git working tree — a path that is
+        // its own working tree (e.g. an agent's worktree under
+        // .claude/worktrees/) is a distinct, possibly-drifted checkout and
+        // must get its own index, not the ancestor's view.
         let contained = {
             let routing = self.routing.lock().await;
             routing.containing_root(std::path::Path::new(&canonical))
         };
-        if let Some((idx, _slug)) = contained {
-            tracing::debug!("master: routing {base_path} to containing root on worker-{idx}");
-            return Some(idx);
+        if let Some((idx, _slug, anc_base)) = contained {
+            if fff::git::working_tree_root(std::path::Path::new(&anc_base)) == candidate_wt {
+                tracing::debug!("master: routing {base_path} to containing root on worker-{idx}");
+                return Some(idx);
+            }
+            tracing::debug!(
+                "master: {base_path} is a distinct git working tree from containing root {anc_base}; minting its own root"
+            );
         }
 
         // Ring assignment is read-only and deterministic; compute outside any lock.
@@ -331,8 +345,10 @@ impl MasterState {
                 }
             }
 
-            // Existing roots that this new root now contains — subsumed below.
-            let descendants: Vec<(u32, String)> = routing
+            // Existing roots this new root now lexically contains. Filtered in
+            // subsume_descendants to those sharing the new parent's working
+            // tree, so a live child worktree is never retracted into it.
+            let descendants: Vec<(u32, String, String)> = routing
                 .workers
                 .iter()
                 .flat_map(|(&widx, entry)| {
@@ -343,7 +359,7 @@ impl MasterState {
                             !r.base_path.is_empty()
                                 && std::path::Path::new(&r.base_path).starts_with(&canonical)
                         })
-                        .map(move |r| (widx, r.slug.clone()))
+                        .map(move |r| (widx, r.slug.clone(), r.base_path.clone()))
                 })
                 .collect();
 
@@ -365,8 +381,10 @@ impl MasterState {
         if !descendants.is_empty() {
             let me = Arc::clone(self);
             let parent_slug = slug.clone();
+            let parent_wt = candidate_wt.clone();
             tokio::spawn(async move {
-                me.subsume_descendants(parent_slug, descendants).await;
+                me.subsume_descendants(parent_slug, parent_wt, descendants)
+                    .await;
             });
         }
 
@@ -385,8 +403,23 @@ impl MasterState {
     // child's worker to merge frecency into the parent and drop the child's
     // EngineState, then remove the child from the routing table. Runs in a
     // background task so the triggering Handshake never blocks.
-    async fn subsume_descendants(&self, parent_slug: String, descendants: Vec<(u32, String)>) {
-        for (widx, child_slug) in descendants {
+    async fn subsume_descendants(
+        &self,
+        parent_slug: String,
+        parent_wt: Option<std::path::PathBuf>,
+        descendants: Vec<(u32, String, String)>,
+    ) {
+        for (widx, child_slug, child_base) in descendants {
+            // A child that is its own git working tree (linked worktree,
+            // submodule, nested repo) is a distinct checkout — never retract it
+            // into the lexical parent, or an active worktree would be served
+            // the parent's stale view.
+            if fff::git::working_tree_root(std::path::Path::new(&child_base)) != parent_wt {
+                tracing::debug!(
+                    "master: keeping child root {child_slug} ({child_base}) — distinct git working tree from {parent_slug}"
+                );
+                continue;
+            }
             let socket = worker_socket_path(widx);
             if let Err(e) = send_drop_root(&socket, child_slug.clone(), parent_slug.clone()).await {
                 tracing::warn!(

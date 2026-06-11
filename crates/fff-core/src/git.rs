@@ -172,6 +172,17 @@ pub fn format_git_status(status: Option<Status>) -> &'static str {
     format_git_status_opt(status).unwrap_or("unknown")
 }
 
+/// Canonical git working-tree root containing `path`, or `None` when `path`
+/// is outside any git repository (or the repo is bare). A linked worktree,
+/// submodule, or nested repo resolves to its OWN workdir — distinct from a
+/// lexical ancestor — letting callers treat working-tree boundaries as root
+/// boundaries.
+pub fn working_tree_root(path: &Path) -> Option<PathBuf> {
+    let repo = Repository::discover(path).ok()?;
+    let workdir = repo.workdir()?;
+    Some(crate::path_utils::normalize(workdir.to_path_buf()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +260,50 @@ mod tests {
                 status
             );
         }
+    }
+
+    #[test]
+    fn working_tree_root_resolves_subdir_to_repo_root() {
+        let tmp = TempDir::new().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        git(&base, &["init", "-b", "main"]);
+        let sub = base.join("a/b");
+        fs::create_dir_all(&sub).unwrap();
+        // A plain subdir shares the repo's working tree as its containing root.
+        assert_eq!(working_tree_root(&sub), working_tree_root(&base));
+    }
+
+    #[test]
+    fn working_tree_root_none_outside_git() {
+        let tmp = TempDir::new().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        assert_eq!(working_tree_root(&base), None);
+    }
+
+    #[test]
+    fn working_tree_root_treats_linked_worktree_as_its_own_root() {
+        let tmp = TempDir::new().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-b", "main"]);
+        fs::write(main.join("f.txt"), "x\n").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-m", "seed", "--no-gpg-sign"]);
+
+        // Linked worktree physically nested under the main repo — the
+        // .claude/worktrees/* layout an agent works in.
+        let wt = main.join(".claude/worktrees/wt");
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(&main, &["worktree", "add", wt.to_str().unwrap()]);
+
+        let wt_root = working_tree_root(&wt).unwrap();
+        let main_root = working_tree_root(&main).unwrap();
+        assert_ne!(
+            wt_root, main_root,
+            "linked worktree must resolve to itself, not the main repo"
+        );
+        assert!(wt_root.ends_with("wt"));
+        assert!(main_root.ends_with("main"));
     }
 }

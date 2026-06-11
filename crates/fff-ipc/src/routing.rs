@@ -100,12 +100,14 @@ impl RoutingTable {
     }
 
     /// Find the registered root whose `base_path` is the longest ancestor of
-    /// (or equal to) `canonical`, returning `(worker_index, slug)`. Comparison
-    /// is path-component-wise via `Path::starts_with`, so `/foo/bar` does not
-    /// match `/foo/barbaz`. Entries with an empty `base_path` (legacy-migrated)
-    /// are skipped. Used to route a sub-path to an already-registered
-    /// containing root instead of minting a duplicate index.
-    pub fn containing_root(&self, canonical: &Path) -> Option<(u32, String)> {
+    /// (or equal to) `canonical`, returning `(worker_index, slug, base_path)`.
+    /// Comparison is path-component-wise via `Path::starts_with`, so `/foo/bar`
+    /// does not match `/foo/barbaz`. Entries with an empty `base_path`
+    /// (legacy-migrated) are skipped. The returned `base_path` lets the caller
+    /// apply a working-tree-boundary check before treating the match as a true
+    /// container (a lexical ancestor in a different git working tree must not
+    /// swallow a distinct checkout).
+    pub fn containing_root(&self, canonical: &Path) -> Option<(u32, String, String)> {
         let mut best: Option<(u32, &RootEntry)> = None;
         let mut best_len = 0usize;
         for (&idx, entry) in &self.workers {
@@ -119,7 +121,7 @@ impl RoutingTable {
                 }
             }
         }
-        best.map(|(idx, root)| (idx, root.slug.clone()))
+        best.map(|(idx, root)| (idx, root.slug.clone(), root.base_path.clone()))
     }
 
     /// Load from a JSON file. Returns `Ok(Default)` when the file is absent.
@@ -214,14 +216,20 @@ mod tests {
             .insert(0, entry_with_roots(0, &[("parent", "/home/me/proj")]));
 
         let hit = rt.containing_root(Path::new("/home/me/proj/src/lib"));
-        assert_eq!(hit, Some((0, "parent".to_string())));
+        assert_eq!(
+            hit,
+            Some((0, "parent".to_string(), "/home/me/proj".to_string()))
+        );
     }
 
     #[test]
     fn containing_root_matches_exact_path() {
         let mut rt = RoutingTable::default();
         rt.workers.insert(0, entry_with_roots(0, &[("p", "/a/b")]));
-        assert_eq!(rt.containing_root(Path::new("/a/b")), Some((0, "p".into())));
+        assert_eq!(
+            rt.containing_root(Path::new("/a/b")),
+            Some((0, "p".into(), "/a/b".into()))
+        );
     }
 
     #[test]
@@ -241,7 +249,7 @@ mod tests {
             entry_with_roots(0, &[("shallow", "/a"), ("deep", "/a/b/c")]),
         );
         let hit = rt.containing_root(Path::new("/a/b/c/d"));
-        assert_eq!(hit, Some((0, "deep".to_string())));
+        assert_eq!(hit, Some((0, "deep".to_string(), "/a/b/c".to_string())));
     }
 
     #[test]
