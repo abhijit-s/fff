@@ -697,18 +697,13 @@ impl FffServer {
 
     #[cfg(unix)]
     fn proxy_record_access(&self, path: &str) -> Option<Result<CallToolResult, ErrorData>> {
-        use fff_ipc::types::SearchRequest;
-
         let pool = self.pool.as_ref()?;
         let registry = self.registry.as_ref()?;
         // Longest-prefix routing: pick the root that owns this file path.
         let base_path = registry.root_for_path(std::path::Path::new(path));
-        let req = SearchRequest::RecordAccess {
-            path: path.to_owned(),
-        };
-        // Best-effort dispatch — record_access is fire-and-forget in the
-        // single-root path, so swallow errors here too.
-        let _ = pool.search_with_retry(&base_path, &req);
+        // Fire-and-forget: the engine sends no reply for RecordAccess, so we
+        // must not dispatch through the blocking request/response path.
+        pool.record_access(&base_path, path);
         Some(Ok(CallToolResult::success(vec![Content::text("ok")])))
     }
 

@@ -105,6 +105,27 @@ impl ConnectionPool {
         call_client(&second, req, base_path)
     }
 
+    /// Fire-and-forget dispatch for `RecordAccess`: obtain a client and write
+    /// the request without awaiting a reply (the engine sends none). A connect
+    /// failure is logged and dropped — frecency tracking is best-effort and must
+    /// never block the caller.
+    pub fn record_access(&self, base_path: &Path, path: &str) {
+        let cell = match self.get_or_connect(base_path) {
+            Ok(cell) => cell,
+            Err(e) => {
+                tracing::warn!(
+                    "pool: record_access connect failed for {}: {e}",
+                    base_path.display()
+                );
+                return;
+            }
+        };
+        match cell.lock() {
+            Ok(mut guard) => guard.record_access(path),
+            Err(e) => tracing::warn!("pool: record_access client mutex poisoned: {e}"),
+        }
+    }
+
     fn lookup(&self, key: &Path) -> Option<ClientCell> {
         let map = self.clients.lock().expect("pool mutex poisoned");
         map.get(key).cloned()
@@ -203,6 +224,20 @@ mod tests {
             "no such file".into()
         )));
         assert!(!is_connection_error(&SearchResponse::Ack));
+    }
+
+    #[test]
+    fn record_access_returns_without_reading_a_reply() {
+        let pool = ConnectionPool::new();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let canon = tmp.path().canonicalize().expect("canonicalize");
+        pool.insert(tmp.path(), stub_client(canon.clone()));
+
+        // Fire-and-forget: completes (does not block on a reply the engine
+        // never sends) even though the stub's peer socket is already closed.
+        pool.record_access(tmp.path(), "some/file.txt");
+
+        assert!(pool.lookup(&canon).is_some());
     }
 
     fn stub_client(base_path: PathBuf) -> EngineClient {
