@@ -280,6 +280,25 @@ impl MasterState {
     async fn assign_new_root(&self, base_path: &str) -> Option<u32> {
         let slug = base_path_slug(std::path::Path::new(base_path));
 
+        // Canonicalize once up front (I/O kept outside locks). Used for the
+        // containment check and stored as the RootEntry.base_path.
+        let canonical = std::fs::canonicalize(base_path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| base_path.to_string());
+
+        // Containment: if an already-registered root is an ancestor of this
+        // path, route to its worker instead of minting a new slug/index/
+        // frecency DB/watcher. Checked before ring assignment so a contained
+        // sub-path never triggers a worker spawn.
+        let contained = {
+            let routing = self.routing.lock().await;
+            routing.containing_root(std::path::Path::new(&canonical))
+        };
+        if let Some((idx, _slug)) = contained {
+            tracing::debug!("master: routing {base_path} to containing root on worker-{idx}");
+            return Some(idx);
+        }
+
         // Ring assignment is read-only and deterministic; compute outside any lock.
         // If the ring is empty (workers still starting), spawn one on demand so
         // Handshakes that arrive before n_min workers are ready still get served.
@@ -299,11 +318,6 @@ impl MasterState {
                 new_idx
             }
         };
-
-        // Canonicalize outside the routing lock to avoid I/O under lock.
-        let canonical = std::fs::canonicalize(base_path)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| base_path.to_string());
 
         // Single write-lock: re-check presence, push slug, compute scale-out trigger.
         let should_scale_out = {

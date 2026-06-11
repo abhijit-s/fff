@@ -99,6 +99,29 @@ impl RoutingTable {
         self.workers.len()
     }
 
+    /// Find the registered root whose `base_path` is the longest ancestor of
+    /// (or equal to) `canonical`, returning `(worker_index, slug)`. Comparison
+    /// is path-component-wise via `Path::starts_with`, so `/foo/bar` does not
+    /// match `/foo/barbaz`. Entries with an empty `base_path` (legacy-migrated)
+    /// are skipped. Used to route a sub-path to an already-registered
+    /// containing root instead of minting a duplicate index.
+    pub fn containing_root(&self, canonical: &Path) -> Option<(u32, String)> {
+        let mut best: Option<(u32, &RootEntry)> = None;
+        let mut best_len = 0usize;
+        for (&idx, entry) in &self.workers {
+            for root in &entry.roots {
+                if root.base_path.is_empty() {
+                    continue;
+                }
+                if canonical.starts_with(&root.base_path) && root.base_path.len() > best_len {
+                    best_len = root.base_path.len();
+                    best = Some((idx, root));
+                }
+            }
+        }
+        best.map(|(idx, root)| (idx, root.slug.clone()))
+    }
+
     /// Load from a JSON file. Returns `Ok(Default)` when the file is absent.
     pub fn load(path: &Path) -> io::Result<Self> {
         match fs::read_to_string(path) {
@@ -174,6 +197,65 @@ mod tests {
         assert_eq!(rt.entries_for_worker(0), 3);
         assert_eq!(rt.entries_for_worker(1), 0);
         assert_eq!(rt.entries_for_worker(99), 0);
+    }
+
+    fn entry_with_roots(index: u32, roots: &[(&str, &str)]) -> WorkerEntry {
+        let mut e = WorkerEntry::new(index, format!("worker-{index}.sock"), 1000 + index);
+        for (slug, base) in roots {
+            e.push_root((*slug).to_string(), (*base).to_string());
+        }
+        e
+    }
+
+    #[test]
+    fn containing_root_matches_ancestor() {
+        let mut rt = RoutingTable::default();
+        rt.workers
+            .insert(0, entry_with_roots(0, &[("parent", "/home/me/proj")]));
+
+        let hit = rt.containing_root(Path::new("/home/me/proj/src/lib"));
+        assert_eq!(hit, Some((0, "parent".to_string())));
+    }
+
+    #[test]
+    fn containing_root_matches_exact_path() {
+        let mut rt = RoutingTable::default();
+        rt.workers.insert(0, entry_with_roots(0, &[("p", "/a/b")]));
+        assert_eq!(rt.containing_root(Path::new("/a/b")), Some((0, "p".into())));
+    }
+
+    #[test]
+    fn containing_root_respects_component_boundary() {
+        let mut rt = RoutingTable::default();
+        rt.workers
+            .insert(0, entry_with_roots(0, &[("p", "/foo/bar")]));
+        // /foo/barbaz is NOT under /foo/bar.
+        assert_eq!(rt.containing_root(Path::new("/foo/barbaz")), None);
+    }
+
+    #[test]
+    fn containing_root_picks_longest_prefix() {
+        let mut rt = RoutingTable::default();
+        rt.workers.insert(
+            0,
+            entry_with_roots(0, &[("shallow", "/a"), ("deep", "/a/b/c")]),
+        );
+        let hit = rt.containing_root(Path::new("/a/b/c/d"));
+        assert_eq!(hit, Some((0, "deep".to_string())));
+    }
+
+    #[test]
+    fn containing_root_skips_empty_base_path() {
+        let mut rt = RoutingTable::default();
+        rt.workers.insert(0, entry_with_roots(0, &[("legacy", "")]));
+        assert_eq!(rt.containing_root(Path::new("/anything")), None);
+    }
+
+    #[test]
+    fn containing_root_none_when_unrelated() {
+        let mut rt = RoutingTable::default();
+        rt.workers.insert(0, entry_with_roots(0, &[("p", "/x/y")]));
+        assert_eq!(rt.containing_root(Path::new("/m/n")), None);
     }
 
     #[test]

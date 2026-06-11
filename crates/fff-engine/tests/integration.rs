@@ -665,6 +665,45 @@ fn u5_scale_out_fires_at_roots_per_worker_max() {
     sigterm_and_wait(&mut master, Duration::from_secs(5));
 }
 
+/// U5-3: A Handshake for a sub-path of an already-registered root routes to that
+/// root's worker WITHOUT minting a new slug (containment, U1).
+#[test]
+fn u5_containment_routes_subpath_to_parent_root() {
+    let env = TestEnv::new();
+    let mut master = env.spawn_master();
+    assert!(env.wait_master(SOCKET_TIMEOUT));
+    env.wait_for_workers(1, SOCKET_TIMEOUT);
+
+    // Real parent dir with a nested sub-directory so canonicalize succeeds.
+    let parent = env.dir.path().join("project");
+    let child = parent.join("src").join("deep");
+    std::fs::create_dir_all(&child).unwrap();
+
+    let parent_idx = match env.handshake(parent.to_str().unwrap()) {
+        MasterResponse::WorkerSocket { worker_index, .. } => worker_index,
+        other => panic!("expected WorkerSocket, got {other:?}"),
+    };
+    let child_idx = match env.handshake(child.to_str().unwrap()) {
+        MasterResponse::WorkerSocket { worker_index, .. } => worker_index,
+        other => panic!("expected WorkerSocket, got {other:?}"),
+    };
+
+    assert_eq!(
+        parent_idx, child_idx,
+        "sub-path Handshake should route to the containing root's worker"
+    );
+
+    // The sub-path must NOT have registered its own slug: exactly one root total.
+    let table = RoutingTable::load(&env.routing_json()).expect("parse routing.json");
+    let total_roots: usize = table.workers.values().map(|w| w.roots.len()).sum();
+    assert_eq!(
+        total_roots, 1,
+        "containment must not mint a second root for the sub-path"
+    );
+
+    sigterm_and_wait(&mut master, Duration::from_secs(5));
+}
+
 /// U5-3: After scale-out, existing routing entries are not remapped.
 /// The root assigned before scale-out must still map to the original worker.
 #[test]
