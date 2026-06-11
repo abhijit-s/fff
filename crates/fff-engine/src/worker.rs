@@ -13,7 +13,7 @@ use std::{
 
 #[cfg(unix)]
 use fff_ipc::{
-    base_path_slug, master_socket_path,
+    base_path_slug, master_lockfile_path, master_socket_path,
     types::{HealthResponse, MasterRequest, RootHealth, SearchRequest, SearchResponse},
     worker_lockfile_path, worker_socket_path, write_message_sync,
 };
@@ -22,7 +22,7 @@ use fff_ipc::{read_message, write_message};
 #[cfg(unix)]
 use parking_lot::{Mutex, RwLock};
 #[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 #[cfg(unix)]
@@ -281,6 +281,23 @@ fn read_picker_freshness(state: &EngineState) -> (Option<u64>, Option<u64>) {
     (Some(indexed), Some(dirty))
 }
 
+// Orphan self-heal cadence. GRACE must comfortably exceed a master restart so a
+// briefly-absent master (re-adopting via routing.json) does not trigger exit.
+// Both are overridable via env for tests (defaults used in production).
+#[cfg(unix)]
+const ORPHAN_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(unix)]
+const ORPHAN_GRACE: Duration = Duration::from_secs(60);
+
+#[cfg(unix)]
+fn env_duration_secs(key: &str) -> Option<Duration> {
+    std::env::var(key)
+        .ok()?
+        .parse()
+        .ok()
+        .map(Duration::from_secs)
+}
+
 /// Entry point for worker mode. Binds the worker socket and serves connections.
 #[cfg(unix)]
 pub async fn run(index: u32, config: FffConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -335,6 +352,40 @@ pub async fn run(index: u32, config: FffConfig) -> Result<(), Box<dyn std::error
     };
     tokio::pin!(shutdown);
 
+    // Self-heal against orphaning. The master reaps workers via SIGTERM only on
+    // its own graceful shutdown; a SIGKILL/crash/OOM (or a test dropping it)
+    // leaves us running with no one to stop us. Watch the master lockfile and,
+    // once the watch is armed and the master has been gone for ORPHAN_GRACE,
+    // exit. Arming requires either having seen a live master (the normal case)
+    // or being reparented to PID 1 (our master died before we first observed
+    // it). A restarted master rewrites the lockfile (and re-adopts us via
+    // routing.json) well within the grace window, so normal restarts don't trip
+    // this, and a standalone/test worker with a living non-master parent and no
+    // master lockfile never arms.
+    let orphan_check = env_duration_secs("FFF_ORPHAN_CHECK_SECS").unwrap_or(ORPHAN_CHECK_INTERVAL);
+    let orphan_grace = env_duration_secs("FFF_ORPHAN_GRACE_SECS").unwrap_or(ORPHAN_GRACE);
+    let orphan_watch = async move {
+        let master_lock = master_lockfile_path();
+        let mut seen_master = false;
+        let mut dead_since: Option<Instant> = None;
+        loop {
+            tokio::time::sleep(orphan_check).await;
+            if fff_ipc::lockfile::is_stale(&master_lock) {
+                let orphaned = unsafe { libc::getppid() } == 1;
+                if seen_master || orphaned {
+                    let since = *dead_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= orphan_grace {
+                        return;
+                    }
+                }
+            } else {
+                seen_master = true;
+                dead_since = None;
+            }
+        }
+    };
+    tokio::pin!(orphan_watch);
+
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -347,6 +398,12 @@ pub async fn run(index: u32, config: FffConfig) -> Result<(), Box<dyn std::error
                 }
             }
             _ = &mut shutdown => break,
+            _ = &mut orphan_watch => {
+                tracing::warn!(
+                    "worker-{index}: no live master for {orphan_grace:?}; exiting to avoid orphaning"
+                );
+                break;
+            }
         }
     }
 

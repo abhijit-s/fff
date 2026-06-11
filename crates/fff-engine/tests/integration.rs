@@ -8,7 +8,9 @@
 //! - U6: Worker crash detection and respawn, startup dead-vs-live PID recovery
 
 use std::{
+    cell::RefCell,
     os::unix::net::UnixStream,
+    os::unix::process::CommandExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
     thread::sleep,
@@ -32,12 +34,18 @@ const POLL_MS: Duration = Duration::from_millis(50);
 
 struct TestEnv {
     dir: TempDir,
+    /// PIDs of every process spawned via this env, killed on Drop so a
+    /// panicking test can't leak an orphaned master/worker.
+    spawned: RefCell<Vec<u32>>,
 }
 
 impl TestEnv {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let env = Self { dir };
+        let env = Self {
+            dir,
+            spawned: RefCell::new(Vec::new()),
+        };
 
         // Write a config file picked up by all spawned processes via XDG_CONFIG_HOME.
         let cfg_dir = env.config_dir().join("fff");
@@ -93,7 +101,10 @@ impl TestEnv {
     }
 
     fn spawn_master(&self) -> Child {
-        Command::new(ENGINE_BIN)
+        // process_group(0): make the master its own group leader so Drop can
+        // kill the whole group — the master's on-demand worker children inherit
+        // its group and would otherwise orphan when the master is killed.
+        let child = Command::new(ENGINE_BIN)
             .arg("--master")
             .env("XDG_CACHE_HOME", self.cache_dir())
             .env("XDG_RUNTIME_DIR", self.runtime_dir())
@@ -101,12 +112,15 @@ impl TestEnv {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .process_group(0)
             .spawn()
-            .expect("spawn master")
+            .expect("spawn master");
+        self.spawned.borrow_mut().push(child.id());
+        child
     }
 
     fn spawn_worker(&self, idx: u32) -> Child {
-        Command::new(ENGINE_BIN)
+        let child = Command::new(ENGINE_BIN)
             .args(["--worker-index", &idx.to_string()])
             .env("XDG_CACHE_HOME", self.cache_dir())
             .env("XDG_RUNTIME_DIR", self.runtime_dir())
@@ -114,8 +128,31 @@ impl TestEnv {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .process_group(0)
             .spawn()
-            .expect("spawn worker")
+            .expect("spawn worker");
+        self.spawned.borrow_mut().push(child.id());
+        child
+    }
+
+    /// Spawn a master with a shortened orphan self-heal window so a test can
+    /// observe a worker self-exit in seconds instead of the production minute.
+    fn spawn_master_with_orphan_timing(&self, grace_secs: u64, check_secs: u64) -> Child {
+        let child = Command::new(ENGINE_BIN)
+            .arg("--master")
+            .env("XDG_CACHE_HOME", self.cache_dir())
+            .env("XDG_RUNTIME_DIR", self.runtime_dir())
+            .env("XDG_CONFIG_HOME", self.config_dir())
+            .env("FFF_ORPHAN_GRACE_SECS", grace_secs.to_string())
+            .env("FFF_ORPHAN_CHECK_SECS", check_secs.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn master");
+        self.spawned.borrow_mut().push(child.id());
+        child
     }
 
     fn wait_master(&self, timeout: Duration) -> bool {
@@ -226,8 +263,16 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        // Best-effort: clean up any leftover processes in case a test panics
-        // without explicit teardown. The TempDir drop will remove the files.
+        // SIGKILL the process GROUP of everything we spawned (negative PID).
+        // Each was spawned as a group leader, so this also reaps the master's
+        // on-demand worker children — which Rust's Child::drop never kills and
+        // which outlive a killed master. Already-dead groups are a harmless
+        // no-op.
+        for &pid in self.spawned.borrow().iter() {
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
     }
 }
 
@@ -1041,4 +1086,32 @@ fn health_reports_indexed_files_after_connect() {
     );
 
     sigterm_and_wait(&mut master, Duration::from_secs(5));
+}
+
+/// Orphan self-heal: a worker that has seen a live master must self-exit when
+/// the master dies WITHOUT SIGTERMing it (SIGKILL/crash). Also proves the
+/// worker resolves the same master lockfile path the master writes — a wrong
+/// path would either never fire or kill live workers.
+#[test]
+fn worker_self_exits_when_master_dies_without_sigterm() {
+    let env = TestEnv::new();
+    // Short window: detect staleness every 1s, exit after 2s orphaned.
+    let mut master = env.spawn_master_with_orphan_timing(2, 1);
+    assert!(env.wait_master(SOCKET_TIMEOUT), "master socket up");
+    assert!(
+        env.wait_worker(0, SOCKET_TIMEOUT),
+        "n_min worker-0 socket up"
+    );
+
+    // Hard-kill the master — skips the graceful SIGTERM-to-workers path, so
+    // nothing tells worker-0 to stop. Its lockfile-watch must catch this.
+    unsafe {
+        libc::kill(master.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = master.wait();
+
+    assert!(
+        env.wait_socket_gone(&env.worker_socket(0), Duration::from_secs(10)),
+        "orphaned worker-0 must self-exit after losing its master"
+    );
 }
