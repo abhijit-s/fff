@@ -4,7 +4,7 @@ use fff_ipc::config::FffConfig;
 use std::{
     collections::HashMap,
     fs::OpenOptions,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -34,6 +34,9 @@ use crate::state::{EffectiveArgs, EngineState};
 #[cfg(unix)]
 struct RootEntry {
     state: Arc<EngineState>,
+    // Canonicalized base_path, precomputed once so ancestor matching in
+    // get_or_init stays I/O-free under the read lock.
+    canonical_base: PathBuf,
     // Milliseconds since Unix epoch; updated atomically on every access.
     // Allows fast-path reads to hold roots.read() instead of roots.write().
     last_access_ms: AtomicU64,
@@ -71,13 +74,15 @@ impl WorkerState {
         let max_roots = self.config.worker.roots_per_worker_max as usize;
         let now = now_ms();
 
-        // Fast path: slug loaded — update last_access atomically (read lock only).
-        {
-            let map = self.roots.read();
-            if let Some(entry) = map.get(&slug) {
-                entry.last_access_ms.store(now, Ordering::Relaxed);
-                return Ok(Arc::clone(&entry.state));
-            }
+        // Canonicalize once (I/O kept outside the lock) for ancestor matching.
+        let canonical_req = std::fs::canonicalize(&base_path).unwrap_or_else(|_| base_path.clone());
+
+        // Fast path: exact slug, or an already-loaded ancestor root (containment).
+        // The master routes a sub-path Handshake to the containing root's worker;
+        // here we bind the Connect to that root's EngineState instead of minting
+        // a duplicate index for the sub-path.
+        if let Some(state) = self.resolve_loaded(&slug, &canonical_req, now) {
+            return Ok(state);
         }
 
         // Slow path: gate serialises concurrent inits for the same slug.
@@ -92,12 +97,8 @@ impl WorkerState {
         let _gate_guard = gate.lock().await;
 
         // Double-check after acquiring gate.
-        {
-            let map = self.roots.read();
-            if let Some(entry) = map.get(&slug) {
-                entry.last_access_ms.store(now, Ordering::Relaxed);
-                return Ok(Arc::clone(&entry.state));
-            }
+        if let Some(state) = self.resolve_loaded(&slug, &canonical_req, now) {
+            return Ok(state);
         }
 
         if self.roots.read().len() >= max_roots {
@@ -119,16 +120,48 @@ impl WorkerState {
         .map_err(|e| format!("spawn_blocking join error: {e}"))??;
 
         let new_state = Arc::new(new_state);
+        let canonical_base = std::fs::canonicalize(&new_state.base_path)
+            .unwrap_or_else(|_| new_state.base_path.clone());
         self.roots.write().insert(
             slug,
             RootEntry {
                 state: Arc::clone(&new_state),
+                canonical_base,
                 last_access_ms: AtomicU64::new(now_ms()),
                 loaded_at: Instant::now(),
             },
         );
 
         Ok(new_state)
+    }
+
+    // Resolve a request to an already-loaded root: exact slug first, then the
+    // longest-prefix ancestor (containment). Updates last_access on a hit.
+    // Held entirely under one read lock — no I/O (canonical paths precomputed).
+    fn resolve_loaded(
+        &self,
+        slug: &str,
+        canonical_req: &Path,
+        now: u64,
+    ) -> Option<Arc<EngineState>> {
+        let map = self.roots.read();
+        if let Some(entry) = map.get(slug) {
+            entry.last_access_ms.store(now, Ordering::Relaxed);
+            return Some(Arc::clone(&entry.state));
+        }
+        let mut best: Option<&RootEntry> = None;
+        let mut best_len = 0usize;
+        for entry in map.values() {
+            let len = entry.canonical_base.as_os_str().len();
+            if canonical_req.starts_with(&entry.canonical_base) && len > best_len {
+                best_len = len;
+                best = Some(entry);
+            }
+        }
+        best.map(|entry| {
+            entry.last_access_ms.store(now, Ordering::Relaxed);
+            Arc::clone(&entry.state)
+        })
     }
 
     // Snapshot freshness signals for every loaded root.

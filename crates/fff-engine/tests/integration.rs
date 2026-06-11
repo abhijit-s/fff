@@ -347,6 +347,39 @@ fn u3_second_connect_same_base_path_gets_ack() {
     sigterm_and_wait(&mut worker, Duration::from_secs(5));
 }
 
+/// U2: A worker Connect for a sub-path of an already-loaded root binds to that
+/// root's EngineState — the worker does not mint a second root (containment).
+#[test]
+fn u3_subpath_connect_binds_to_ancestor_root() {
+    let env = TestEnv::new();
+    let mut worker = env.spawn_worker(0);
+    assert!(env.wait_worker(0, SOCKET_TIMEOUT));
+
+    let parent = env.dir.path().join("project");
+    let child = parent.join("src").join("deep");
+    std::fs::create_dir_all(&child).unwrap();
+
+    // Connect parent (inits the root), then a sub-path (must bind to parent).
+    let _s1 = env.worker_connect(&env.worker_socket(0), parent.to_str().unwrap());
+    let _s2 = env.worker_connect(&env.worker_socket(0), child.to_str().unwrap());
+
+    // Worker health reports exactly one loaded root.
+    let mut stream = UnixStream::connect(env.worker_socket(0)).expect("connect for health");
+    write_message_sync(&mut stream, &SearchRequest::Health).expect("write Health");
+    let resp: SearchResponse = read_message_sync(&mut stream).expect("read Health");
+    let roots = match resp {
+        SearchResponse::Health(h) => h.roots,
+        other => panic!("expected Health response, got {other:?}"),
+    };
+    assert_eq!(
+        roots.len(),
+        1,
+        "sub-path Connect must bind to the ancestor root, not mint a new one"
+    );
+
+    sigterm_and_wait(&mut worker, Duration::from_secs(5));
+}
+
 /// U3-5: Worker cleans up socket and lockfile on SIGTERM.
 #[test]
 fn u3_worker_cleans_up_on_sigterm() {
