@@ -143,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .or_else(|| cfg.frecency.db.as_deref().map(PathBuf::from)),
         no_watch: eff_no_watch,
         no_warmup: eff_no_warmup,
+        ignore: cfg.mcp.ignore_for(&base_path),
     };
 
     let socket_path = fff_ipc::socket_path(&base_path);

@@ -35,6 +35,7 @@ const MAX_MACOS_NONRECURSIVE_WATCHES: usize = 4096;
 const AI_MODE_COOLDOWN_SECS: u64 = 5 * 60;
 
 impl BackgroundWatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_path: PathBuf,
         git_workdir: Option<PathBuf>,
@@ -43,6 +44,7 @@ impl BackgroundWatcher {
         mode: FFFMode,
         enable_fs_root_scanning: bool,
         enable_home_dir_scanning: bool,
+        ignore_globs: Vec<String>,
     ) -> Result<Self, Error> {
         info!(
             "Initializing background watcher for path: {}, mode: {:?}",
@@ -83,6 +85,7 @@ impl BackgroundWatcher {
         let owner_weak_picker = shared_picker.weaken();
         let owner_frecency = shared_frecency.clone();
         let owner_git_workdir = git_workdir.clone();
+        let owner_user_gi = crate::ignore::user_ignore_matcher(&base_path, &ignore_globs);
 
         let debouncer = Self::create_debouncer(
             base_path,
@@ -92,6 +95,7 @@ impl BackgroundWatcher {
             mode,
             use_recursive,
             watch_tx_for_debouncer,
+            ignore_globs,
         )?;
 
         info!("Background file watcher initialized successfully");
@@ -162,6 +166,7 @@ impl BackgroundWatcher {
                         &strong_picker,
                         &owner_frecency,
                         &owner_git_workdir,
+                        &owner_user_gi,
                     );
 
                     // Transient strong ref drops here, back
@@ -179,6 +184,7 @@ impl BackgroundWatcher {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_debouncer(
         base_path: PathBuf,
         git_workdir: Option<PathBuf>,
@@ -187,7 +193,10 @@ impl BackgroundWatcher {
         mode: FFFMode,
         use_recursive: bool,
         watch_tx: mpsc::Sender<PathBuf>,
+        ignore_globs: Vec<String>,
     ) -> Result<Debouncer, Error> {
+        let user_gi = crate::ignore::user_ignore_matcher(&base_path, &ignore_globs);
+
         let config = Config::default()
             // do not follow symlinks as then notifiers spawns a bunch of events for symlinked
             // files that could be git ignored, we have to property differentiate those and if
@@ -209,6 +218,7 @@ impl BackgroundWatcher {
         let git_workdir_for_handler = git_workdir.clone();
         let shared_picker_for_watching = shared_picker.clone();
         let event_picker = shared_picker.weaken();
+        let user_gi_for_handler = user_gi.clone();
         let mut debouncer = new_debouncer_opt(
             DEBOUNCE_TIMEOUT,
             Some(DEBOUNCE_TIMEOUT / 2), // tick rate for the event span
@@ -229,6 +239,7 @@ impl BackgroundWatcher {
                             &strong_picker,
                             &shared_frecency,
                             mode,
+                            &user_gi_for_handler,
                         );
 
                         // every new directory creates had to be reflected in the picker state
@@ -429,13 +440,14 @@ fn watch_all_dirs(
     aborted_early
 }
 
-#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency), level = Level::DEBUG)]
+#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency, user_gi), level = Level::DEBUG)]
 fn handle_debounced_events(
     events: Vec<DebouncedEvent>,
     git_workdir: &Option<PathBuf>,
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
     mode: FFFMode,
+    user_gi: &Option<ignore::gitignore::Gitignore>,
 ) -> Vec<PathBuf> {
     // this will be called very often, we have to minimiy the lock time for file picker
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
@@ -522,12 +534,12 @@ fn handle_debounced_events(
                 // New directory — collect it so the caller can register a
                 // watcher. No filesystem scanning: files that arrive later
                 // will be handled by the newly registered watch.
-                if !is_path_ignored(path, &repo) {
+                if !is_path_ignored(path, &repo, user_gi) {
                     new_dirs_to_watch.push(path.to_path_buf());
                 }
             } else {
                 // For additions/modifications, still filter gitignored files.
-                if should_include_file(path, &repo) {
+                if should_include_file(path, &repo, user_gi) {
                     paths_to_add_or_modify.push(path.as_path());
                 }
             }
@@ -742,6 +754,7 @@ fn track_files_from_new_directories(
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
     git_workdir: &Option<PathBuf>,
+    user_gi: &Option<ignore::gitignore::Gitignore>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -753,7 +766,7 @@ fn track_files_from_new_directories(
     for entry in entries.flatten() {
         if entry.file_type().is_ok_and(|ft| ft.is_file()) {
             let path = entry.path();
-            if should_include_file(&path, &repo) {
+            if should_include_file(&path, &repo, user_gi) {
                 files_to_add.push(path);
             }
         }
@@ -801,9 +814,17 @@ fn track_files_from_new_directories(
     );
 }
 
-fn should_include_file(path: &Path, repo: &Option<Repository>) -> bool {
+fn should_include_file(
+    path: &Path,
+    repo: &Option<Repository>,
+    user_gi: &Option<ignore::gitignore::Gitignore>,
+) -> bool {
     // Directories are not indexed — only regular files (and symlinks to files).
     if path.is_dir() {
+        return false;
+    }
+
+    if user_matches_ignore(path, false, user_gi) {
         return false;
     }
 
@@ -823,11 +844,29 @@ fn is_non_code_directory(path: &Path) -> bool {
 }
 
 #[inline]
-fn is_path_ignored(path: &Path, repo: &Option<Repository>) -> bool {
+fn is_path_ignored(
+    path: &Path,
+    repo: &Option<Repository>,
+    user_gi: &Option<ignore::gitignore::Gitignore>,
+) -> bool {
+    if user_matches_ignore(path, true, user_gi) {
+        return true;
+    }
     match repo.as_ref() {
         Some(repo) => repo.is_path_ignored(path) == Ok(true),
         None => is_non_code_directory(path),
     }
+}
+
+#[inline]
+fn user_matches_ignore(
+    path: &Path,
+    is_dir: bool,
+    user_gi: &Option<ignore::gitignore::Gitignore>,
+) -> bool {
+    user_gi
+        .as_ref()
+        .is_some_and(|gi| gi.matched(path, is_dir).is_ignore())
 }
 
 #[inline]

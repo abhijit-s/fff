@@ -88,7 +88,18 @@ path = "/Users/you/work/lib"
 
 [[mcp.roots]]            # name is optional
 path = "/Users/you/scratch"
+
+[[mcp.roots]]
+name = "app-scoped"
+path = "/Users/you/work/big-app"
+# ignore: gitignore-style globs excluded from this root's index and watcher.
+# Standard gitignore syntax — bare globs exclude, leading `!` re-includes.
+ignore = ["target/", "**/*.log", "vendor/", "!vendor/keepme/"]
 ```
+
+Per-root `ignore` patterns apply on top of `.gitignore` and fff's built-in
+excludes, inside git repos and plain directories alike. Use them to keep large
+build, vendor, or log directories out of the index and watcher.
 
 The config auto-loads — the registration needs no extra flags:
 

@@ -413,6 +413,9 @@ pub struct FilePickerOptions {
     /// Allow indexing the user's home directory. Off by default for the same
     /// reason as `enable_fs_root_scanning`.
     pub enable_home_dir_scanning: bool,
+    /// Per-picker gitignore-style patterns excluded from the walk and watcher.
+    /// Bare globs exclude, leading `!` re-includes (true gitignore semantics).
+    pub ignore_globs: Vec<String>,
 }
 
 impl Default for FilePickerOptions {
@@ -427,6 +430,7 @@ impl Default for FilePickerOptions {
             follow_symlinks: false,
             enable_fs_root_scanning: false,
             enable_home_dir_scanning: false,
+            ignore_globs: Vec::new(),
         }
     }
 }
@@ -453,6 +457,7 @@ pub struct FilePicker {
     follow_symlinks: bool,
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
+    ignore_globs: Vec<String>,
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -508,6 +513,10 @@ impl FilePicker {
 
     pub fn follows_symlinks(&self) -> bool {
         self.follow_symlinks
+    }
+
+    pub(crate) fn ignore_globs(&self) -> &[String] {
+        &self.ignore_globs
     }
 
     pub fn fs_root_scanning_enabled(&self) -> bool {
@@ -735,6 +744,7 @@ impl FilePicker {
             follow_symlinks: options.follow_symlinks,
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
+            ignore_globs: options.ignore_globs,
         })
     }
 
@@ -762,6 +772,7 @@ impl FilePicker {
         let follow_symlinks = picker.follow_symlinks;
         let enable_fs_root_scanning = picker.enable_fs_root_scanning;
         let enable_home_dir_scanning = picker.enable_home_dir_scanning;
+        let ignore_globs = picker.ignore_globs().to_vec();
 
         let signals = picker.scan_signals();
         let scanned_files_counter = picker.scanned_files_counter();
@@ -791,6 +802,7 @@ impl FilePicker {
                 follow_symlinks,
                 enable_fs_root_scanning,
                 enable_home_dir_scanning,
+                ignore_globs,
             },
         )
         .spawn();
@@ -821,6 +833,7 @@ impl FilePicker {
             &empty_frecency,
             self.mode,
             self.follow_symlinks,
+            &self.ignore_globs,
         )?;
 
         self.sync_data = sync;
@@ -870,6 +883,7 @@ impl FilePicker {
             self.mode,
             self.enable_fs_root_scanning,
             self.enable_home_dir_scanning,
+            self.ignore_globs.clone(),
         )?;
         self.background_watcher = Some(watcher);
         self.signals.watcher_ready.store(true, Ordering::Release);
@@ -1795,6 +1809,7 @@ impl FileSync {
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
         follow_symlinks: bool,
+        ignore_globs: &[String],
     ) -> Result<FileSync, Error> {
         use ignore::WalkBuilder;
 
@@ -1818,6 +1833,13 @@ impl FileSync {
 
         if !is_git_repo && let Some(overrides) = non_git_repo_overrides(base_path) {
             walk_builder.overrides(overrides);
+        }
+
+        if let Some(user_gi) = crate::ignore::user_ignore_matcher(base_path, ignore_globs) {
+            walk_builder.filter_entry(move |entry| {
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                !user_gi.matched(entry.path(), is_dir).is_ignore()
+            });
         }
 
         let walker = walk_builder.build_parallel();
@@ -2159,6 +2181,78 @@ pub(crate) fn hint_allocator_collect() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Build a picker over `base` with the given ignore globs, scan, return
+    // the indexed file count.
+    fn indexed_count(base: &Path, ignore_globs: Vec<String>) -> usize {
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ignore_globs,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        picker.get_files().len()
+    }
+
+    #[test]
+    fn ignore_globs_exclude_files_from_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+        for rel in ["keep.rs", "logs/app.txt", "notes.log"] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+
+        // Control: without ignore globs, all three files are indexed.
+        assert_eq!(indexed_count(&base, Vec::new()), 3);
+
+        // With ignore globs, the logs/ dir and the *.log file are excluded.
+        assert_eq!(
+            indexed_count(&base, vec!["logs/".into(), "*.log".into()]),
+            1,
+            "only keep.rs should remain"
+        );
+    }
+
+    #[test]
+    fn ignore_globs_apply_inside_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+        git2::Repository::init(&base).unwrap();
+        for rel in ["keep.rs", "logs/app.txt", "notes.log"] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+
+        // The new filter_entry runs in the git branch too (previously overrides
+        // applied only to non-git roots).
+        assert_eq!(
+            indexed_count(&base, vec!["logs/".into(), "*.log".into()]),
+            1,
+            "ignore globs must apply inside a git repo"
+        );
+    }
+
+    #[test]
+    fn ignore_globs_honor_gitignore_negation() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+        for rel in ["keep.rs", "a.tmp", "important.tmp"] {
+            std::fs::write(base.join(rel), b"x").unwrap();
+        }
+
+        // True gitignore semantics: *.tmp excludes, !important.tmp re-includes.
+        // keep.rs + important.tmp survive; a.tmp is excluded.
+        assert_eq!(
+            indexed_count(&base, vec!["*.tmp".into(), "!important.tmp".into()]),
+            2,
+            "negation must re-include important.tmp"
+        );
+    }
 
     /// The watcher must watch every ancestor directory up to `base_path`,
     /// not just the immediate parents of indexed files. Intermediate dirs
