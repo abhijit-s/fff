@@ -16,6 +16,14 @@ use fff_ipc::{IpcError, lockfile, master_lockfile_path, master_socket_path};
 use fff_ipc::{read_message_sync, write_message_sync};
 
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Read timeout for the Connect→Ack handshake — short so a dead worker is
+/// detected fast.
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Read timeout for ongoing queries once connected. Must exceed the engine's
+/// cold-start query-readiness wait (`GREP_READINESS_TIMEOUT` = 30s in
+/// fff-engine) so a slow initial scan does not make the client preempt a
+/// response the engine is deliberately holding while the index warms up.
+const QUERY_READ_TIMEOUT: Duration = Duration::from_secs(35);
 
 pub struct EngineClient {
     reader: BufReader<UnixStream>,
@@ -38,10 +46,10 @@ impl EngineClient {
 
         // Phase 2: connect to the worker and send Connect{base_path}.
         let stream = wait_and_connect(&worker_socket, SPAWN_TIMEOUT)?;
-        // Bound reads so a missing or slow worker reply degrades to an error
-        // instead of hanging the client (mirrors connect_legacy/check_health).
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        // Short timeout for the Connect→Ack handshake so a dead worker is
+        // detected fast; raised to QUERY_READ_TIMEOUT once connected.
+        stream.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT))?;
+        stream.set_write_timeout(Some(HANDSHAKE_READ_TIMEOUT))?;
         let base_path_str = base_path.to_string_lossy().into_owned();
 
         let mut writer = BufWriter::new(stream.try_clone()?);
@@ -62,6 +70,14 @@ impl EngineClient {
             SearchResponse::Error(e) => return Err(format!("worker Connect rejected: {e}").into()),
             other => return Err(format!("unexpected worker response: {other:?}").into()),
         }
+
+        // Handshake done — raise the read timeout for ongoing queries. The
+        // engine may hold a response for up to its cold-start readiness wait
+        // (30s) while a fresh index finishes scanning; the short handshake
+        // timeout would otherwise preempt a legitimately slow first query.
+        reader
+            .get_ref()
+            .set_read_timeout(Some(QUERY_READ_TIMEOUT))?;
 
         Ok(Self {
             reader,
@@ -388,4 +404,73 @@ fn find_engine_bin() -> PathBuf {
         }
     }
     PathBuf::from("fff-engine")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fff_ipc::types::FindOptions;
+
+    fn find_req() -> SearchRequest {
+        SearchRequest::FindFiles {
+            query: "q".into(),
+            options: FindOptions::default(),
+        }
+    }
+
+    // A response that arrives within the read timeout is received — the property
+    // QUERY_READ_TIMEOUT relies on so a slow cold-start query (engine holds the
+    // reply up to ~30s while the index warms) is not preempted by the client.
+    #[test]
+    fn search_receives_response_delayed_under_read_timeout() {
+        let (client_sock, mut server_sock) = UnixStream::pair().unwrap();
+        client_sock
+            .set_read_timeout(Some(Duration::from_millis(800)))
+            .unwrap();
+
+        let server = std::thread::spawn(move || {
+            let _req: SearchRequest = read_message_sync(&mut server_sock).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            write_message_sync(&mut server_sock, &SearchResponse::SearchResults(vec![])).unwrap();
+        });
+
+        let mut client = EngineClient::from_stream(client_sock, PathBuf::from("/x"));
+        let resp = client.search(&find_req());
+        server.join().unwrap();
+        assert!(
+            matches!(resp, Ok(SearchResponse::SearchResults(_))),
+            "delayed-but-in-window response must arrive, got {resp:?}"
+        );
+    }
+
+    // A response slower than the read timeout errors (the old no-timeout path
+    // hung here forever; a bounded timeout lets search_with_recovery react).
+    #[test]
+    fn search_errors_when_response_exceeds_read_timeout() {
+        let (client_sock, mut server_sock) = UnixStream::pair().unwrap();
+        client_sock
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        let server = std::thread::spawn(move || {
+            let _req: SearchRequest = read_message_sync(&mut server_sock).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = write_message_sync(&mut server_sock, &SearchResponse::SearchResults(vec![]));
+        });
+
+        let mut client = EngineClient::from_stream(client_sock, PathBuf::from("/x"));
+        let resp = client.search(&find_req());
+        let _ = server.join();
+        assert!(
+            resp.is_err(),
+            "response slower than the read timeout must error"
+        );
+    }
+
+    #[test]
+    fn query_read_timeout_exceeds_engine_cold_start_wait() {
+        // fff-engine gates queries on GREP_READINESS_TIMEOUT (30s). The client
+        // query read timeout must exceed it or slow cold-start queries fail.
+        assert!(QUERY_READ_TIMEOUT >= Duration::from_secs(30));
+    }
 }
