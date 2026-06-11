@@ -20,35 +20,37 @@ jobs:
     strategy:
       matrix:
         include:
+          # Non-macOS targets are disabled for now to keep CI lean (releases
+          # are Homebrew-only). Uncomment a block to re-enable that platform.
           ## Linux builds (using cargo-zigbuild)
           # Glibc 2.31 (Ubuntu 20.04, Debian 11, RHEL 9).
           # Rust 1.91+ requires glibc >= 2.31 for std::sys::random::getrandom,
           # copy_file_range, and statx; earlier targets (2.17) no longer link.
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            zigbuild_target: x86_64-unknown-linux-gnu.2.31
-            artifact_name: target/x86_64-unknown-linux-gnu/ci/libfff_nvim.so
-            ext: so
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            zigbuild_target: aarch64-unknown-linux-gnu.2.31
-            artifact_name: target/aarch64-unknown-linux-gnu/ci/libfff_nvim.so
-            ext: so
-          # Musl (statically linked)
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            artifact_name: target/x86_64-unknown-linux-musl/ci/libfff_nvim.so
-            ext: so
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            artifact_name: target/aarch64-unknown-linux-musl/ci/libfff_nvim.so
-            ext: so
+          # - os: ubuntu-latest
+          #   target: x86_64-unknown-linux-gnu
+          #   zigbuild_target: x86_64-unknown-linux-gnu.2.31
+          #   artifact_name: target/x86_64-unknown-linux-gnu/ci/libfff_nvim.so
+          #   ext: so
+          # - os: ubuntu-latest
+          #   target: aarch64-unknown-linux-gnu
+          #   zigbuild_target: aarch64-unknown-linux-gnu.2.31
+          #   artifact_name: target/aarch64-unknown-linux-gnu/ci/libfff_nvim.so
+          #   ext: so
+          # # Musl (statically linked)
+          # - os: ubuntu-latest
+          #   target: x86_64-unknown-linux-musl
+          #   artifact_name: target/x86_64-unknown-linux-musl/ci/libfff_nvim.so
+          #   ext: so
+          # - os: ubuntu-latest
+          #   target: aarch64-unknown-linux-musl
+          #   artifact_name: target/aarch64-unknown-linux-musl/ci/libfff_nvim.so
+          #   ext: so
 
           ## Android (Termux)
-          - os: ubuntu-latest
-            target: aarch64-linux-android
-            artifact_name: target/aarch64-linux-android/ci/libfff_nvim.so
-            ext: so
+          # - os: ubuntu-latest
+          #   target: aarch64-linux-android
+          #   artifact_name: target/aarch64-linux-android/ci/libfff_nvim.so
+          #   ext: so
 
           ## macOS builds
           - os: macos-latest
@@ -60,14 +62,15 @@ jobs:
             artifact_name: target/aarch64-apple-darwin/ci/libfff_nvim.dylib
             ext: dylib
 
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: target/x86_64-pc-windows-msvc/ci/fff_nvim.dll
-            ext: dll
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            artifact_name: target/aarch64-pc-windows-msvc/ci/fff_nvim.dll
-            ext: dll
+          ## Windows builds
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   artifact_name: target/x86_64-pc-windows-msvc/ci/fff_nvim.dll
+          #   ext: dll
+          # - os: windows-latest
+          #   target: aarch64-pc-windows-msvc
+          #   artifact_name: target/aarch64-pc-windows-msvc/ci/fff_nvim.dll
+          #   ext: dll
 
     steps:
       - uses: actions/checkout@v5
@@ -137,40 +140,42 @@ jobs:
     strategy:
       matrix:
         include:
+          # Non-macOS targets are disabled for now to keep CI lean (releases
+          # are Homebrew-only). Uncomment a block to re-enable that platform.
           ## Linux builds
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            zigbuild_target: x86_64-unknown-linux-gnu.2.31
-            artifact_name: target/x86_64-unknown-linux-gnu/ci/libfff_c.so
-            npm_package: fff-bin-linux-x64-gnu
-            lib_filename: libfff_c.so
-            ext: so
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            zigbuild_target: aarch64-unknown-linux-gnu.2.31
-            artifact_name: target/aarch64-unknown-linux-gnu/ci/libfff_c.so
-            npm_package: fff-bin-linux-arm64-gnu
-            lib_filename: libfff_c.so
-            ext: so
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            artifact_name: target/x86_64-unknown-linux-musl/ci/libfff_c.so
-            npm_package: fff-bin-linux-x64-musl
-            lib_filename: libfff_c.so
-            ext: so
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            artifact_name: target/aarch64-unknown-linux-musl/ci/libfff_c.so
-            npm_package: fff-bin-linux-arm64-musl
-            lib_filename: libfff_c.so
-            ext: so
+          # - os: ubuntu-latest
+          #   target: x86_64-unknown-linux-gnu
+          #   zigbuild_target: x86_64-unknown-linux-gnu.2.31
+          #   artifact_name: target/x86_64-unknown-linux-gnu/ci/libfff_c.so
+          #   npm_package: fff-bin-linux-x64-gnu
+          #   lib_filename: libfff_c.so
+          #   ext: so
+          # - os: ubuntu-latest
+          #   target: aarch64-unknown-linux-gnu
+          #   zigbuild_target: aarch64-unknown-linux-gnu.2.31
+          #   artifact_name: target/aarch64-unknown-linux-gnu/ci/libfff_c.so
+          #   npm_package: fff-bin-linux-arm64-gnu
+          #   lib_filename: libfff_c.so
+          #   ext: so
+          # - os: ubuntu-latest
+          #   target: x86_64-unknown-linux-musl
+          #   artifact_name: target/x86_64-unknown-linux-musl/ci/libfff_c.so
+          #   npm_package: fff-bin-linux-x64-musl
+          #   lib_filename: libfff_c.so
+          #   ext: so
+          # - os: ubuntu-latest
+          #   target: aarch64-unknown-linux-musl
+          #   artifact_name: target/aarch64-unknown-linux-musl/ci/libfff_c.so
+          #   npm_package: fff-bin-linux-arm64-musl
+          #   lib_filename: libfff_c.so
+          #   ext: so
 
           ## Android (Termux)
-          - os: ubuntu-latest
-            target: aarch64-linux-android
-            artifact_name: target/aarch64-linux-android/ci/libfff_c.so
-            lib_filename: libfff_c.so
-            ext: so
+          # - os: ubuntu-latest
+          #   target: aarch64-linux-android
+          #   artifact_name: target/aarch64-linux-android/ci/libfff_c.so
+          #   lib_filename: libfff_c.so
+          #   ext: so
 
           ## macOS builds
           - os: macos-latest
@@ -187,18 +192,18 @@ jobs:
             ext: dylib
 
           ## Windows builds
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: target/x86_64-pc-windows-msvc/ci/fff_c.dll
-            npm_package: fff-bin-win32-x64
-            lib_filename: fff_c.dll
-            ext: dll
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            artifact_name: target/aarch64-pc-windows-msvc/ci/fff_c.dll
-            npm_package: fff-bin-win32-arm64
-            lib_filename: fff_c.dll
-            ext: dll
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   artifact_name: target/x86_64-pc-windows-msvc/ci/fff_c.dll
+          #   npm_package: fff-bin-win32-x64
+          #   lib_filename: fff_c.dll
+          #   ext: dll
+          # - os: windows-latest
+          #   target: aarch64-pc-windows-msvc
+          #   artifact_name: target/aarch64-pc-windows-msvc/ci/fff_c.dll
+          #   npm_package: fff-bin-win32-arm64
+          #   lib_filename: fff_c.dll
+          #   ext: dll
 
     steps:
       - uses: actions/checkout@v5
@@ -281,21 +286,23 @@ jobs:
     strategy:
       matrix:
         include:
+          # Non-macOS targets are disabled for now to keep CI lean (releases
+          # are Homebrew-only). Uncomment a block to re-enable that platform.
           ## Linux builds (using cargo-zigbuild)
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            zigbuild_target: x86_64-unknown-linux-gnu.2.31
-            artifact_name: target/x86_64-unknown-linux-gnu/ci/fff-mcp
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            zigbuild_target: aarch64-unknown-linux-gnu.2.31
-            artifact_name: target/aarch64-unknown-linux-gnu/ci/fff-mcp
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            artifact_name: target/x86_64-unknown-linux-musl/ci/fff-mcp
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            artifact_name: target/aarch64-unknown-linux-musl/ci/fff-mcp
+          # - os: ubuntu-latest
+          #   target: x86_64-unknown-linux-gnu
+          #   zigbuild_target: x86_64-unknown-linux-gnu.2.31
+          #   artifact_name: target/x86_64-unknown-linux-gnu/ci/fff-mcp
+          # - os: ubuntu-latest
+          #   target: aarch64-unknown-linux-gnu
+          #   zigbuild_target: aarch64-unknown-linux-gnu.2.31
+          #   artifact_name: target/aarch64-unknown-linux-gnu/ci/fff-mcp
+          # - os: ubuntu-latest
+          #   target: x86_64-unknown-linux-musl
+          #   artifact_name: target/x86_64-unknown-linux-musl/ci/fff-mcp
+          # - os: ubuntu-latest
+          #   target: aarch64-unknown-linux-musl
+          #   artifact_name: target/aarch64-unknown-linux-musl/ci/fff-mcp
 
           ## macOS builds
           - os: macos-latest
@@ -306,12 +313,12 @@ jobs:
             artifact_name: target/aarch64-apple-darwin/ci/fff-mcp
 
           ## Windows builds
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: target/x86_64-pc-windows-msvc/ci/fff-mcp.exe
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            artifact_name: target/aarch64-pc-windows-msvc/ci/fff-mcp.exe
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   artifact_name: target/x86_64-pc-windows-msvc/ci/fff-mcp.exe
+          # - os: windows-latest
+          #   target: aarch64-pc-windows-msvc
+          #   artifact_name: target/aarch64-pc-windows-msvc/ci/fff-mcp.exe
 
     steps:
       - uses: actions/checkout@v5
