@@ -33,7 +33,7 @@ pub(crate) struct ScanSignals {
 }
 
 /// Which optional phases a scan should run.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct ScanConfig {
     pub(crate) warmup: bool,
     pub(crate) content_indexing: bool,
@@ -43,6 +43,7 @@ pub(crate) struct ScanConfig {
     pub(crate) follow_symlinks: bool,
     pub(crate) enable_fs_root_scanning: bool,
     pub(crate) enable_home_dir_scanning: bool,
+    pub(crate) ignore_globs: Vec<String>,
 }
 
 /// A fully-configured scan job ready to run on a background thread.
@@ -94,6 +95,7 @@ impl ScanJob {
             follow_symlinks: picker.follows_symlinks(),
             enable_fs_root_scanning: picker.fs_root_scanning_enabled(),
             enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
+            ignore_globs: picker.ignore_globs().to_vec(),
         };
 
         drop(guard); // just a sanity check
@@ -165,6 +167,7 @@ impl ScanJob {
             &shared_frecency,
             mode,
             config.follow_symlinks,
+            &config.ignore_globs,
         ) {
             Ok(sync) => sync,
             Err(e) => {
@@ -250,6 +253,7 @@ impl ScanJob {
                 mode,
                 config.enable_fs_root_scanning,
                 config.enable_home_dir_scanning,
+                config.ignore_globs.clone(),
             ) {
                 Ok(watcher) => {
                     if let Ok(mut guard) = shared_picker.write()

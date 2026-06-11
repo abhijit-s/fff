@@ -110,6 +110,7 @@ impl WorkerState {
             frecency_db_path: self.config.frecency.db.as_deref().map(PathBuf::from),
             no_watch: self.config.index.no_watch,
             no_warmup: self.config.index.no_warmup,
+            ignore: self.config.mcp.ignore_for(&base_path),
         };
 
         // Convert error to String inside closure so the return type is Send.

@@ -12,6 +12,8 @@ pub struct EffectiveArgs {
     pub frecency_db_path: Option<PathBuf>,
     pub no_watch: bool,
     pub no_warmup: bool,
+    /// Gitignore-style patterns excluded from this root's index and watcher.
+    pub ignore: Vec<String>,
 }
 
 pub struct EngineState {
@@ -60,6 +62,7 @@ pub fn init(args: &EffectiveArgs) -> Result<EngineState, Box<dyn std::error::Err
             watch: !args.no_watch,
             mode: FFFMode::Ai,
             follow_symlinks: false,
+            ignore_globs: args.ignore.clone(),
             ..Default::default()
         },
     )?;

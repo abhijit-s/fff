@@ -52,6 +52,31 @@ pub(crate) fn non_git_repo_overrides(base_path: &Path) -> Option<ignore::overrid
     builder.build().ok()
 }
 
+/// Build a gitignore matcher from user-supplied patterns rooted at `base_path`.
+/// Returns None when there are no patterns (callers skip filtering). Patterns
+/// use standard gitignore syntax (bare glob excludes, leading `!` re-includes).
+pub(crate) fn user_ignore_matcher(
+    base_path: &Path,
+    patterns: &[String],
+) -> Option<ignore::gitignore::Gitignore> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(base_path);
+    for p in patterns {
+        if let Err(e) = builder.add_line(None, p) {
+            tracing::warn!("invalid ignore pattern {p:?}: {e}");
+        }
+    }
+    match builder.build() {
+        Ok(gi) => Some(gi),
+        Err(e) => {
+            tracing::warn!("failed to build ignore matcher: {e}");
+            None
+        }
+    }
+}
+
 pub(crate) fn is_non_code_directory(path: &Path) -> bool {
     let path_str = path.as_os_str().to_str().unwrap_or("");
     NON_GIT_IGNORED_DIRS
