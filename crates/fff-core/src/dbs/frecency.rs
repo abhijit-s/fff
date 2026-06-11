@@ -303,6 +303,103 @@ impl FrecencyTracker {
             })
     }
 
+    /// Merge all access history from `other` into `self`, keyed by raw
+    /// path-hash. For each key the timestamp lists are unioned, deduped, and
+    /// sorted, then trimmed to the 30-day window and per-file cap (the same
+    /// invariants `track_access` enforces). Returns the number of keys merged.
+    /// Keys are `blake3(absolute_path)`, identical across roots, so a child
+    /// root's signal merges into an ancestor with no path rewriting.
+    pub fn merge_from(&self, other: &FrecencyTracker) -> Result<usize> {
+        // Same env (e.g. a shared config.frecency.db): nothing to merge, and
+        // opening read+write txns against one env from a single path is a no-op
+        // at best — skip.
+        if self.db_path() == other.db_path() {
+            return Ok(0);
+        }
+
+        // Snapshot the source under a read txn, then apply under one write txn.
+        let incoming: Vec<(Vec<u8>, VecDeque<u64>)> = {
+            let rtxn = other
+                .env
+                .read_txn()
+                .map_err(|source| Error::DbStartReadTxn {
+                    db: Self::LABEL,
+                    source,
+                })?;
+            let iter = other.db.iter(&rtxn).map_err(|source| Error::DbRead {
+                db: Self::LABEL,
+                source,
+            })?;
+            let mut out = Vec::new();
+            for result in iter {
+                let (key, accesses) = result.map_err(|source| Error::DbRead {
+                    db: Self::LABEL,
+                    source,
+                })?;
+                out.push((key.to_vec(), accesses));
+            }
+            out
+        };
+
+        if incoming.is_empty() {
+            return Ok(0);
+        }
+
+        let now = self.get_now();
+        let cutoff_time = now.saturating_sub((MAX_HISTORY_DAYS * SECONDS_PER_DAY) as u64);
+
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|source| Error::DbStartWriteTxn {
+                db: Self::LABEL,
+                source,
+            })?;
+
+        let mut merged = 0usize;
+        for (key, other_accesses) in &incoming {
+            let existing = self
+                .db
+                .get(&wtxn, key.as_slice())
+                .map_err(|source| Error::DbRead {
+                    db: Self::LABEL,
+                    source,
+                })?
+                .unwrap_or_default();
+            let mut combined: Vec<u64> = existing
+                .into_iter()
+                .chain(other_accesses.iter().copied())
+                .filter(|&ts| ts >= cutoff_time)
+                .collect();
+            combined.sort_unstable();
+            combined.dedup();
+            if combined.len() > MAX_TIMESTAMPS_PER_FILE {
+                let drop_n = combined.len() - MAX_TIMESTAMPS_PER_FILE;
+                combined.drain(0..drop_n);
+            }
+            let deque: VecDeque<u64> = combined.into();
+            if let Err(e) = self.db.put(&mut wtxn, key.as_slice(), &deque) {
+                if is_map_full(&e) {
+                    self.health.mark_unhealthy("MDB_MAP_FULL on merge put");
+                    tracing::error!("Frecency merge hit MDB_MAP_FULL; stopping merge early");
+                    break;
+                }
+                return Err(Error::DbWrite {
+                    db: Self::LABEL,
+                    source: e,
+                });
+            }
+            merged += 1;
+        }
+
+        wtxn.commit().map_err(|source| Error::DbCommit {
+            db: Self::LABEL,
+            source,
+        })?;
+
+        Ok(merged)
+    }
+
     pub fn get_access_score(&self, file_path: &Path, mode: FFFMode) -> i64 {
         let accesses = self
             .get_accesses(file_path)
@@ -463,6 +560,70 @@ mod tests {
             recent_score,
             old_score
         );
+    }
+
+    #[test]
+    fn merge_from_unions_child_into_parent() {
+        let base = std::env::temp_dir().join("fff_merge_from_test");
+        let pdir = base.join("parent");
+        let cdir = base.join("child");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::create_dir_all(&cdir).unwrap();
+
+        let parent = FrecencyTracker::open(pdir.to_str().unwrap()).unwrap();
+        let child = FrecencyTracker::open(cdir.to_str().unwrap()).unwrap();
+
+        let shared = Path::new("/abs/proj/shared.rs");
+        let child_only = Path::new("/abs/proj/sub/only.rs");
+        parent.track_access(shared).unwrap();
+        child.track_access(shared).unwrap();
+        child.track_access(child_only).unwrap();
+
+        let merged = parent.merge_from(&child).unwrap();
+        assert_eq!(merged, 2, "both child keys should be merged");
+
+        // Child-only file now known to the parent.
+        assert_eq!(parent.access_count(child_only).unwrap(), 1);
+        // Shared file retains at least the parent's access (union, deduped).
+        assert!(parent.access_count(shared).unwrap() >= 1);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_from_same_env_is_skipped() {
+        let dir = std::env::temp_dir().join("fff_merge_same_env");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = FrecencyTracker::open(dir.to_str().unwrap()).unwrap();
+        t.track_access(Path::new("/abs/x.rs")).unwrap();
+
+        // Merging an env into itself (same db_path, e.g. a shared frecency DB)
+        // is a guarded no-op.
+        assert_eq!(t.merge_from(&t).unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_from_empty_child_is_noop() {
+        let base = std::env::temp_dir().join("fff_merge_empty_test");
+        let pdir = base.join("parent");
+        let cdir = base.join("child");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::create_dir_all(&cdir).unwrap();
+
+        let parent = FrecencyTracker::open(pdir.to_str().unwrap()).unwrap();
+        let child = FrecencyTracker::open(cdir.to_str().unwrap()).unwrap();
+        parent.track_access(Path::new("/abs/a.rs")).unwrap();
+
+        let merged = parent.merge_from(&child).unwrap();
+        assert_eq!(merged, 0, "merging an empty child changes nothing");
+        assert_eq!(parent.access_count(Path::new("/abs/a.rs")).unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

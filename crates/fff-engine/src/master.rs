@@ -277,8 +277,27 @@ impl MasterState {
     // Ring assignment is read first (deterministic, no mutation), then the
     // routing write-lock covers presence-check + push + scale-out threshold
     // atomically — eliminating the concurrent-Handshake double-push race.
-    async fn assign_new_root(&self, base_path: &str) -> Option<u32> {
+    async fn assign_new_root(self: &Arc<Self>, base_path: &str) -> Option<u32> {
         let slug = base_path_slug(std::path::Path::new(base_path));
+
+        // Canonicalize once up front (I/O kept outside locks). Used for the
+        // containment check and stored as the RootEntry.base_path.
+        let canonical = std::fs::canonicalize(base_path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| base_path.to_string());
+
+        // Containment: if an already-registered root is an ancestor of this
+        // path, route to its worker instead of minting a new slug/index/
+        // frecency DB/watcher. Checked before ring assignment so a contained
+        // sub-path never triggers a worker spawn.
+        let contained = {
+            let routing = self.routing.lock().await;
+            routing.containing_root(std::path::Path::new(&canonical))
+        };
+        if let Some((idx, _slug)) = contained {
+            tracing::debug!("master: routing {base_path} to containing root on worker-{idx}");
+            return Some(idx);
+        }
 
         // Ring assignment is read-only and deterministic; compute outside any lock.
         // If the ring is empty (workers still starting), spawn one on demand so
@@ -300,13 +319,9 @@ impl MasterState {
             }
         };
 
-        // Canonicalize outside the routing lock to avoid I/O under lock.
-        let canonical = std::fs::canonicalize(base_path)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| base_path.to_string());
-
-        // Single write-lock: re-check presence, push slug, compute scale-out trigger.
-        let should_scale_out = {
+        // Single write-lock: re-check presence, collect now-contained children,
+        // push slug, compute scale-out trigger.
+        let (should_scale_out, descendants) = {
             let mut routing = self.routing.lock().await;
 
             // Re-check after lock: a concurrent Handshake may have added this slug already.
@@ -315,6 +330,22 @@ impl MasterState {
                     return Some(*idx);
                 }
             }
+
+            // Existing roots that this new root now contains — subsumed below.
+            let descendants: Vec<(u32, String)> = routing
+                .workers
+                .iter()
+                .flat_map(|(&widx, entry)| {
+                    entry
+                        .roots
+                        .iter()
+                        .filter(|r| {
+                            !r.base_path.is_empty()
+                                && std::path::Path::new(&r.base_path).starts_with(&canonical)
+                        })
+                        .map(move |r| (widx, r.slug.clone()))
+                })
+                .collect();
 
             let mut scale_out = false;
             if let Some(entry) = routing.workers.get_mut(&index) {
@@ -327,8 +358,17 @@ impl MasterState {
             // Remove from idle_since: this worker now has work.
             self.idle_since.lock().await.remove(&index);
             self.persist_routing(&routing);
-            scale_out
+            (scale_out, descendants)
         };
+
+        // Subsume any pre-existing child roots off the hot path (passive, async).
+        if !descendants.is_empty() {
+            let me = Arc::clone(self);
+            let parent_slug = slug.clone();
+            tokio::spawn(async move {
+                me.subsume_descendants(parent_slug, descendants).await;
+            });
+        }
 
         if should_scale_out {
             let new_idx = self.alloc_index().await;
@@ -340,6 +380,57 @@ impl MasterState {
 
         Some(index)
     }
+
+    // Subsume pre-existing child roots into a newly-registered parent: tell each
+    // child's worker to merge frecency into the parent and drop the child's
+    // EngineState, then remove the child from the routing table. Runs in a
+    // background task so the triggering Handshake never blocks.
+    async fn subsume_descendants(&self, parent_slug: String, descendants: Vec<(u32, String)>) {
+        for (widx, child_slug) in descendants {
+            let socket = worker_socket_path(widx);
+            if let Err(e) = send_drop_root(&socket, child_slug.clone(), parent_slug.clone()).await {
+                tracing::warn!(
+                    "master: subsumption DropRoot for {child_slug} on worker-{widx} failed: {e}"
+                );
+            }
+            // Remove from routing regardless: future Handshakes for the child
+            // path now resolve to the parent via containment.
+            self.handle_evicted_root(&child_slug).await;
+            tracing::info!("master: subsumed child root {child_slug} into {parent_slug}");
+        }
+    }
+}
+
+// Send a DropRoot to a worker and await its Ack. Used by containment subsumption.
+#[cfg(unix)]
+async fn send_drop_root(
+    socket: &std::path::Path,
+    slug: String,
+    merge_into_slug: String,
+) -> Result<(), String> {
+    // Bound the whole round-trip so a wedged or version-skewed worker can't
+    // hang this background task (mirrors the client-side timeout discipline).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (mut read_half, mut write_half) = tokio::io::split(stream);
+        write_message(
+            &mut write_half,
+            &SearchRequest::DropRoot {
+                slug,
+                merge_into_slug,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let _: SearchResponse = read_message(&mut read_half)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| "DropRoot timed out".to_string())?
 }
 
 // Connect to a worker socket, send Health as the first message, and read the

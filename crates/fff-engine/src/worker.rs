@@ -4,7 +4,7 @@ use fff_ipc::config::FffConfig;
 use std::{
     collections::HashMap,
     fs::OpenOptions,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -34,6 +34,9 @@ use crate::state::{EffectiveArgs, EngineState};
 #[cfg(unix)]
 struct RootEntry {
     state: Arc<EngineState>,
+    // Canonicalized base_path, precomputed once so ancestor matching in
+    // get_or_init stays I/O-free under the read lock.
+    canonical_base: PathBuf,
     // Milliseconds since Unix epoch; updated atomically on every access.
     // Allows fast-path reads to hold roots.read() instead of roots.write().
     last_access_ms: AtomicU64,
@@ -71,13 +74,15 @@ impl WorkerState {
         let max_roots = self.config.worker.roots_per_worker_max as usize;
         let now = now_ms();
 
-        // Fast path: slug loaded — update last_access atomically (read lock only).
-        {
-            let map = self.roots.read();
-            if let Some(entry) = map.get(&slug) {
-                entry.last_access_ms.store(now, Ordering::Relaxed);
-                return Ok(Arc::clone(&entry.state));
-            }
+        // Canonicalize once (I/O kept outside the lock) for ancestor matching.
+        let canonical_req = std::fs::canonicalize(&base_path).unwrap_or_else(|_| base_path.clone());
+
+        // Fast path: exact slug, or an already-loaded ancestor root (containment).
+        // The master routes a sub-path Handshake to the containing root's worker;
+        // here we bind the Connect to that root's EngineState instead of minting
+        // a duplicate index for the sub-path.
+        if let Some(state) = self.resolve_loaded(&slug, &canonical_req, now) {
+            return Ok(state);
         }
 
         // Slow path: gate serialises concurrent inits for the same slug.
@@ -92,12 +97,8 @@ impl WorkerState {
         let _gate_guard = gate.lock().await;
 
         // Double-check after acquiring gate.
-        {
-            let map = self.roots.read();
-            if let Some(entry) = map.get(&slug) {
-                entry.last_access_ms.store(now, Ordering::Relaxed);
-                return Ok(Arc::clone(&entry.state));
-            }
+        if let Some(state) = self.resolve_loaded(&slug, &canonical_req, now) {
+            return Ok(state);
         }
 
         if self.roots.read().len() >= max_roots {
@@ -119,16 +120,74 @@ impl WorkerState {
         .map_err(|e| format!("spawn_blocking join error: {e}"))??;
 
         let new_state = Arc::new(new_state);
+        let canonical_base = std::fs::canonicalize(&new_state.base_path)
+            .unwrap_or_else(|_| new_state.base_path.clone());
         self.roots.write().insert(
             slug,
             RootEntry {
                 state: Arc::clone(&new_state),
+                canonical_base,
                 last_access_ms: AtomicU64::new(now_ms()),
                 loaded_at: Instant::now(),
             },
         );
 
         Ok(new_state)
+    }
+
+    // Resolve a request to an already-loaded root: exact slug first, then the
+    // longest-prefix ancestor (containment). Updates last_access on a hit.
+    // Held entirely under one read lock — no I/O (canonical paths precomputed).
+    fn resolve_loaded(
+        &self,
+        slug: &str,
+        canonical_req: &Path,
+        now: u64,
+    ) -> Option<Arc<EngineState>> {
+        let map = self.roots.read();
+        if let Some(entry) = map.get(slug) {
+            entry.last_access_ms.store(now, Ordering::Relaxed);
+            return Some(Arc::clone(&entry.state));
+        }
+        let mut best: Option<&RootEntry> = None;
+        let mut best_len = 0usize;
+        for entry in map.values() {
+            let len = entry.canonical_base.as_os_str().len();
+            if canonical_req.starts_with(&entry.canonical_base) && len > best_len {
+                best_len = len;
+                best = Some(entry);
+            }
+        }
+        best.map(|entry| {
+            entry.last_access_ms.store(now, Ordering::Relaxed);
+            Arc::clone(&entry.state)
+        })
+    }
+
+    // Subsume a child root: merge its frecency into the parent when both are
+    // co-resident on this worker, then remove the child's EngineState. Sent by
+    // the master during containment subsumption. Arcs are cloned under a brief
+    // read lock; the merge runs lock-free; removal takes the write lock.
+    fn drop_root(&self, slug: &str, merge_into_slug: &str) {
+        let (child, parent) = {
+            let map = self.roots.read();
+            (
+                map.get(slug).map(|e| Arc::clone(&e.state)),
+                map.get(merge_into_slug).map(|e| Arc::clone(&e.state)),
+            )
+        };
+        match (&child, &parent) {
+            (Some(child), Some(parent)) => merge_child_frecency(parent, child),
+            (Some(_), None) => tracing::warn!(
+                "worker-{}: subsuming {slug} but parent {merge_into_slug} is not loaded here \
+                 — frecency not merged (parent re-accrues signal as it is used)",
+                self.index
+            ),
+            _ => {}
+        }
+        if self.roots.write().remove(slug).is_some() {
+            tracing::info!("worker-{}: dropped subsumed root {slug}", self.index);
+        }
     }
 
     // Snapshot freshness signals for every loaded root.
@@ -312,6 +371,14 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
             let _ = write_message(&mut write_half, &SearchResponse::Health(health)).await;
             return;
         }
+        Ok(SearchRequest::DropRoot {
+            slug,
+            merge_into_slug,
+        }) => {
+            ws.drop_root(&slug, &merge_into_slug);
+            let _ = write_message(&mut write_half, &SearchResponse::Ack).await;
+            return;
+        }
         Ok(other) => {
             tracing::warn!(
                 "worker-{}: unexpected first message {:?}, closing",
@@ -354,6 +421,17 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
                 .await;
                 break;
             }
+            SearchRequest::DropRoot { .. } => {
+                // DropRoot is only valid as a first message on a fresh
+                // connection; reject mid-session rather than reaching the
+                // dispatch_request unreachable.
+                let _ = write_message(
+                    &mut write_half,
+                    &SearchResponse::Error("unexpected DropRoot mid-session".into()),
+                )
+                .await;
+                break;
+            }
             SearchRequest::RecordAccess { path } => {
                 let frecency = state.shared_frecency.clone();
                 let base = state.base_path.clone();
@@ -386,6 +464,21 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
                     break;
                 }
             }
+        }
+    }
+}
+
+// Merge a subsumed child's frecency history into the parent's DB, in-process,
+// using the already-open trackers (no cross-process LMDB env aliasing). Keys
+// are absolute-path hashes, identical across roots, so the union is direct.
+#[cfg(unix)]
+fn merge_child_frecency(parent: &EngineState, child: &EngineState) {
+    if let (Ok(pg), Ok(cg)) = (parent.shared_frecency.read(), child.shared_frecency.read())
+        && let (Some(p), Some(c)) = (pg.as_ref(), cg.as_ref())
+    {
+        match p.merge_from(c) {
+            Ok(n) => tracing::info!(merged = n, "subsumption: merged child frecency into parent"),
+            Err(e) => tracing::warn!("subsumption: frecency merge failed: {e}"),
         }
     }
 }

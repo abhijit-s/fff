@@ -347,6 +347,39 @@ fn u3_second_connect_same_base_path_gets_ack() {
     sigterm_and_wait(&mut worker, Duration::from_secs(5));
 }
 
+/// U2: A worker Connect for a sub-path of an already-loaded root binds to that
+/// root's EngineState — the worker does not mint a second root (containment).
+#[test]
+fn u3_subpath_connect_binds_to_ancestor_root() {
+    let env = TestEnv::new();
+    let mut worker = env.spawn_worker(0);
+    assert!(env.wait_worker(0, SOCKET_TIMEOUT));
+
+    let parent = env.dir.path().join("project");
+    let child = parent.join("src").join("deep");
+    std::fs::create_dir_all(&child).unwrap();
+
+    // Connect parent (inits the root), then a sub-path (must bind to parent).
+    let _s1 = env.worker_connect(&env.worker_socket(0), parent.to_str().unwrap());
+    let _s2 = env.worker_connect(&env.worker_socket(0), child.to_str().unwrap());
+
+    // Worker health reports exactly one loaded root.
+    let mut stream = UnixStream::connect(env.worker_socket(0)).expect("connect for health");
+    write_message_sync(&mut stream, &SearchRequest::Health).expect("write Health");
+    let resp: SearchResponse = read_message_sync(&mut stream).expect("read Health");
+    let roots = match resp {
+        SearchResponse::Health(h) => h.roots,
+        other => panic!("expected Health response, got {other:?}"),
+    };
+    assert_eq!(
+        roots.len(),
+        1,
+        "sub-path Connect must bind to the ancestor root, not mint a new one"
+    );
+
+    sigterm_and_wait(&mut worker, Duration::from_secs(5));
+}
+
 /// U3-5: Worker cleans up socket and lockfile on SIGTERM.
 #[test]
 fn u3_worker_cleans_up_on_sigterm() {
@@ -660,6 +693,97 @@ fn u5_scale_out_fires_at_roots_per_worker_max() {
     assert!(
         scaled,
         "master should have spawned a second worker after exceeding roots_per_worker_max"
+    );
+
+    sigterm_and_wait(&mut master, Duration::from_secs(5));
+}
+
+/// U5-3: A Handshake for a sub-path of an already-registered root routes to that
+/// root's worker WITHOUT minting a new slug (containment, U1).
+#[test]
+fn u5_containment_routes_subpath_to_parent_root() {
+    let env = TestEnv::new();
+    let mut master = env.spawn_master();
+    assert!(env.wait_master(SOCKET_TIMEOUT));
+    env.wait_for_workers(1, SOCKET_TIMEOUT);
+
+    // Real parent dir with a nested sub-directory so canonicalize succeeds.
+    let parent = env.dir.path().join("project");
+    let child = parent.join("src").join("deep");
+    std::fs::create_dir_all(&child).unwrap();
+
+    let parent_idx = match env.handshake(parent.to_str().unwrap()) {
+        MasterResponse::WorkerSocket { worker_index, .. } => worker_index,
+        other => panic!("expected WorkerSocket, got {other:?}"),
+    };
+    let child_idx = match env.handshake(child.to_str().unwrap()) {
+        MasterResponse::WorkerSocket { worker_index, .. } => worker_index,
+        other => panic!("expected WorkerSocket, got {other:?}"),
+    };
+
+    assert_eq!(
+        parent_idx, child_idx,
+        "sub-path Handshake should route to the containing root's worker"
+    );
+
+    // The sub-path must NOT have registered its own slug: exactly one root total.
+    let table = RoutingTable::load(&env.routing_json()).expect("parse routing.json");
+    let total_roots: usize = table.workers.values().map(|w| w.roots.len()).sum();
+    assert_eq!(
+        total_roots, 1,
+        "containment must not mint a second root for the sub-path"
+    );
+
+    sigterm_and_wait(&mut master, Duration::from_secs(5));
+}
+
+/// U3 (subsumption): registering a parent over an already-registered child
+/// subsumes the child — the async background task removes the child's routing
+/// entry, leaving only the parent.
+#[test]
+fn u5_parent_registration_subsumes_existing_child() {
+    let env = TestEnv::new();
+    let mut master = env.spawn_master();
+    assert!(env.wait_master(SOCKET_TIMEOUT));
+    env.wait_for_workers(1, SOCKET_TIMEOUT);
+
+    let parent = env.dir.path().join("project");
+    let child = parent.join("nested").join("child");
+    std::fs::create_dir_all(&child).unwrap();
+
+    // Child registered first as its own root.
+    env.handshake(child.to_str().unwrap());
+    let before: usize = RoutingTable::load(&env.routing_json())
+        .expect("routing")
+        .workers
+        .values()
+        .map(|w| w.roots.len())
+        .sum();
+    assert_eq!(before, 1, "child should be registered as its own root");
+
+    // Registering the parent triggers async subsumption of the child.
+    env.handshake(parent.to_str().unwrap());
+
+    // Poll until the background task has evicted the child: one root, the parent.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let subsumed = loop {
+        let bases: Vec<String> = RoutingTable::load(&env.routing_json())
+            .expect("routing")
+            .workers
+            .values()
+            .flat_map(|w| w.roots.iter().map(|r| r.base_path.clone()))
+            .collect();
+        if bases.len() == 1 && bases[0].ends_with("project") {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        sleep(Duration::from_millis(200));
+    };
+    assert!(
+        subsumed,
+        "parent registration should subsume the pre-existing child root"
     );
 
     sigterm_and_wait(&mut master, Duration::from_secs(5));
