@@ -12,7 +12,8 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use fff_ipc::lockfile::{self, Lockfile};
 use fff_ipc::routing::RootEntry;
 use fff_ipc::types::{HealthReport, MasterRequest, MasterResponse, RootHealth, WorkerInfo};
@@ -33,8 +34,12 @@ struct Cli {
     #[arg(long, short = 'j', global = true)]
     json: bool,
 
+    /// Print a shell completion script to stdout and exit.
+    #[arg(long = "completions", value_name = "SHELL", exclusive = true)]
+    completions: Option<Shell>,
+
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -85,8 +90,19 @@ enum Cmd {
 
 fn main() {
     let cli = Cli::parse();
+
+    if let Some(shell) = cli.completions {
+        let mut cmd = Cli::command();
+        generate(shell, &mut cmd, "fffctl", &mut std::io::stdout());
+        return;
+    }
+
     let json = cli.json;
-    let exit = match cli.command {
+    let Some(command) = cli.command else {
+        let _ = Cli::command().print_help();
+        std::process::exit(2);
+    };
+    let exit = match command {
         Cmd::List => cmd_list(json),
         Cmd::ListWorkers => cmd_list_workers(json),
         Cmd::Paths { base_path } => cmd_paths(&base_path, json),

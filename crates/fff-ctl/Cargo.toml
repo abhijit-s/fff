@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 fff-ipc = { path = "../fff-ipc", version = "0.14.0" }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { workspace = true }
