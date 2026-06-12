@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::IpcError;
+use crate::protocol::MAX_FRAME_LEN;
 
 // ── Sync codec (used by fff-mcp's blocking EngineClient) ─────────────────────
 
@@ -74,6 +75,90 @@ where
         .map_err(IpcError::Io)?;
 
     bincode::deserialize(&payload).map_err(IpcError::Decode)
+}
+
+// ── JSON codec (versioned protocol envelope) ─────────────────────────────────
+//
+// Reuses the SAME `[u32-LE len][payload]` framing as the bincode functions, but
+// serializes/deserializes via serde_json and enforces MAX_FRAME_LEN on the read
+// path so a hostile/garbled length can't trigger an unbounded allocation (KTD9).
+
+/// Synchronous write of a length-prefixed JSON message.
+pub fn write_json_message_sync<W: Write, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), IpcError> {
+    let payload = serde_json::to_vec(value).map_err(IpcError::JsonEncode)?;
+    let len = payload.len() as u32;
+    writer.write_all(&len.to_le_bytes()).map_err(IpcError::Io)?;
+    writer.write_all(&payload).map_err(IpcError::Io)?;
+    Ok(())
+}
+
+/// Synchronous read of a length-prefixed JSON message. Rejects an over-length
+/// declared frame before allocating.
+pub fn read_json_message_sync<R: Read, T: for<'de> Deserialize<'de>>(
+    reader: &mut R,
+) -> Result<T, IpcError> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).map_err(IpcError::Io)?;
+    let len = u32::from_le_bytes(len_buf);
+    if len > MAX_FRAME_LEN {
+        return Err(IpcError::FrameTooLarge {
+            len,
+            max: MAX_FRAME_LEN,
+        });
+    }
+
+    let mut payload = vec![0u8; len as usize];
+    reader.read_exact(&mut payload).map_err(IpcError::Io)?;
+
+    serde_json::from_slice(&payload).map_err(IpcError::JsonDecode)
+}
+
+/// Write a length-prefixed JSON message over an async stream.
+pub async fn write_json_message<W, T>(writer: &mut W, value: &T) -> Result<(), IpcError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let payload = serde_json::to_vec(value).map_err(IpcError::JsonEncode)?;
+    let len = payload.len() as u32;
+    writer
+        .write_all(&len.to_le_bytes())
+        .await
+        .map_err(IpcError::Io)?;
+    writer.write_all(&payload).await.map_err(IpcError::Io)?;
+    Ok(())
+}
+
+/// Read a length-prefixed JSON message over an async stream. Rejects an
+/// over-length declared frame before allocating.
+pub async fn read_json_message<R, T>(reader: &mut R) -> Result<T, IpcError>
+where
+    R: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    let mut len_buf = [0u8; 4];
+    reader
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(IpcError::Io)?;
+    let len = u32::from_le_bytes(len_buf);
+    if len > MAX_FRAME_LEN {
+        return Err(IpcError::FrameTooLarge {
+            len,
+            max: MAX_FRAME_LEN,
+        });
+    }
+
+    let mut payload = vec![0u8; len as usize];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(IpcError::Io)?;
+
+    serde_json::from_slice(&payload).map_err(IpcError::JsonDecode)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
