@@ -354,13 +354,13 @@ impl MasterState {
             let routing = self.routing.lock().await;
             routing.containing_root(std::path::Path::new(&canonical))
         };
-        if let Some((idx, _slug, anc_base)) = contained {
-            if fff::git::working_tree_root(std::path::Path::new(&anc_base)) == candidate_wt {
+        if let Some((idx, _slug, ancestor_base)) = contained {
+            if fff::git::working_tree_root(std::path::Path::new(&ancestor_base)) == candidate_wt {
                 tracing::debug!("master: routing {base_path} to containing root on worker-{idx}");
                 return Some(idx);
             }
             tracing::debug!(
-                "master: {base_path} is a distinct git working tree from containing root {anc_base}; minting its own root"
+                "master: {base_path} is a distinct git working tree from containing root {ancestor_base}; minting its own root"
             );
         }
 
