@@ -25,6 +25,9 @@ __all__ = [
     "PROTOCOL_MISMATCH",
     "BAD_REQUEST",
     "INTERNAL",
+    "FIND_OPTIONS_DEFAULTS",
+    "GREP_OPTIONS_DEFAULTS",
+    "merged_options",
     "build_request",
     "encode_frame",
     "write_message",
@@ -44,6 +47,44 @@ BAD_REQUEST = "BAD_REQUEST"
 INTERNAL = "INTERNAL"
 
 _LEN_PREFIX = struct.Struct("<I")
+
+# The engine's `FindOptions`/`GrepOptions` have NO per-field serde defaults: when
+# the `options` key is present it must carry EVERY field, or deserialization
+# fails ("missing field ..."). Omitting `options` entirely is fine (the field is
+# `#[serde(default)]`), but a partial object is rejected. These mirror the Rust
+# `Default` impls in fff_ipc::types so the client can send a complete object when
+# the caller overrides any single field.
+FIND_OPTIONS_DEFAULTS = {
+    "max_threads": 0,
+    "current_file": None,
+    "combo_boost_score_multiplier": 3,
+    "min_combo_count": 2,
+    "offset": 0,
+    "limit": 20,
+}
+
+GREP_OPTIONS_DEFAULTS = {
+    "max_file_size": 10 * 1024 * 1024,
+    "max_matches_per_file": 10,
+    "smart_case": True,
+    "file_offset": 0,
+    "page_limit": 50,
+    "mode": "PlainText",
+    "time_budget_ms": 0,
+    "before_context": 0,
+    "after_context": 0,
+    "classify_definitions": False,
+    "trim_whitespace": True,
+}
+
+
+def merged_options(
+    defaults: Dict[str, Any], overrides: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Full option object: engine defaults with caller overrides applied."""
+    merged = dict(defaults)
+    merged.update(overrides)
+    return merged
 
 
 def build_request(verb: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

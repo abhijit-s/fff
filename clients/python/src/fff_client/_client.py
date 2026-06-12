@@ -135,7 +135,9 @@ class FffClient:
         """
         params: Dict[str, Any] = {"query": query}
         if options:
-            params["options"] = options
+            params["options"] = _protocol.merged_options(
+                _protocol.GREP_OPTIONS_DEFAULTS, options
+            )
         return self._call("grep", params)
 
     def find_files(self, query: str, **options: Any) -> List[Dict[str, Any]]:
@@ -147,7 +149,9 @@ class FffClient:
         """
         params: Dict[str, Any] = {"query": query}
         if options:
-            params["options"] = options
+            params["options"] = _protocol.merged_options(
+                _protocol.FIND_OPTIONS_DEFAULTS, options
+            )
         return self._call("find_files", params)
 
     def multi_grep(
@@ -164,7 +168,9 @@ class FffClient:
         if constraints is not None:
             params["constraints"] = constraints
         if options:
-            params["options"] = options
+            params["options"] = _protocol.merged_options(
+                _protocol.GREP_OPTIONS_DEFAULTS, options
+            )
         return self._call("multi_grep", params)
 
     def list_roots(self) -> List[Dict[str, Any]]:
