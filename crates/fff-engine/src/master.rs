@@ -15,7 +15,7 @@ use fff_ipc::{
     ResponseError, base_path_slug, check_protocol_version,
     config::WorkerConfig,
     decode_bincode, decode_json, looks_like_json, master_lockfile_path, master_socket_path,
-    protocol::verbs,
+    protocol::{WireRoot, verbs},
     read_frame, read_message,
     routing::{RoutingTable, WorkerEntry},
     routing_table_path,
@@ -54,6 +54,17 @@ struct MasterState {
     save_fail_count: AtomicU32,
     /// Master startup time — used to report uptime via `fffctl health`.
     started_at: Instant,
+    /// Configured `[mcp]` roots (name, canonical path, is_default), default-first.
+    /// Source of name/default for the `list_roots` verb.
+    configured_roots: Vec<ConfiguredRoot>,
+}
+
+// A configured `[mcp]` root, canonicalized and tagged with its default flag.
+#[cfg(unix)]
+struct ConfiguredRoot {
+    name: Option<String>,
+    path: PathBuf,
+    default: bool,
 }
 
 #[cfg(unix)]
@@ -65,6 +76,7 @@ impl MasterState {
         ring: HashRing,
         next_index: u32,
         adopted_pids: HashMap<u32, u32>,
+        configured_roots: Vec<ConfiguredRoot>,
     ) -> Self {
         Self {
             config,
@@ -77,6 +89,7 @@ impl MasterState {
             idle_since: Mutex::new(HashMap::new()),
             save_fail_count: AtomicU32::new(0),
             started_at: Instant::now(),
+            configured_roots,
         }
     }
 
@@ -531,6 +544,47 @@ pub async fn run(_config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std:
     Err("fff-engine master mode is not supported on this platform".into())
 }
 
+// Canonicalize a path, falling back to the original when it does not exist.
+#[cfg(unix)]
+fn canonicalize_root(p: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+// Derive default-first `ConfiguredRoot`s from `[mcp]`, mirroring
+// `RootRegistry::all_with_names`: canonicalize, default first, de-dup by
+// canonical path (first wins).
+#[cfg(unix)]
+fn configured_roots_from_mcp(mcp: &fff_ipc::config::McpConfig) -> Vec<ConfiguredRoot> {
+    let default_path = mcp.default_path().map(|p| canonicalize_root(&p));
+    let default_name = default_path.as_ref().and_then(|dp| {
+        mcp.roots
+            .iter()
+            .find(|r| canonicalize_root(&r.path) == *dp)
+            .and_then(|r| r.name.clone())
+    });
+
+    let mut out: Vec<ConfiguredRoot> = Vec::with_capacity(mcp.roots.len() + 1);
+    if let Some(dp) = default_path.clone() {
+        out.push(ConfiguredRoot {
+            name: default_name,
+            path: dp,
+            default: true,
+        });
+    }
+    for root in &mcp.roots {
+        let canon = canonicalize_root(&root.path);
+        if out.iter().any(|e| e.path == canon) {
+            continue;
+        }
+        out.push(ConfiguredRoot {
+            name: root.name.clone(),
+            path: canon,
+            default: false,
+        });
+    }
+    out
+}
+
 /// Entry point for master mode.
 #[cfg(unix)]
 pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -566,6 +620,7 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
     std::fs::write(&lockfile, format!("{}\n", std::process::id()))?;
 
     let exe_path = std::env::current_exe()?;
+    let configured_roots = configured_roots_from_mcp(&config.mcp);
     let worker_cfg = config.worker;
 
     // Load routing.json and probe surviving workers.
@@ -612,6 +667,7 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
         ring,
         max_seen_index.wrapping_add(1),
         adopted_pids,
+        configured_roots,
     ));
 
     // Bind master socket before spawning workers so clients can connect
@@ -965,7 +1021,17 @@ async fn dispatch_master_json(frame: &[u8], ms: &Arc<MasterState>) -> ResponseEn
             ok_or_internal(ResponseEnvelope::ok(&report))
         }
 
-        // `list_roots` is a master verb handled in U4 — not implemented here.
+        verbs::LIST_ROOTS => {
+            let live: Vec<String> = ms
+                .collect_worker_info()
+                .await
+                .into_iter()
+                .flat_map(|w| w.roots.into_iter().map(|r| r.base_path))
+                .collect();
+            let roots = build_list_roots(&ms.configured_roots, &live);
+            ok_or_internal(ResponseEnvelope::ok(&roots))
+        }
+
         other => ResponseEnvelope::err(ResponseError {
             code: BAD_REQUEST.to_string(),
             message: format!("unsupported master verb: {other}"),
@@ -973,6 +1039,38 @@ async fn dispatch_master_json(frame: &[u8], ms: &Arc<MasterState>) -> ResponseEn
             client_version: None,
         }),
     }
+}
+
+// Reconcile configured `[mcp]` roots with live routing-table base_paths into the
+// `list_roots` result. Configured roots come first (already default-first and
+// self-de-duped); live-only base_paths follow as `name:None`/`default:false`.
+// De-dup is by canonical path — a configured root that is also live appears once
+// and keeps its name/default.
+#[cfg(unix)]
+fn build_list_roots(configured: &[ConfiguredRoot], live: &[String]) -> Vec<WireRoot> {
+    let mut out: Vec<WireRoot> = configured
+        .iter()
+        .map(|c| WireRoot {
+            base_path: c.path.to_string_lossy().into_owned(),
+            name: c.name.clone(),
+            default: c.default,
+        })
+        .collect();
+
+    let mut seen: Vec<PathBuf> = configured.iter().map(|c| c.path.clone()).collect();
+    for base_path in live {
+        let canon = canonicalize_root(std::path::Path::new(base_path));
+        if seen.contains(&canon) {
+            continue;
+        }
+        out.push(WireRoot {
+            base_path: canon.to_string_lossy().into_owned(),
+            name: None,
+            default: false,
+        });
+        seen.push(canon);
+    }
+    out
 }
 
 // Collapse a result-serialization failure into an INTERNAL error envelope.
@@ -1011,6 +1109,7 @@ mod tests {
             HashRing::new(),
             1,
             HashMap::new(),
+            Vec::new(),
         ))
     }
 
@@ -1066,6 +1165,7 @@ mod tests {
             HashRing::new(),
             0,
             HashMap::new(),
+            Vec::new(),
         ));
         let env = RequestEnvelope::new(verbs::HEALTH, json!({}));
 
@@ -1080,8 +1180,7 @@ mod tests {
     #[tokio::test]
     async fn json_unknown_verb_is_bad_request() {
         let ms = state_with_root("/tmp/fff-dual-read-test-root");
-        // `list_roots` is a master verb but lands in U4 — until then it is rejected.
-        let env = RequestEnvelope::new(verbs::LIST_ROOTS, json!({}));
+        let env = RequestEnvelope::new("not_a_real_verb", json!({}));
 
         let resp = dispatch_master_json(&frame_for(&env), &ms).await;
 
@@ -1089,7 +1188,83 @@ mod tests {
         let err = resp.error.unwrap();
         assert_eq!(err.code, BAD_REQUEST);
         assert!(err.message.contains("unsupported master verb"));
-        assert!(err.message.contains("list_roots"));
+        assert!(err.message.contains("not_a_real_verb"));
+    }
+
+    #[tokio::test]
+    async fn json_list_roots_returns_live_base_path() {
+        let base_path = "/tmp/fff-dual-read-test-root";
+        let ms = state_with_root(base_path);
+        let env = RequestEnvelope::new(verbs::LIST_ROOTS, json!({}));
+
+        let resp = dispatch_master_json(&frame_for(&env), &ms).await;
+
+        assert!(resp.ok, "expected ok, got {resp:?}");
+        let roots: Vec<WireRoot> = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].name, None);
+        assert!(!roots[0].default);
+    }
+
+    fn configured(name: Option<&str>, path: &str, default: bool) -> ConfiguredRoot {
+        ConfiguredRoot {
+            name: name.map(|n| n.to_string()),
+            path: PathBuf::from(path),
+            default,
+        }
+    }
+
+    #[test]
+    fn build_list_roots_unions_configured_and_live() {
+        let configured_roots = vec![
+            configured(Some("app"), "/tmp/fff-cfg-app", true),
+            configured(Some("lib"), "/tmp/fff-cfg-lib", false),
+        ];
+        let live = vec!["/tmp/fff-live-only".to_string()];
+
+        let roots = build_list_roots(&configured_roots, &live);
+
+        assert_eq!(roots.len(), 3);
+        // Default-first, configured carry name/default.
+        assert_eq!(roots[0].base_path, "/tmp/fff-cfg-app");
+        assert_eq!(roots[0].name.as_deref(), Some("app"));
+        assert!(roots[0].default);
+        assert_eq!(roots[1].name.as_deref(), Some("lib"));
+        assert!(!roots[1].default);
+        // Live-only is anonymous and non-default.
+        assert_eq!(roots[2].base_path, "/tmp/fff-live-only");
+        assert_eq!(roots[2].name, None);
+        assert!(!roots[2].default);
+    }
+
+    #[test]
+    fn build_list_roots_dedups_configured_that_is_also_live() {
+        // The path exists so both sides canonicalize identically. The configured
+        // path is pre-canonicalized (as `configured_roots_from_mcp` does in prod).
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().to_string_lossy().into_owned();
+        let canon = canonicalize_root(std::path::Path::new(&raw))
+            .to_string_lossy()
+            .into_owned();
+
+        let configured_roots = vec![configured(Some("app"), &canon, true)];
+        let live = vec![raw.clone()];
+
+        let roots = build_list_roots(&configured_roots, &live);
+
+        assert_eq!(roots.len(), 1, "de-dup by canonical path");
+        assert_eq!(roots[0].name.as_deref(), Some("app"));
+        assert!(roots[0].default, "configured entry wins");
+    }
+
+    #[test]
+    fn build_list_roots_empty_config_single_live() {
+        let roots = build_list_roots(&[], &["/tmp/fff-live-solo".to_string()]);
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].base_path, "/tmp/fff-live-solo");
+        assert_eq!(roots[0].name, None);
+        assert!(!roots[0].default);
     }
 
     // Regression (R5): the legacy bincode Handshake → WorkerSocket round-trip is
