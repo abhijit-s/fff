@@ -1256,6 +1256,58 @@ fn u3_json_record_access_sends_no_reply() {
     sigterm_and_wait(&mut worker, Duration::from_secs(5));
 }
 
+/// U3-J6 (L1 regression): a malformed `record_access` is logged and dropped —
+/// no reply frame and the session stays usable. Fire-and-forget must not tear
+/// down the connection over a no-reply verb.
+#[test]
+fn u3_json_record_access_malformed_params_keeps_session() {
+    let env = TestEnv::new();
+    let mut worker = env.spawn_worker(0);
+    assert!(env.wait_worker(0, SOCKET_TIMEOUT));
+
+    let project = env.dir.path().join("j6_project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("a.txt"), b"x").unwrap();
+    let base_path = project.to_str().unwrap();
+
+    let mut stream = env.worker_connect_json(&env.worker_socket(0), base_path);
+
+    // `path` must be a string; an integer fails RecordAccessParams decode.
+    let bad = RequestEnvelope::new(verbs::RECORD_ACCESS, json!({ "path": 123 }));
+    write_json_message_sync(&mut stream, &bad).expect("write malformed record_access");
+
+    // The dropped verb sends no reply.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let no_reply: Result<ResponseEnvelope, _> = read_json_message_sync(&mut stream);
+    assert!(
+        no_reply.is_err(),
+        "malformed record_access must send no reply, got {no_reply:?}"
+    );
+
+    // Session survives: a subsequent grep still round-trips on the same connection.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let grep = RequestEnvelope::new(
+        verbs::GREP,
+        serde_json::to_value(GrepParams {
+            query: "x".into(),
+            options: GrepOptions::default(),
+        })
+        .unwrap(),
+    );
+    write_json_message_sync(&mut stream, &grep).expect("write grep after malformed record_access");
+    let resp: ResponseEnvelope = read_json_message_sync(&mut stream).expect("read grep");
+    assert!(
+        resp.ok && resp.result.is_some(),
+        "session must survive a malformed record_access, got {resp:?}"
+    );
+
+    sigterm_and_wait(&mut worker, Duration::from_secs(5));
+}
+
 /// U3-J3: A JSON `connect` with an incompatible protocol_version is rejected
 /// with PROTOCOL_MISMATCH carrying both versions, and the connection closes.
 #[test]

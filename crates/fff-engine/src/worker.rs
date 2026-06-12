@@ -649,12 +649,13 @@ async fn json_request_loop(
         };
 
         // record_access is fire-and-forget: perform the write, send no frame.
+        // Malformed params are logged and dropped — never reply (the client
+        // awaits nothing) and never tear down the session over a no-reply verb.
         if env.verb == verbs::RECORD_ACCESS {
             match env.params_as::<RecordAccessParams>() {
                 Ok(p) => record_access(state, p.path),
-                Err(err_env) => {
-                    let _ = write_json_message(write_half, &err_env).await;
-                    break;
+                Err(_) => {
+                    tracing::warn!("worker: dropping record_access with malformed params");
                 }
             }
             continue;
