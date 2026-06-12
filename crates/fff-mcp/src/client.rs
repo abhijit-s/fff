@@ -1,8 +1,15 @@
 //! Synchronous IPC client for fff-engine — two-phase connect via master.
 //!
-//! Phase 1: connect to master socket, send Handshake{base_path}, receive
-//! WorkerSocket{path, worker_index}.
-//! Phase 2: connect to the worker socket, send Connect{base_path}, wait for Ack.
+//! Speaks the versioned JSON envelope (`fff_ipc::protocol`) on the hot path:
+//! handshake, connect, search, and record_access all ride the documented
+//! `[u32-LE len][json]` framing. `set_log_level` and `check_health` stay on the
+//! legacy bincode path (no JSON verb / read-only probe); the engine dual-reads
+//! both encodings, so the mix is transparent on the wire.
+//!
+//! Phase 1: connect to master socket, send a `handshake` envelope, receive a
+//! `HandshakeResult{worker_socket, worker_index}`. A protocol mismatch fails
+//! loud here (refuse-on-mismatch) instead of silently garbling.
+//! Phase 2: connect to the worker socket, send a `connect` envelope, await ack.
 //! All subsequent search traffic uses the direct worker connection.
 
 use std::io::{BufReader, BufWriter};
@@ -11,9 +18,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use fff_ipc::types::{MasterRequest, MasterResponse, SearchRequest, SearchResponse};
+use fff_ipc::protocol::{
+    BasePathParams, FindFilesParams, GetGitStatusParams, GrepParams, HandshakeResult,
+    ListDirectoriesParams, ListRecentFilesParams, MultiGrepParams, PROTOCOL_MISMATCH,
+    RecordAccessParams, RequestEnvelope, ResponseEnvelope, verbs,
+};
+use fff_ipc::types::{
+    HealthResponse, MasterRequest, MasterResponse, SearchRequest, SearchResponse, WireDirEntry,
+    WireGitFile, WireGrepResponse, WireSearchResult,
+};
 use fff_ipc::{IpcError, lockfile, master_lockfile_path, master_socket_path};
-use fff_ipc::{read_message_sync, write_message_sync};
+use fff_ipc::{
+    read_json_message_sync, read_message_sync, write_json_message_sync, write_message_sync,
+};
 
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Read timeout for the Connect→Ack handshake — short so a dead worker is
@@ -55,20 +72,23 @@ impl EngineClient {
         let mut writer = BufWriter::new(stream.try_clone()?);
         let mut reader = BufReader::new(stream);
 
-        write_message_sync(
-            &mut writer,
-            &SearchRequest::Connect {
+        let connect_env = RequestEnvelope::new(
+            verbs::CONNECT,
+            serde_json::to_value(BasePathParams {
                 base_path: base_path_str.clone(),
-            },
-        )?;
+            })?,
+        );
+        write_json_message_sync(&mut writer, &connect_env)?;
         use std::io::Write;
         writer.flush().map_err(IpcError::Io)?;
 
-        let connect_resp: SearchResponse = read_message_sync(&mut reader)?;
-        match connect_resp {
-            SearchResponse::Ack => {}
-            SearchResponse::Error(e) => return Err(format!("worker Connect rejected: {e}").into()),
-            other => return Err(format!("unexpected worker response: {other:?}").into()),
+        let connect_resp: ResponseEnvelope = read_json_message_sync(&mut reader)?;
+        if !connect_resp.ok {
+            let msg = connect_resp
+                .error
+                .map(|e| e.message)
+                .unwrap_or_else(|| "worker Connect rejected".into());
+            return Err(format!("worker Connect rejected: {msg}").into());
         }
 
         // Handshake done — raise the read timeout for ongoing queries. The
@@ -160,28 +180,42 @@ impl EngineClient {
         }
     }
 
-    /// Low-level send with no retry.
+    /// Low-level send with no retry. Encodes the request as a versioned JSON
+    /// envelope and decodes the JSON response back into the existing
+    /// `SearchResponse` shape.
     pub fn search(&mut self, req: &SearchRequest) -> Result<SearchResponse, IpcError> {
-        write_message_sync(&mut self.writer, req)?;
+        let env = searchrequest_to_envelope(req)?;
+        write_json_message_sync(&mut self.writer, &env)?;
+        use std::io::Write;
+        self.writer.flush().map_err(IpcError::Io)?;
+        let resp: ResponseEnvelope = read_json_message_sync(&mut self.reader)?;
+        Ok(responseenvelope_to_searchresponse(&env.verb, resp))
+    }
+
+    /// Hot-reload the daemon's log filter. No JSON verb exists for SetLogLevel
+    /// (operator path, not a memory-kit verb), so this stays on legacy bincode;
+    /// the engine dual-reads it.
+    pub fn set_log_level(&mut self, level: &str) -> Result<SearchResponse, IpcError> {
+        write_message_sync(
+            &mut self.writer,
+            &SearchRequest::SetLogLevel {
+                level: level.to_owned(),
+            },
+        )?;
         use std::io::Write;
         self.writer.flush().map_err(IpcError::Io)?;
         read_message_sync(&mut self.reader)
     }
 
-    /// Hot-reload the daemon's log filter.
-    pub fn set_log_level(&mut self, level: &str) -> Result<SearchResponse, IpcError> {
-        self.search(&SearchRequest::SetLogLevel {
-            level: level.to_owned(),
-        })
-    }
-
-    /// Fire-and-forget frecency write. Writes and flushes without reading a
-    /// reply — the engine sends none for `RecordAccess`.
+    /// Fire-and-forget frecency write. Writes and flushes a JSON `record_access`
+    /// envelope without reading a reply — the engine sends none for it.
     pub fn record_access(&mut self, path: &str) {
-        let req = SearchRequest::RecordAccess {
+        if let Ok(params) = serde_json::to_value(RecordAccessParams {
             path: path.to_owned(),
-        };
-        let _ = write_message_sync(&mut self.writer, &req);
+        }) {
+            let env = RequestEnvelope::new(verbs::RECORD_ACCESS, params);
+            let _ = write_json_message_sync(&mut self.writer, &env);
+        }
         let _ = {
             use std::io::Write;
             self.writer.flush()
@@ -190,6 +224,9 @@ impl EngineClient {
 
     /// Check daemon health without triggering root initialisation.
     /// Uses MasterRequest::RouteInfo (read-only) instead of a full two-phase connect.
+    // Stays on legacy bincode this increment: RouteInfo is a cheap liveness probe
+    // that must not trigger root init; the JSON `health` verb fans out to workers
+    // and is heavier. Migration deferred.
     pub fn check_health(base_path: &Path) -> HealthStatus {
         use std::io::{BufReader, BufWriter};
         let master = master_socket_path();
@@ -239,7 +276,125 @@ pub enum HealthStatus {
     ConnRefused(String),
 }
 
-/// Send a Handshake to the master and return the worker socket path.
+// Client-side inverse of the engine's `envelope_to_request` (worker.rs): map a
+// SearchRequest to its verb + params envelope. Reuses the fff-ipc param structs
+// so field names never drift from the documented contract.
+fn searchrequest_to_envelope(req: &SearchRequest) -> Result<RequestEnvelope, IpcError> {
+    let to_env = |verb: &str, params: serde_json::Result<serde_json::Value>| {
+        params
+            .map(|p| RequestEnvelope::new(verb, p))
+            .map_err(IpcError::JsonEncode)
+    };
+    match req {
+        SearchRequest::Grep { query, options } => to_env(
+            verbs::GREP,
+            serde_json::to_value(GrepParams {
+                query: query.clone(),
+                options: options.clone(),
+            }),
+        ),
+        SearchRequest::FindFiles { query, options } => to_env(
+            verbs::FIND_FILES,
+            serde_json::to_value(FindFilesParams {
+                query: query.clone(),
+                options: options.clone(),
+            }),
+        ),
+        SearchRequest::MultiGrep {
+            patterns,
+            constraints,
+            options,
+        } => to_env(
+            verbs::MULTI_GREP,
+            serde_json::to_value(MultiGrepParams {
+                patterns: patterns.clone(),
+                constraints: constraints.clone(),
+                options: options.clone(),
+            }),
+        ),
+        SearchRequest::ListRecentFiles { limit, dirty_only } => to_env(
+            verbs::LIST_RECENT_FILES,
+            serde_json::to_value(ListRecentFilesParams {
+                limit: *limit,
+                dirty_only: *dirty_only,
+            }),
+        ),
+        SearchRequest::GetGitStatus { include_clean } => to_env(
+            verbs::GET_GIT_STATUS,
+            serde_json::to_value(GetGitStatusParams {
+                include_clean: *include_clean,
+            }),
+        ),
+        SearchRequest::ListDirectories { limit } => to_env(
+            verbs::LIST_DIRECTORIES,
+            serde_json::to_value(ListDirectoriesParams { limit: *limit }),
+        ),
+        SearchRequest::Health => Ok(RequestEnvelope::new(verbs::HEALTH, serde_json::json!({}))),
+        // RecordAccess / SetLogLevel / Connect / DropRoot are not routed through
+        // search(): they have dedicated paths (fire-and-forget JSON, legacy
+        // bincode, the connect handshake) or no client-side caller.
+        other => Err(IpcError::Protocol(format!(
+            "request not supported on the JSON search path: {other:?}"
+        ))),
+    }
+}
+
+// Client-side inverse of the engine's `searchresponse_to_json_value` (server.rs):
+// decode a ResponseEnvelope back into the existing SearchResponse, parsing the
+// JSON `result` into the verb's Wire* type. !ok → SearchResponse::Error so the
+// existing error channel is preserved. The verb selects which Wire* to expect.
+fn responseenvelope_to_searchresponse(verb: &str, resp: ResponseEnvelope) -> SearchResponse {
+    if !resp.ok {
+        let msg = resp
+            .error
+            .map(|e| {
+                if e.code == PROTOCOL_MISMATCH {
+                    format!("{}: {}", PROTOCOL_MISMATCH, e.message)
+                } else {
+                    e.message
+                }
+            })
+            .unwrap_or_else(|| "engine returned an error without a message".into());
+        return SearchResponse::Error(msg);
+    }
+    let value = match resp.result {
+        Some(v) => v,
+        None => return SearchResponse::Error("engine ok response missing result".into()),
+    };
+    let parse_err = |e: serde_json::Error| SearchResponse::Error(format!("malformed result: {e}"));
+    match verb {
+        verbs::GREP | verbs::MULTI_GREP => {
+            match serde_json::from_value::<WireGrepResponse>(value) {
+                Ok(w) => SearchResponse::GrepResults(w),
+                Err(e) => parse_err(e),
+            }
+        }
+        verbs::FIND_FILES => match serde_json::from_value::<Vec<WireSearchResult>>(value) {
+            Ok(v) => SearchResponse::SearchResults(v),
+            Err(e) => parse_err(e),
+        },
+        verbs::LIST_RECENT_FILES => match serde_json::from_value::<Vec<WireSearchResult>>(value) {
+            Ok(v) => SearchResponse::RecentFiles(v),
+            Err(e) => parse_err(e),
+        },
+        verbs::GET_GIT_STATUS => match serde_json::from_value::<Vec<WireGitFile>>(value) {
+            Ok(v) => SearchResponse::GitStatus(v),
+            Err(e) => parse_err(e),
+        },
+        verbs::LIST_DIRECTORIES => match serde_json::from_value::<Vec<WireDirEntry>>(value) {
+            Ok(v) => SearchResponse::Directories(v),
+            Err(e) => parse_err(e),
+        },
+        verbs::HEALTH => match serde_json::from_value::<HealthResponse>(value) {
+            Ok(h) => SearchResponse::Health(h),
+            Err(e) => parse_err(e),
+        },
+        other => SearchResponse::Error(format!("no result decoder for verb '{other}'")),
+    }
+}
+
+/// Send a JSON `handshake` envelope to the master and return the worker socket
+/// path. A protocol-version mismatch fails loud (refuse-on-mismatch).
 fn master_handshake(base_path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let master = master_socket_path();
     let stream = UnixStream::connect(&master)
@@ -250,34 +405,55 @@ fn master_handshake(base_path: &Path) -> Result<PathBuf, Box<dyn std::error::Err
     let mut writer = BufWriter::new(stream.try_clone()?);
     let mut reader = BufReader::new(stream);
 
-    let base_str = base_path.to_string_lossy().into_owned();
-    write_message_sync(
-        &mut writer,
-        &MasterRequest::Handshake {
-            base_path: base_str,
-        },
-    )?;
+    let env = RequestEnvelope::new(
+        verbs::HANDSHAKE,
+        serde_json::to_value(BasePathParams {
+            base_path: base_path.to_string_lossy().into_owned(),
+        })?,
+    );
+    write_json_message_sync(&mut writer, &env)?;
     use std::io::Write;
     writer.flush().map_err(IpcError::Io)?;
 
-    let resp: MasterResponse = read_message_sync(&mut reader)?;
-    match resp {
-        MasterResponse::WorkerSocket { path, worker_index } => {
-            // Validate the returned path is under the expected workers/ directory.
-            let expected = fff_ipc::worker_socket_path(worker_index);
-            let actual = PathBuf::from(&path);
-            if actual != expected {
+    let resp: ResponseEnvelope = read_json_message_sync(&mut reader)?;
+    let result = handshake_result_from_envelope(resp)?;
+
+    // Validate the returned path is under the expected workers/ directory.
+    let expected = fff_ipc::worker_socket_path(result.worker_index);
+    let actual = PathBuf::from(&result.worker_socket);
+    if actual != expected {
+        return Err(format!(
+            "master returned unexpected worker socket path: {:?} (expected {expected:?})",
+            result.worker_socket
+        )
+        .into());
+    }
+    Ok(actual)
+}
+
+/// Parse a master handshake `ResponseEnvelope` into a `HandshakeResult`. A
+/// `PROTOCOL_MISMATCH` error (or version skew) fails loud rather than hanging or
+/// garbling — this is the refuse-on-mismatch contract (R3/KTD4).
+fn handshake_result_from_envelope(
+    resp: ResponseEnvelope,
+) -> Result<HandshakeResult, Box<dyn std::error::Error>> {
+    if !resp.ok {
+        if let Some(err) = resp.error {
+            if err.code == PROTOCOL_MISMATCH {
                 return Err(format!(
-                    "master returned unexpected worker socket path: {path:?} \
-                     (expected {expected:?})"
+                    "fff-engine protocol mismatch (engine {:?}, client {:?}): {}",
+                    err.engine_version, err.client_version, err.message
                 )
                 .into());
             }
-            Ok(actual)
+            return Err(format!("master handshake error [{}]: {}", err.code, err.message).into());
         }
-        MasterResponse::Error(e) => Err(format!("master handshake error: {e}").into()),
-        other => Err(format!("unexpected master response: {other:?}").into()),
+        return Err("master handshake failed without an error body".into());
     }
+    let value = resp
+        .result
+        .ok_or("master handshake ok response missing result")?;
+    serde_json::from_value(value).map_err(|e| format!("malformed handshake result: {e}").into())
 }
 
 /// Ensure `fff-engine --master` is running, spawning it if absent.
@@ -409,13 +585,29 @@ fn find_engine_bin() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fff_ipc::types::FindOptions;
+    use fff_ipc::protocol::{PROTOCOL_VERSION, ResponseError};
+    use fff_ipc::types::{FindOptions, GrepOptions};
 
     fn find_req() -> SearchRequest {
         SearchRequest::FindFiles {
             query: "q".into(),
             options: FindOptions::default(),
         }
+    }
+
+    // Stand-in for the engine's JSON reply on a worker socket: read one request
+    // envelope, then write the given ok response envelope. Mirrors the wire the
+    // migrated client now speaks so the timeout-discipline tests stay valid.
+    fn serve_one_json(server_sock: &mut UnixStream, delay: Duration, result: serde_json::Value) {
+        let _req: RequestEnvelope = read_json_message_sync(server_sock).unwrap();
+        std::thread::sleep(delay);
+        let env = ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            ok: true,
+            result: Some(result),
+            error: None,
+        };
+        let _ = write_json_message_sync(server_sock, &env);
     }
 
     // A response that arrives within the read timeout is received — the property
@@ -429,9 +621,11 @@ mod tests {
             .unwrap();
 
         let server = std::thread::spawn(move || {
-            let _req: SearchRequest = read_message_sync(&mut server_sock).unwrap();
-            std::thread::sleep(Duration::from_millis(150));
-            write_message_sync(&mut server_sock, &SearchResponse::SearchResults(vec![])).unwrap();
+            serve_one_json(
+                &mut server_sock,
+                Duration::from_millis(150),
+                serde_json::json!([]),
+            );
         });
 
         let mut client = EngineClient::from_stream(client_sock, PathBuf::from("/x"));
@@ -453,9 +647,11 @@ mod tests {
             .unwrap();
 
         let server = std::thread::spawn(move || {
-            let _req: SearchRequest = read_message_sync(&mut server_sock).unwrap();
-            std::thread::sleep(Duration::from_millis(300));
-            let _ = write_message_sync(&mut server_sock, &SearchResponse::SearchResults(vec![]));
+            serve_one_json(
+                &mut server_sock,
+                Duration::from_millis(300),
+                serde_json::json!([]),
+            );
         });
 
         let mut client = EngineClient::from_stream(client_sock, PathBuf::from("/x"));
@@ -472,5 +668,91 @@ mod tests {
         // fff-engine gates queries on GREP_READINESS_TIMEOUT (30s). The client
         // query read timeout must exceed it or slow cold-start queries fail.
         assert!(QUERY_READ_TIMEOUT >= Duration::from_secs(30));
+    }
+
+    // find_files: an ok envelope carrying a Vec<WireSearchResult> decodes to the
+    // SearchResults variant — the typed result the tool surface expects.
+    #[test]
+    fn find_files_response_decodes_to_search_results() {
+        let result = serde_json::to_value(vec![WireSearchResult {
+            path: "src/main.rs".into(),
+            score: 100,
+            git_status: Some(0),
+            frecency_score: 100,
+        }])
+        .unwrap();
+        let env = ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            ok: true,
+            result: Some(result),
+            error: None,
+        };
+        match responseenvelope_to_searchresponse(verbs::FIND_FILES, env) {
+            SearchResponse::SearchResults(v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].path, "src/main.rs");
+            }
+            other => panic!("expected SearchResults, got {other:?}"),
+        }
+    }
+
+    // grep: an ok envelope carrying a WireGrepResponse decodes to GrepResults.
+    #[test]
+    fn grep_response_decodes_to_grep_results() {
+        let result = serde_json::to_value(WireGrepResponse {
+            matches: vec![],
+            total_files_searched: 7,
+            total_files: 9,
+            files_with_matches: 0,
+            next_file_offset: 0,
+            regex_fallback_error: None,
+        })
+        .unwrap();
+        let env = ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            ok: true,
+            result: Some(result),
+            error: None,
+        };
+        match responseenvelope_to_searchresponse(verbs::GREP, env) {
+            SearchResponse::GrepResults(w) => assert_eq!(w.total_files, 9),
+            other => panic!("expected GrepResults, got {other:?}"),
+        }
+    }
+
+    // The grep request maps to the documented verb + GrepParams shape.
+    #[test]
+    fn grep_request_maps_to_grep_verb_and_params() {
+        let req = SearchRequest::Grep {
+            query: "needle".into(),
+            options: GrepOptions::default(),
+        };
+        let env = searchrequest_to_envelope(&req).unwrap();
+        assert_eq!(env.verb, verbs::GREP);
+        let params: GrepParams = serde_json::from_value(env.params).unwrap();
+        assert_eq!(params.query, "needle");
+    }
+
+    // A version-incompatible engine surfaces a loud PROTOCOL_MISMATCH error from
+    // the handshake decode rather than hanging or garbling (R3/KTD4).
+    #[test]
+    fn handshake_mismatch_fails_loud() {
+        let env = ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION + 1,
+            ok: false,
+            result: None,
+            error: Some(ResponseError {
+                code: PROTOCOL_MISMATCH.to_string(),
+                message: "engine speaks 2, client sent 1".into(),
+                engine_version: Some(PROTOCOL_VERSION + 1),
+                client_version: Some(PROTOCOL_VERSION),
+            }),
+        };
+        let err = handshake_result_from_envelope(env).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("protocol mismatch"),
+            "mismatch must be explicit, got: {msg}"
+        );
     }
 }
