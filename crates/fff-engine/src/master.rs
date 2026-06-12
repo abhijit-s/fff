@@ -11,16 +11,19 @@ use std::{
 
 #[cfg(unix)]
 use fff_ipc::{
-    base_path_slug,
+    BAD_REQUEST, BasePathParams, HandshakeResult, INTERNAL, RequestEnvelope, ResponseEnvelope,
+    ResponseError, base_path_slug, check_protocol_version,
     config::WorkerConfig,
-    master_lockfile_path, master_socket_path, read_message,
+    decode_bincode, decode_json, looks_like_json, master_lockfile_path, master_socket_path,
+    protocol::{WireRoot, verbs},
+    read_frame, read_message,
     routing::{RoutingTable, WorkerEntry},
     routing_table_path,
     types::{
         HealthReport, MasterRequest, MasterResponse, SearchRequest, SearchResponse, WorkerHealth,
         WorkerInfo,
     },
-    worker_socket_path, write_message,
+    worker_socket_path, write_json_message, write_message,
 };
 #[cfg(unix)]
 use tokio::{
@@ -51,6 +54,17 @@ struct MasterState {
     save_fail_count: AtomicU32,
     /// Master startup time — used to report uptime via `fffctl health`.
     started_at: Instant,
+    /// Configured `[mcp]` roots (name, canonical path, is_default), default-first.
+    /// Source of name/default for the `list_roots` verb.
+    configured_roots: Vec<ConfiguredRoot>,
+}
+
+// A configured `[mcp]` root, canonicalized and tagged with its default flag.
+#[cfg(unix)]
+struct ConfiguredRoot {
+    name: Option<String>,
+    path: PathBuf,
+    default: bool,
 }
 
 #[cfg(unix)]
@@ -62,6 +76,7 @@ impl MasterState {
         ring: HashRing,
         next_index: u32,
         adopted_pids: HashMap<u32, u32>,
+        configured_roots: Vec<ConfiguredRoot>,
     ) -> Self {
         Self {
             config,
@@ -74,6 +89,7 @@ impl MasterState {
             idle_since: Mutex::new(HashMap::new()),
             save_fail_count: AtomicU32::new(0),
             started_at: Instant::now(),
+            configured_roots,
         }
     }
 
@@ -206,6 +222,41 @@ impl MasterState {
         }
     }
 
+    // Resolve a base_path to its worker socket + index. Routing-table hit
+    // returns immediately; a miss assigns a new root (may scale out). Shared by
+    // the bincode `Handshake` arm and the JSON `handshake` verb so both paths
+    // run identical routing logic.
+    async fn resolve_worker_socket(
+        self: &Arc<Self>,
+        base_path: &str,
+    ) -> Result<(String, u32), String> {
+        let slug = base_path_slug(std::path::Path::new(base_path));
+
+        let routing_hit = {
+            let routing = self.routing.lock().await;
+            routing.workers.iter().find_map(|(&idx, e)| {
+                if e.contains_slug(&slug) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+        };
+
+        if let Some(index) = routing_hit {
+            let socket = worker_socket_path(index).to_string_lossy().into_owned();
+            return Ok((socket, index));
+        }
+
+        match self.assign_new_root(base_path).await {
+            Some(index) => {
+                let socket = worker_socket_path(index).to_string_lossy().into_owned();
+                Ok((socket, index))
+            }
+            None => Err("no workers available".into()),
+        }
+    }
+
     async fn worker_info(&self, index: u32) -> Option<WorkerInfo> {
         let routing = self.routing.lock().await;
         routing.workers.get(&index).map(|e| WorkerInfo {
@@ -303,13 +354,13 @@ impl MasterState {
             let routing = self.routing.lock().await;
             routing.containing_root(std::path::Path::new(&canonical))
         };
-        if let Some((idx, _slug, anc_base)) = contained {
-            if fff::git::working_tree_root(std::path::Path::new(&anc_base)) == candidate_wt {
+        if let Some((idx, _slug, ancestor_base)) = contained {
+            if fff::git::working_tree_root(std::path::Path::new(&ancestor_base)) == candidate_wt {
                 tracing::debug!("master: routing {base_path} to containing root on worker-{idx}");
                 return Some(idx);
             }
             tracing::debug!(
-                "master: {base_path} is a distinct git working tree from containing root {anc_base}; minting its own root"
+                "master: {base_path} is a distinct git working tree from containing root {ancestor_base}; minting its own root"
             );
         }
 
@@ -493,6 +544,47 @@ pub async fn run(_config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std:
     Err("fff-engine master mode is not supported on this platform".into())
 }
 
+// Canonicalize a path, falling back to the original when it does not exist.
+#[cfg(unix)]
+fn canonicalize_root(p: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+// Derive default-first `ConfiguredRoot`s from `[mcp]`, mirroring
+// `RootRegistry::all_with_names`: canonicalize, default first, de-dup by
+// canonical path (first wins).
+#[cfg(unix)]
+fn configured_roots_from_mcp(mcp: &fff_ipc::config::McpConfig) -> Vec<ConfiguredRoot> {
+    let default_path = mcp.default_path().map(|p| canonicalize_root(&p));
+    let default_name = default_path.as_ref().and_then(|dp| {
+        mcp.roots
+            .iter()
+            .find(|r| canonicalize_root(&r.path) == *dp)
+            .and_then(|r| r.name.clone())
+    });
+
+    let mut out: Vec<ConfiguredRoot> = Vec::with_capacity(mcp.roots.len() + 1);
+    if let Some(dp) = default_path.clone() {
+        out.push(ConfiguredRoot {
+            name: default_name,
+            path: dp,
+            default: true,
+        });
+    }
+    for root in &mcp.roots {
+        let canon = canonicalize_root(&root.path);
+        if out.iter().any(|e| e.path == canon) {
+            continue;
+        }
+        out.push(ConfiguredRoot {
+            name: root.name.clone(),
+            path: canon,
+            default: false,
+        });
+    }
+    out
+}
+
 /// Entry point for master mode.
 #[cfg(unix)]
 pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -528,6 +620,7 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
     std::fs::write(&lockfile, format!("{}\n", std::process::id()))?;
 
     let exe_path = std::env::current_exe()?;
+    let configured_roots = configured_roots_from_mcp(&config.mcp);
     let worker_cfg = config.worker;
 
     // Load routing.json and probe surviving workers.
@@ -574,6 +667,7 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
         ring,
         max_seen_index.wrapping_add(1),
         adopted_pids,
+        configured_roots,
     ));
 
     // Bind master socket before spawning workers so clients can connect
@@ -800,45 +894,29 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
 async fn handle_connection(stream: tokio::net::UnixStream, ms: Arc<MasterState>) {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
-    let req: MasterRequest = match read_message(&mut read_half).await {
+    // Dual-read: read one frame, sniff the first payload byte. `{` ⇒ versioned
+    // JSON envelope; anything else ⇒ legacy bincode (byte-for-byte unchanged).
+    let frame = match read_frame(&mut read_half).await {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    if looks_like_json(&frame) {
+        let resp = dispatch_master_json(&frame, &ms).await;
+        let _ = write_json_message(&mut write_half, &resp).await;
+        return;
+    }
+
+    let req: MasterRequest = match decode_bincode(&frame) {
         Ok(r) => r,
         Err(_) => return,
     };
 
     match req {
         MasterRequest::Handshake { base_path } => {
-            let slug = base_path_slug(std::path::Path::new(&base_path));
-
-            // Fast path: routing table hit — same worker, no mutation.
-            let routing_hit = {
-                let routing = ms.routing.lock().await;
-                routing.workers.iter().find_map(|(&idx, e)| {
-                    if e.contains_slug(&slug) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-            };
-
-            let resp = if let Some(index) = routing_hit {
-                let socket = worker_socket_path(index).to_string_lossy().into_owned();
-                MasterResponse::WorkerSocket {
-                    path: socket,
-                    worker_index: index,
-                }
-            } else {
-                // Routing miss — assign new root (may trigger scale-out).
-                match ms.assign_new_root(&base_path).await {
-                    Some(index) => {
-                        let socket = worker_socket_path(index).to_string_lossy().into_owned();
-                        MasterResponse::WorkerSocket {
-                            path: socket,
-                            worker_index: index,
-                        }
-                    }
-                    None => MasterResponse::Error("no workers available".into()),
-                }
+            let resp = match ms.resolve_worker_socket(&base_path).await {
+                Ok((path, worker_index)) => MasterResponse::WorkerSocket { path, worker_index },
+                Err(msg) => MasterResponse::Error(msg),
             };
             let _ = write_message(&mut write_half, &resp).await;
         }
@@ -888,6 +966,336 @@ async fn handle_connection(stream: tokio::net::UnixStream, ms: Arc<MasterState>)
         MasterRequest::Health => {
             let report = ms.collect_health().await;
             let _ = write_message(&mut write_half, &MasterResponse::HealthReport(report)).await;
+        }
+    }
+}
+
+// JSON dual-read dispatch for the master socket. Parses the versioned envelope,
+// enforces the version check (refuse-on-mismatch, R3/KTD4), then routes the verb
+// through the SAME helpers the bincode path uses. Returns the response envelope
+// to write; the caller closes the connection after a single request, matching
+// the bincode path's one-shot lifecycle.
+#[cfg(unix)]
+async fn dispatch_master_json(frame: &[u8], ms: &Arc<MasterState>) -> ResponseEnvelope {
+    let env: RequestEnvelope = match decode_json(frame) {
+        Ok(e) => e,
+        Err(e) => {
+            return ResponseEnvelope::err(ResponseError {
+                code: BAD_REQUEST.to_string(),
+                message: format!("malformed request envelope: {e}"),
+                engine_version: None,
+                client_version: None,
+            });
+        }
+    };
+
+    if let Err(mismatch) = check_protocol_version(env.protocol_version) {
+        return mismatch;
+    }
+
+    match env.verb.as_str() {
+        verbs::HANDSHAKE => {
+            let params: BasePathParams = match env.params_as() {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            match ms.resolve_worker_socket(&params.base_path).await {
+                Ok((worker_socket, worker_index)) => {
+                    let result = HandshakeResult {
+                        worker_socket,
+                        worker_index,
+                    };
+                    ok_or_internal(ResponseEnvelope::ok(&result))
+                }
+                Err(message) => ResponseEnvelope::err(ResponseError {
+                    code: INTERNAL.to_string(),
+                    message,
+                    engine_version: None,
+                    client_version: None,
+                }),
+            }
+        }
+
+        verbs::HEALTH => {
+            let report = ms.collect_health().await;
+            ok_or_internal(ResponseEnvelope::ok(&report))
+        }
+
+        verbs::LIST_ROOTS => {
+            let live: Vec<String> = ms
+                .collect_worker_info()
+                .await
+                .into_iter()
+                .flat_map(|w| w.roots.into_iter().map(|r| r.base_path))
+                .collect();
+            let roots = build_list_roots(&ms.configured_roots, &live);
+            ok_or_internal(ResponseEnvelope::ok(&roots))
+        }
+
+        other => ResponseEnvelope::err(ResponseError {
+            code: BAD_REQUEST.to_string(),
+            message: format!("unsupported master verb: {other}"),
+            engine_version: None,
+            client_version: None,
+        }),
+    }
+}
+
+// Reconcile configured `[mcp]` roots with live routing-table base_paths into the
+// `list_roots` result. Configured roots come first (already default-first and
+// self-de-duped); live-only base_paths follow as `name:None`/`default:false`.
+// De-dup is by canonical path — a configured root that is also live appears once
+// and keeps its name/default.
+#[cfg(unix)]
+fn build_list_roots(configured: &[ConfiguredRoot], live: &[String]) -> Vec<WireRoot> {
+    let mut out: Vec<WireRoot> = configured
+        .iter()
+        .map(|c| WireRoot {
+            base_path: c.path.to_string_lossy().into_owned(),
+            name: c.name.clone(),
+            default: c.default,
+        })
+        .collect();
+
+    let mut seen: Vec<PathBuf> = configured.iter().map(|c| c.path.clone()).collect();
+    for base_path in live {
+        let canon = canonicalize_root(std::path::Path::new(base_path));
+        if seen.contains(&canon) {
+            continue;
+        }
+        out.push(WireRoot {
+            base_path: canon.to_string_lossy().into_owned(),
+            name: None,
+            default: false,
+        });
+        seen.push(canon);
+    }
+    out
+}
+
+// Collapse a result-serialization failure into an INTERNAL error envelope.
+#[cfg(unix)]
+fn ok_or_internal<E: std::fmt::Display>(r: Result<ResponseEnvelope, E>) -> ResponseEnvelope {
+    r.unwrap_or_else(|e| {
+        ResponseEnvelope::err(ResponseError {
+            code: INTERNAL.to_string(),
+            message: format!("failed to serialize result: {e}"),
+            engine_version: None,
+            client_version: None,
+        })
+    })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use fff_ipc::types::HealthReport;
+    use fff_ipc::{PROTOCOL_MISMATCH, PROTOCOL_VERSION};
+    use serde_json::json;
+
+    // A master state with one worker already holding `base_path`, so a handshake
+    // routing hit returns without spawning a real worker process.
+    fn state_with_root(base_path: &str) -> Arc<MasterState> {
+        let mut routing = RoutingTable::default();
+        let mut entry = WorkerEntry::new(0, worker_socket_path(0).to_string_lossy().into(), 1234);
+        let slug = base_path_slug(std::path::Path::new(base_path));
+        entry.push_root(slug, base_path.to_string());
+        routing.workers.insert(0, entry);
+
+        Arc::new(MasterState::new(
+            WorkerConfig::default(),
+            PathBuf::from("/nonexistent/fff-engine"),
+            routing,
+            HashRing::new(),
+            1,
+            HashMap::new(),
+            Vec::new(),
+        ))
+    }
+
+    fn frame_for(env: &RequestEnvelope) -> Vec<u8> {
+        serde_json::to_vec(env).unwrap()
+    }
+
+    #[tokio::test]
+    async fn json_handshake_returns_handshake_result() {
+        let base_path = "/tmp/fff-dual-read-test-root";
+        let ms = state_with_root(base_path);
+        let env = RequestEnvelope::new(verbs::HANDSHAKE, json!({ "base_path": base_path }));
+
+        let resp = dispatch_master_json(&frame_for(&env), &ms).await;
+
+        assert!(resp.ok, "expected ok, got {resp:?}");
+        assert_eq!(resp.protocol_version, PROTOCOL_VERSION);
+        let result: HandshakeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.worker_index, 0);
+        assert_eq!(
+            result.worker_socket,
+            worker_socket_path(0).to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    async fn json_handshake_version_mismatch_refuses_loud() {
+        let base_path = "/tmp/fff-dual-read-test-root";
+        let ms = state_with_root(base_path);
+        let mut env = RequestEnvelope::new(verbs::HANDSHAKE, json!({ "base_path": base_path }));
+        env.protocol_version = PROTOCOL_VERSION + 1;
+
+        let resp = dispatch_master_json(&frame_for(&env), &ms).await;
+
+        assert!(!resp.ok);
+        assert!(
+            resp.result.is_none(),
+            "must not return a worker socket on skew"
+        );
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, PROTOCOL_MISMATCH);
+        assert_eq!(err.engine_version, Some(PROTOCOL_VERSION));
+        assert_eq!(err.client_version, Some(PROTOCOL_VERSION + 1));
+    }
+
+    #[tokio::test]
+    async fn json_health_returns_health_report() {
+        // Empty routing table → no worker fan-out, report has no workers.
+        let ms = Arc::new(MasterState::new(
+            WorkerConfig::default(),
+            PathBuf::from("/nonexistent/fff-engine"),
+            RoutingTable::default(),
+            HashRing::new(),
+            0,
+            HashMap::new(),
+            Vec::new(),
+        ));
+        let env = RequestEnvelope::new(verbs::HEALTH, json!({}));
+
+        let resp = dispatch_master_json(&frame_for(&env), &ms).await;
+
+        assert!(resp.ok, "expected ok, got {resp:?}");
+        let report: HealthReport = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(report.master_pid, std::process::id());
+        assert!(report.workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_unknown_verb_is_bad_request() {
+        let ms = state_with_root("/tmp/fff-dual-read-test-root");
+        let env = RequestEnvelope::new("not_a_real_verb", json!({}));
+
+        let resp = dispatch_master_json(&frame_for(&env), &ms).await;
+
+        assert!(!resp.ok);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, BAD_REQUEST);
+        assert!(err.message.contains("unsupported master verb"));
+        assert!(err.message.contains("not_a_real_verb"));
+    }
+
+    #[tokio::test]
+    async fn json_list_roots_returns_live_base_path() {
+        let base_path = "/tmp/fff-dual-read-test-root";
+        let ms = state_with_root(base_path);
+        let env = RequestEnvelope::new(verbs::LIST_ROOTS, json!({}));
+
+        let resp = dispatch_master_json(&frame_for(&env), &ms).await;
+
+        assert!(resp.ok, "expected ok, got {resp:?}");
+        let roots: Vec<WireRoot> = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].name, None);
+        assert!(!roots[0].default);
+    }
+
+    fn configured(name: Option<&str>, path: &str, default: bool) -> ConfiguredRoot {
+        ConfiguredRoot {
+            name: name.map(|n| n.to_string()),
+            path: PathBuf::from(path),
+            default,
+        }
+    }
+
+    #[test]
+    fn build_list_roots_unions_configured_and_live() {
+        let configured_roots = vec![
+            configured(Some("app"), "/tmp/fff-cfg-app", true),
+            configured(Some("lib"), "/tmp/fff-cfg-lib", false),
+        ];
+        let live = vec!["/tmp/fff-live-only".to_string()];
+
+        let roots = build_list_roots(&configured_roots, &live);
+
+        assert_eq!(roots.len(), 3);
+        // Default-first, configured carry name/default.
+        assert_eq!(roots[0].base_path, "/tmp/fff-cfg-app");
+        assert_eq!(roots[0].name.as_deref(), Some("app"));
+        assert!(roots[0].default);
+        assert_eq!(roots[1].name.as_deref(), Some("lib"));
+        assert!(!roots[1].default);
+        // Live-only is anonymous and non-default.
+        assert_eq!(roots[2].base_path, "/tmp/fff-live-only");
+        assert_eq!(roots[2].name, None);
+        assert!(!roots[2].default);
+    }
+
+    #[test]
+    fn build_list_roots_dedups_configured_that_is_also_live() {
+        // The path exists so both sides canonicalize identically. The configured
+        // path is pre-canonicalized (as `configured_roots_from_mcp` does in prod).
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().to_string_lossy().into_owned();
+        let canon = canonicalize_root(std::path::Path::new(&raw))
+            .to_string_lossy()
+            .into_owned();
+
+        let configured_roots = vec![configured(Some("app"), &canon, true)];
+        let live = vec![raw.clone()];
+
+        let roots = build_list_roots(&configured_roots, &live);
+
+        assert_eq!(roots.len(), 1, "de-dup by canonical path");
+        assert_eq!(roots[0].name.as_deref(), Some("app"));
+        assert!(roots[0].default, "configured entry wins");
+    }
+
+    #[test]
+    fn build_list_roots_empty_config_single_live() {
+        let roots = build_list_roots(&[], &["/tmp/fff-live-solo".to_string()]);
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].base_path, "/tmp/fff-live-solo");
+        assert_eq!(roots[0].name, None);
+        assert!(!roots[0].default);
+    }
+
+    // Regression (R5): the legacy bincode Handshake → WorkerSocket round-trip is
+    // byte-for-byte unchanged. We exercise the shared routing helper the bincode
+    // arm now calls, plus confirm the frame still sniffs as bincode (not JSON).
+    #[tokio::test]
+    async fn legacy_bincode_handshake_still_routes() {
+        let base_path = "/tmp/fff-dual-read-test-root";
+        let ms = state_with_root(base_path);
+
+        // Encode the legacy request exactly as a bincode client would.
+        let req = MasterRequest::Handshake {
+            base_path: base_path.to_string(),
+        };
+        let frame = bincode::serialize(&req).unwrap();
+        assert!(
+            !looks_like_json(&frame),
+            "legacy bincode frame must not sniff as JSON"
+        );
+
+        // The bincode arm routes through resolve_worker_socket; assert the same
+        // (path, index) the WorkerSocket response would carry.
+        let (path, index) = ms.resolve_worker_socket(base_path).await.unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(path, worker_socket_path(0).to_string_lossy());
+
+        // And the legacy decode path still yields the original request.
+        let decoded: MasterRequest = decode_bincode(&frame).unwrap();
+        match decoded {
+            MasterRequest::Handshake { base_path: bp } => assert_eq!(bp, base_path),
+            other => panic!("expected Handshake, got {other:?}"),
         }
     }
 }
