@@ -1,6 +1,6 @@
 [package]
 name = "fff-ctl"
-version = "0.16.2"
+version = "0.17.0"
 edition = "2024"
 description = "Operator CLI for managing fff-engine daemons — list, stop, status, clean"
 license = "MIT"
@@ -10,7 +10,7 @@ name = "fffctl"
 path = "src/main.rs"
 
 [dependencies]
-fff-ipc = { path = "../fff-ipc", version = "0.16.2" }
+fff-ipc = { path = "../fff-ipc", version = "0.17.0" }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 libc = "0.2"
@@ -19,5 +19,5 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-fff-ipc = { path = "../fff-ipc", version = "0.16.2" }
+fff-ipc = { path = "../fff-ipc", version = "0.17.0" }
 libc = "0.2"
