@@ -36,15 +36,23 @@ _MAX_SUN_PATH = 100
 
 
 def _find_engine_binary():
-    """Locate a fff-engine built from THIS repo, under its target/ dirs."""
+    """Locate a fff-engine built from THIS repo, under its target/ dirs.
+
+    Picks the MOST RECENTLY BUILT binary across profiles. A stale binary from
+    before this branch speaks legacy bincode and would fail the JSON protocol
+    under test, so newest-by-mtime (not a fixed profile order) is what keeps the
+    live test pointed at the build that actually carries the protocol.
+    """
     here = Path(__file__).resolve()
     # clients/python/tests/ -> repo root is three levels up.
     repo_root = here.parents[3]
-    for profile in ("release", "debug"):
-        c = repo_root / "target" / profile / "fff-engine"
-        if c.is_file() and os.access(c, os.X_OK):
-            return c
-    return None
+    candidates = [
+        repo_root / "target" / profile / "fff-engine" for profile in ("release", "debug")
+    ]
+    existing = [c for c in candidates if c.is_file() and os.access(c, os.X_OK)]
+    if not existing:
+        return None
+    return max(existing, key=lambda c: c.stat().st_mtime)
 
 
 _ENGINE = _find_engine_binary()
