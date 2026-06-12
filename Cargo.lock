@@ -677,6 +677,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "parking_lot",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

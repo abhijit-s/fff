@@ -11,16 +11,19 @@ use std::{
 
 #[cfg(unix)]
 use fff_ipc::{
-    base_path_slug,
+    BAD_REQUEST, BasePathParams, HandshakeResult, INTERNAL, RequestEnvelope, ResponseEnvelope,
+    ResponseError, base_path_slug, check_protocol_version,
     config::WorkerConfig,
-    master_lockfile_path, master_socket_path, read_message,
+    decode_bincode, decode_json, looks_like_json, master_lockfile_path, master_socket_path,
+    protocol::verbs,
+    read_frame, read_message,
     routing::{RoutingTable, WorkerEntry},
     routing_table_path,
     types::{
         HealthReport, MasterRequest, MasterResponse, SearchRequest, SearchResponse, WorkerHealth,
         WorkerInfo,
     },
-    worker_socket_path, write_message,
+    worker_socket_path, write_json_message, write_message,
 };
 #[cfg(unix)]
 use tokio::{
@@ -203,6 +206,41 @@ impl MasterState {
             master_pid: std::process::id(),
             uptime_sec: self.started_at.elapsed().as_secs(),
             workers,
+        }
+    }
+
+    // Resolve a base_path to its worker socket + index. Routing-table hit
+    // returns immediately; a miss assigns a new root (may scale out). Shared by
+    // the bincode `Handshake` arm and the JSON `handshake` verb so both paths
+    // run identical routing logic.
+    async fn resolve_worker_socket(
+        self: &Arc<Self>,
+        base_path: &str,
+    ) -> Result<(String, u32), String> {
+        let slug = base_path_slug(std::path::Path::new(base_path));
+
+        let routing_hit = {
+            let routing = self.routing.lock().await;
+            routing.workers.iter().find_map(|(&idx, e)| {
+                if e.contains_slug(&slug) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+        };
+
+        if let Some(index) = routing_hit {
+            let socket = worker_socket_path(index).to_string_lossy().into_owned();
+            return Ok((socket, index));
+        }
+
+        match self.assign_new_root(base_path).await {
+            Some(index) => {
+                let socket = worker_socket_path(index).to_string_lossy().into_owned();
+                Ok((socket, index))
+            }
+            None => Err("no workers available".into()),
         }
     }
 
@@ -800,45 +838,29 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
 async fn handle_connection(stream: tokio::net::UnixStream, ms: Arc<MasterState>) {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
-    let req: MasterRequest = match read_message(&mut read_half).await {
+    // Dual-read: read one frame, sniff the first payload byte. `{` ⇒ versioned
+    // JSON envelope; anything else ⇒ legacy bincode (byte-for-byte unchanged).
+    let frame = match read_frame(&mut read_half).await {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    if looks_like_json(&frame) {
+        let resp = dispatch_master_json(&frame, &ms).await;
+        let _ = write_json_message(&mut write_half, &resp).await;
+        return;
+    }
+
+    let req: MasterRequest = match decode_bincode(&frame) {
         Ok(r) => r,
         Err(_) => return,
     };
 
     match req {
         MasterRequest::Handshake { base_path } => {
-            let slug = base_path_slug(std::path::Path::new(&base_path));
-
-            // Fast path: routing table hit — same worker, no mutation.
-            let routing_hit = {
-                let routing = ms.routing.lock().await;
-                routing.workers.iter().find_map(|(&idx, e)| {
-                    if e.contains_slug(&slug) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-            };
-
-            let resp = if let Some(index) = routing_hit {
-                let socket = worker_socket_path(index).to_string_lossy().into_owned();
-                MasterResponse::WorkerSocket {
-                    path: socket,
-                    worker_index: index,
-                }
-            } else {
-                // Routing miss — assign new root (may trigger scale-out).
-                match ms.assign_new_root(&base_path).await {
-                    Some(index) => {
-                        let socket = worker_socket_path(index).to_string_lossy().into_owned();
-                        MasterResponse::WorkerSocket {
-                            path: socket,
-                            worker_index: index,
-                        }
-                    }
-                    None => MasterResponse::Error("no workers available".into()),
-                }
+            let resp = match ms.resolve_worker_socket(&base_path).await {
+                Ok((path, worker_index)) => MasterResponse::WorkerSocket { path, worker_index },
+                Err(msg) => MasterResponse::Error(msg),
             };
             let _ = write_message(&mut write_half, &resp).await;
         }
@@ -888,6 +910,217 @@ async fn handle_connection(stream: tokio::net::UnixStream, ms: Arc<MasterState>)
         MasterRequest::Health => {
             let report = ms.collect_health().await;
             let _ = write_message(&mut write_half, &MasterResponse::HealthReport(report)).await;
+        }
+    }
+}
+
+// JSON dual-read dispatch for the master socket. Parses the versioned envelope,
+// enforces the version check (refuse-on-mismatch, R3/KTD4), then routes the verb
+// through the SAME helpers the bincode path uses. Returns the response envelope
+// to write; the caller closes the connection after a single request, matching
+// the bincode path's one-shot lifecycle.
+#[cfg(unix)]
+async fn dispatch_master_json(frame: &[u8], ms: &Arc<MasterState>) -> ResponseEnvelope {
+    let env: RequestEnvelope = match decode_json(frame) {
+        Ok(e) => e,
+        Err(e) => {
+            return ResponseEnvelope::err(ResponseError {
+                code: BAD_REQUEST.to_string(),
+                message: format!("malformed request envelope: {e}"),
+                engine_version: None,
+                client_version: None,
+            });
+        }
+    };
+
+    if let Err(mismatch) = check_protocol_version(env.protocol_version) {
+        return mismatch;
+    }
+
+    match env.verb.as_str() {
+        verbs::HANDSHAKE => {
+            let params: BasePathParams = match env.params_as() {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            match ms.resolve_worker_socket(&params.base_path).await {
+                Ok((worker_socket, worker_index)) => {
+                    let result = HandshakeResult {
+                        worker_socket,
+                        worker_index,
+                    };
+                    ok_or_internal(ResponseEnvelope::ok(&result))
+                }
+                Err(message) => ResponseEnvelope::err(ResponseError {
+                    code: INTERNAL.to_string(),
+                    message,
+                    engine_version: None,
+                    client_version: None,
+                }),
+            }
+        }
+
+        verbs::HEALTH => {
+            let report = ms.collect_health().await;
+            ok_or_internal(ResponseEnvelope::ok(&report))
+        }
+
+        // `list_roots` is a master verb handled in U4 — not implemented here.
+        other => ResponseEnvelope::err(ResponseError {
+            code: BAD_REQUEST.to_string(),
+            message: format!("unsupported master verb: {other}"),
+            engine_version: None,
+            client_version: None,
+        }),
+    }
+}
+
+// Collapse a result-serialization failure into an INTERNAL error envelope.
+#[cfg(unix)]
+fn ok_or_internal<E: std::fmt::Display>(r: Result<ResponseEnvelope, E>) -> ResponseEnvelope {
+    r.unwrap_or_else(|e| {
+        ResponseEnvelope::err(ResponseError {
+            code: INTERNAL.to_string(),
+            message: format!("failed to serialize result: {e}"),
+            engine_version: None,
+            client_version: None,
+        })
+    })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use fff_ipc::types::HealthReport;
+    use fff_ipc::{PROTOCOL_MISMATCH, PROTOCOL_VERSION};
+    use serde_json::json;
+
+    // A master state with one worker already holding `base_path`, so a handshake
+    // routing hit returns without spawning a real worker process.
+    fn state_with_root(base_path: &str) -> Arc<MasterState> {
+        let mut routing = RoutingTable::default();
+        let mut entry = WorkerEntry::new(0, worker_socket_path(0).to_string_lossy().into(), 1234);
+        let slug = base_path_slug(std::path::Path::new(base_path));
+        entry.push_root(slug, base_path.to_string());
+        routing.workers.insert(0, entry);
+
+        Arc::new(MasterState::new(
+            WorkerConfig::default(),
+            PathBuf::from("/nonexistent/fff-engine"),
+            routing,
+            HashRing::new(),
+            1,
+            HashMap::new(),
+        ))
+    }
+
+    fn frame_for(env: &RequestEnvelope) -> Vec<u8> {
+        serde_json::to_vec(env).unwrap()
+    }
+
+    #[tokio::test]
+    async fn json_handshake_returns_handshake_result() {
+        let base_path = "/tmp/fff-dual-read-test-root";
+        let ms = state_with_root(base_path);
+        let env = RequestEnvelope::new(verbs::HANDSHAKE, json!({ "base_path": base_path }));
+
+        let resp = dispatch_master_json(&frame_for(&env), &ms).await;
+
+        assert!(resp.ok, "expected ok, got {resp:?}");
+        assert_eq!(resp.protocol_version, PROTOCOL_VERSION);
+        let result: HandshakeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.worker_index, 0);
+        assert_eq!(
+            result.worker_socket,
+            worker_socket_path(0).to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    async fn json_handshake_version_mismatch_refuses_loud() {
+        let base_path = "/tmp/fff-dual-read-test-root";
+        let ms = state_with_root(base_path);
+        let mut env = RequestEnvelope::new(verbs::HANDSHAKE, json!({ "base_path": base_path }));
+        env.protocol_version = PROTOCOL_VERSION + 1;
+
+        let resp = dispatch_master_json(&frame_for(&env), &ms).await;
+
+        assert!(!resp.ok);
+        assert!(
+            resp.result.is_none(),
+            "must not return a worker socket on skew"
+        );
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, PROTOCOL_MISMATCH);
+        assert_eq!(err.engine_version, Some(PROTOCOL_VERSION));
+        assert_eq!(err.client_version, Some(PROTOCOL_VERSION + 1));
+    }
+
+    #[tokio::test]
+    async fn json_health_returns_health_report() {
+        // Empty routing table → no worker fan-out, report has no workers.
+        let ms = Arc::new(MasterState::new(
+            WorkerConfig::default(),
+            PathBuf::from("/nonexistent/fff-engine"),
+            RoutingTable::default(),
+            HashRing::new(),
+            0,
+            HashMap::new(),
+        ));
+        let env = RequestEnvelope::new(verbs::HEALTH, json!({}));
+
+        let resp = dispatch_master_json(&frame_for(&env), &ms).await;
+
+        assert!(resp.ok, "expected ok, got {resp:?}");
+        let report: HealthReport = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(report.master_pid, std::process::id());
+        assert!(report.workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_unknown_verb_is_bad_request() {
+        let ms = state_with_root("/tmp/fff-dual-read-test-root");
+        // `list_roots` is a master verb but lands in U4 — until then it is rejected.
+        let env = RequestEnvelope::new(verbs::LIST_ROOTS, json!({}));
+
+        let resp = dispatch_master_json(&frame_for(&env), &ms).await;
+
+        assert!(!resp.ok);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, BAD_REQUEST);
+        assert!(err.message.contains("unsupported master verb"));
+        assert!(err.message.contains("list_roots"));
+    }
+
+    // Regression (R5): the legacy bincode Handshake → WorkerSocket round-trip is
+    // byte-for-byte unchanged. We exercise the shared routing helper the bincode
+    // arm now calls, plus confirm the frame still sniffs as bincode (not JSON).
+    #[tokio::test]
+    async fn legacy_bincode_handshake_still_routes() {
+        let base_path = "/tmp/fff-dual-read-test-root";
+        let ms = state_with_root(base_path);
+
+        // Encode the legacy request exactly as a bincode client would.
+        let req = MasterRequest::Handshake {
+            base_path: base_path.to_string(),
+        };
+        let frame = bincode::serialize(&req).unwrap();
+        assert!(
+            !looks_like_json(&frame),
+            "legacy bincode frame must not sniff as JSON"
+        );
+
+        // The bincode arm routes through resolve_worker_socket; assert the same
+        // (path, index) the WorkerSocket response would carry.
+        let (path, index) = ms.resolve_worker_socket(base_path).await.unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(path, worker_socket_path(0).to_string_lossy());
+
+        // And the legacy decode path still yields the original request.
+        let decoded: MasterRequest = decode_bincode(&frame).unwrap();
+        match decoded {
+            MasterRequest::Handshake { base_path: bp } => assert_eq!(bp, base_path),
+            other => panic!("expected Handshake, got {other:?}"),
         }
     }
 }
