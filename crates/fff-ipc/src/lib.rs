@@ -7,7 +7,8 @@ pub mod routing;
 pub mod types;
 
 pub use codec::{
-    read_json_message, read_json_message_sync, read_message, read_message_sync, write_json_message,
+    decode_bincode, decode_json, read_frame, read_frame_sync, read_json_message,
+    read_json_message_sync, read_message, read_message_sync, write_json_message,
     write_json_message_sync, write_message, write_message_sync,
 };
 #[cfg(unix)]

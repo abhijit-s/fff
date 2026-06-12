@@ -161,6 +161,62 @@ where
     serde_json::from_slice(&payload).map_err(IpcError::JsonDecode)
 }
 
+// ── Dual-read frame primitives ───────────────────────────────────────────────
+//
+// Read one frame's payload bytes without committing to an encoding, so a
+// receiver can sniff `protocol::looks_like_json` and then decode the bytes as
+// JSON (versioned envelope) or bincode (legacy). MAX_FRAME_LEN is enforced;
+// first-frame requests are tiny, so the guard never trips legitimate legacy
+// traffic.
+
+/// Read one length-prefixed frame's payload bytes from an async stream.
+pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, IpcError> {
+    let mut len_buf = [0u8; 4];
+    reader
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(IpcError::Io)?;
+    let len = u32::from_le_bytes(len_buf);
+    if len > MAX_FRAME_LEN {
+        return Err(IpcError::FrameTooLarge {
+            len,
+            max: MAX_FRAME_LEN,
+        });
+    }
+    let mut payload = vec![0u8; len as usize];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(IpcError::Io)?;
+    Ok(payload)
+}
+
+/// Synchronous variant of [`read_frame`].
+pub fn read_frame_sync<R: Read>(reader: &mut R) -> Result<Vec<u8>, IpcError> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).map_err(IpcError::Io)?;
+    let len = u32::from_le_bytes(len_buf);
+    if len > MAX_FRAME_LEN {
+        return Err(IpcError::FrameTooLarge {
+            len,
+            max: MAX_FRAME_LEN,
+        });
+    }
+    let mut payload = vec![0u8; len as usize];
+    reader.read_exact(&mut payload).map_err(IpcError::Io)?;
+    Ok(payload)
+}
+
+/// Decode already-read frame bytes as bincode (legacy path).
+pub fn decode_bincode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, IpcError> {
+    bincode::deserialize(bytes).map_err(IpcError::Decode)
+}
+
+/// Decode already-read frame bytes as a JSON value (versioned path).
+pub fn decode_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, IpcError> {
+    serde_json::from_slice(bytes).map_err(IpcError::JsonDecode)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -215,6 +271,31 @@ mod tests {
             SearchResponse::Error(msg) => assert_eq!(msg, "oops"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[tokio::test]
+    async fn read_frame_sniffs_json_vs_bincode() {
+        use crate::protocol::{RequestEnvelope, looks_like_json, verbs};
+        use serde_json::json;
+
+        // JSON envelope frame → sniff true, decodes as envelope.
+        let (mut c1, mut s1) = duplex(4096);
+        let env = RequestEnvelope::new(verbs::HEALTH, json!({}));
+        write_json_message(&mut c1, &env).await.unwrap();
+        drop(c1);
+        let frame = read_frame(&mut s1).await.unwrap();
+        assert!(looks_like_json(&frame));
+        let back: RequestEnvelope = decode_json(&frame).unwrap();
+        assert_eq!(back.verb, verbs::HEALTH);
+
+        // Legacy bincode frame → sniff false, decodes as bincode.
+        let (mut c2, mut s2) = duplex(4096);
+        write_message(&mut c2, &SearchResponse::Ack).await.unwrap();
+        drop(c2);
+        let frame = read_frame(&mut s2).await.unwrap();
+        assert!(!looks_like_json(&frame));
+        let back: SearchResponse = decode_bincode(&frame).unwrap();
+        assert!(matches!(back, SearchResponse::Ack));
     }
 
     #[tokio::test]
