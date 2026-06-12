@@ -176,8 +176,12 @@ class FffClient:
     def list_roots(self) -> List[Dict[str, Any]]:
         """Enumerate targetable roots. Returns a list of ``WireRoot`` dicts:
         ``{base_path, name (str|None), default (bool)}``, default-first.
+
+        Route-enumeration is a **master-socket** verb, so this opens its own
+        master connection and does NOT require a prior :meth:`connect` — handy
+        for discovering a ``base_path`` before binding to one.
         """
-        return self._call("list_roots", {})
+        return self._call_master("list_roots", {})
 
     def list_recent_files(
         self, limit: int, dirty_only: bool = False
@@ -277,3 +281,12 @@ class FffClient:
         sock = self._require_worker()
         _protocol.write_message(sock, _protocol.build_request(verb, params))
         return self._read_result(sock)
+
+    def _call_master(self, verb: str, params: Dict[str, Any]) -> Any:
+        """One-shot call on a fresh master connection (master-socket verbs)."""
+        master = self._connect_socket(self._master_candidates())
+        try:
+            _protocol.write_message(master, _protocol.build_request(verb, params))
+            return self._read_result(master)
+        finally:
+            master.close()

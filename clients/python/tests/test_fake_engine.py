@@ -110,7 +110,19 @@ class _FakeEngine:
         class MasterHandler(socketserver.BaseRequestHandler):
             def handle(self):
                 req = _read_frame(self.request)
-                if req.get("verb") != "handshake":
+                verb = req.get("verb")
+                # list_roots is a master-socket verb (one-shot), like handshake.
+                if verb == "list_roots":
+                    _write_frame(
+                        self.request,
+                        {
+                            "protocol_version": PROTOCOL_VERSION,
+                            "ok": True,
+                            "result": _ROOTS_RESULT,
+                        },
+                    )
+                    return
+                if verb != "handshake":
                     return
                 if engine._handshake_error is not None:
                     _write_frame(
@@ -158,11 +170,13 @@ class _FakeEngine:
         self._worker.daemon_threads = True
 
     def _reply_for(self, verb):
+        # list_roots is intentionally NOT here — it's a master-socket verb; a
+        # real worker rejects it. Keeping it off the worker is what makes the
+        # test exercise the correct (master) route.
         result = {
             "connect": {"ack": True},
             "find_files": _FIND_RESULT,
             "grep": _GREP_RESULT,
-            "list_roots": _ROOTS_RESULT,
         }.get(verb, {})
         return {"protocol_version": PROTOCOL_VERSION, "ok": True, "result": result}
 

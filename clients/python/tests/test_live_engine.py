@@ -185,3 +185,19 @@ def test_live_grep_finds_content(repo, engine):
             assert "frecency_score" in m
     finally:
         client.close()
+
+
+def test_live_list_roots_includes_connected_root(repo, engine):
+    # Regression guard: list_roots is a MASTER-socket verb. Routing it to the
+    # worker (the original client bug) returns BAD_REQUEST against a real engine.
+    client = _connect_with_retry(repo, engine)
+    try:
+        roots = client.list_roots()
+        assert isinstance(roots, list)
+        base_paths = [r["base_path"] for r in roots]
+        resolved = str(repo.resolve())
+        assert any(bp == resolved or bp == str(repo) for bp in base_paths), base_paths
+        for r in roots:
+            assert "base_path" in r and "name" in r and "default" in r
+    finally:
+        client.close()
