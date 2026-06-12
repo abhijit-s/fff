@@ -12,13 +12,22 @@ use std::{
 };
 
 #[cfg(unix)]
+use fff_ipc::protocol::{
+    BasePathParams, FindFilesParams, GetGitStatusParams, GrepParams, ListDirectoriesParams,
+    ListRecentFilesParams, MultiGrepParams, RecordAccessParams, RequestEnvelope, ResponseEnvelope,
+    ResponseError, check_protocol_version, verbs,
+};
+#[cfg(unix)]
+use fff_ipc::{
+    BAD_REQUEST, decode_bincode, decode_json, looks_like_json, read_frame, read_message,
+    write_json_message, write_message,
+};
+#[cfg(unix)]
 use fff_ipc::{
     base_path_slug, master_lockfile_path, master_socket_path,
     types::{HealthResponse, MasterRequest, RootHealth, SearchRequest, SearchResponse},
     worker_lockfile_path, worker_socket_path, write_message_sync,
 };
-#[cfg(unix)]
-use fff_ipc::{read_message, write_message};
 #[cfg(unix)]
 use parking_lot::{Mutex, RwLock};
 #[cfg(unix)]
@@ -420,9 +429,34 @@ pub async fn run(_index: u32, _config: FffConfig) -> Result<(), Box<dyn std::err
 
 #[cfg(unix)]
 async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<WorkerState>) {
-    let (mut read_half, mut write_half) = tokio::io::split(stream);
+    let (mut read_half, write_half) = tokio::io::split(stream);
 
-    let base_path = match read_message(&mut read_half).await {
+    // Dual-read: sniff the first frame's leading byte. `{` ⇒ versioned JSON
+    // envelope; anything else ⇒ legacy bincode SearchRequest. The session stays
+    // in whichever mode it opened — response encoding mirrors request encoding.
+    let first = match read_frame(&mut read_half).await {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+
+    if looks_like_json(&first) {
+        handle_json_connection(first, read_half, write_half, ws).await;
+    } else {
+        handle_bincode_connection(first, read_half, write_half, ws).await;
+    }
+}
+
+// Legacy bincode path — byte-for-byte behaviorally identical to the pre-dual-read
+// worker (R5). The first frame's bytes are already read; decode them as a
+// SearchRequest and proceed exactly as before.
+#[cfg(unix)]
+async fn handle_bincode_connection(
+    first: Vec<u8>,
+    mut read_half: tokio::io::ReadHalf<tokio::net::UnixStream>,
+    mut write_half: tokio::io::WriteHalf<tokio::net::UnixStream>,
+    ws: Arc<WorkerState>,
+) {
+    let base_path = match decode_bincode::<SearchRequest>(&first) {
         Ok(SearchRequest::Connect { base_path }) => PathBuf::from(base_path),
         Ok(SearchRequest::Health) => {
             let health = ws.collect_health();
@@ -491,21 +525,7 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
                 break;
             }
             SearchRequest::RecordAccess { path } => {
-                let frecency = state.shared_frecency.clone();
-                let base = state.base_path.clone();
-                tokio::task::spawn_blocking(move || {
-                    let abs_path = if std::path::Path::new(&path).is_absolute() {
-                        PathBuf::from(&path)
-                    } else {
-                        base.join(&path)
-                    };
-                    if let Ok(guard) = frecency.read()
-                        && let Some(tracker) = guard.as_ref()
-                        && let Err(e) = tracker.track_access(&abs_path)
-                    {
-                        tracing::warn!(?abs_path, "RecordAccess failed: {e}");
-                    }
-                });
+                record_access(&state, path);
             }
             SearchRequest::SetLogLevel { level } => {
                 let response = match crate::set_log_level(&level) {
@@ -524,6 +544,221 @@ async fn handle_worker_connection(stream: tokio::net::UnixStream, ws: Arc<Worker
             }
         }
     }
+}
+
+// Versioned JSON path. First message must be `connect` (version-checked, then
+// loads the root and acks) or `health` (one-shot, then close); any other first
+// verb is rejected, mirroring the legacy "first message must be Connect"
+// discipline. A connection that opened JSON stays JSON for its lifetime.
+#[cfg(unix)]
+async fn handle_json_connection(
+    first: Vec<u8>,
+    mut read_half: tokio::io::ReadHalf<tokio::net::UnixStream>,
+    mut write_half: tokio::io::WriteHalf<tokio::net::UnixStream>,
+    ws: Arc<WorkerState>,
+) {
+    let env: RequestEnvelope = match decode_json(&first) {
+        Ok(e) => e,
+        Err(_) => {
+            let _ =
+                write_json_message(&mut write_half, &bad_request("malformed JSON envelope")).await;
+            return;
+        }
+    };
+
+    if let Err(mismatch) = check_protocol_version(env.protocol_version) {
+        let _ = write_json_message(&mut write_half, &mismatch).await;
+        return;
+    }
+
+    let state = match env.verb.as_str() {
+        verbs::CONNECT => {
+            let base_path = match env.params_as::<BasePathParams>() {
+                Ok(p) => PathBuf::from(p.base_path),
+                Err(err_env) => {
+                    let _ = write_json_message(&mut write_half, &err_env).await;
+                    return;
+                }
+            };
+            match ws.get_or_init(base_path).await {
+                Ok(s) => {
+                    let ack = ResponseEnvelope::ok(&serde_json::json!({ "ack": true }));
+                    match ack {
+                        Ok(env) if write_json_message(&mut write_half, &env).await.is_ok() => s,
+                        _ => return,
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("worker-{}: state init failed: {e}", ws.index);
+                    let _ = write_json_message(
+                        &mut write_half,
+                        &ResponseEnvelope::err(ResponseError {
+                            code: fff_ipc::INTERNAL.to_string(),
+                            message: e,
+                            engine_version: None,
+                            client_version: None,
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        verbs::HEALTH => {
+            let health = ws.collect_health();
+            if let Ok(env) = ResponseEnvelope::ok(&health) {
+                let _ = write_json_message(&mut write_half, &env).await;
+            }
+            return;
+        }
+        _ => {
+            let _ = write_json_message(
+                &mut write_half,
+                &bad_request("first JSON message must be 'connect' or 'health'"),
+            )
+            .await;
+            return;
+        }
+    };
+
+    json_request_loop(&state, &mut read_half, &mut write_half).await;
+}
+
+// Per-request JSON loop: decode each frame as a RequestEnvelope, map the verb to
+// the existing SearchRequest, reuse `dispatch_request`, then serialize the
+// returned SearchResponse as the JSON `result`. `record_access` is
+// fire-and-forget — it writes no response frame (parity with bincode).
+#[cfg(unix)]
+async fn json_request_loop(
+    state: &EngineState,
+    read_half: &mut tokio::io::ReadHalf<tokio::net::UnixStream>,
+    write_half: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
+) {
+    loop {
+        let frame = match read_frame(read_half).await {
+            Ok(f) => f,
+            Err(_) => break,
+        };
+        let env: RequestEnvelope = match decode_json(&frame) {
+            Ok(e) => e,
+            Err(_) => {
+                let _ =
+                    write_json_message(write_half, &bad_request("malformed JSON envelope")).await;
+                break;
+            }
+        };
+
+        // record_access is fire-and-forget: perform the write, send no frame.
+        if env.verb == verbs::RECORD_ACCESS {
+            match env.params_as::<RecordAccessParams>() {
+                Ok(p) => record_access(state, p.path),
+                Err(err_env) => {
+                    let _ = write_json_message(write_half, &err_env).await;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        let response = match envelope_to_request(&env) {
+            Ok(req) => {
+                let resp = crate::server::dispatch_request(state, req).await;
+                match crate::server::searchresponse_to_json_value(resp) {
+                    Ok(value) => match ResponseEnvelope::ok(&value) {
+                        Ok(env) => env,
+                        Err(_) => break,
+                    },
+                    Err(err) => ResponseEnvelope::err(err),
+                }
+            }
+            Err(err_env) => err_env,
+        };
+
+        if write_json_message(write_half, &response).await.is_err() {
+            break;
+        }
+    }
+}
+
+// Map a JSON request envelope to the existing SearchRequest. Returns a
+// BAD_REQUEST error envelope for unknown verbs or undeserializable params.
+#[cfg(unix)]
+fn envelope_to_request(env: &RequestEnvelope) -> Result<SearchRequest, ResponseEnvelope> {
+    let req = match env.verb.as_str() {
+        verbs::GREP => {
+            let p: GrepParams = env.params_as()?;
+            SearchRequest::Grep {
+                query: p.query,
+                options: p.options,
+            }
+        }
+        verbs::FIND_FILES => {
+            let p: FindFilesParams = env.params_as()?;
+            SearchRequest::FindFiles {
+                query: p.query,
+                options: p.options,
+            }
+        }
+        verbs::MULTI_GREP => {
+            let p: MultiGrepParams = env.params_as()?;
+            SearchRequest::MultiGrep {
+                patterns: p.patterns,
+                constraints: p.constraints,
+                options: p.options,
+            }
+        }
+        verbs::LIST_RECENT_FILES => {
+            let p: ListRecentFilesParams = env.params_as()?;
+            SearchRequest::ListRecentFiles {
+                limit: p.limit,
+                dirty_only: p.dirty_only,
+            }
+        }
+        verbs::GET_GIT_STATUS => {
+            let p: GetGitStatusParams = env.params_as()?;
+            SearchRequest::GetGitStatus {
+                include_clean: p.include_clean,
+            }
+        }
+        verbs::LIST_DIRECTORIES => {
+            let p: ListDirectoriesParams = env.params_as()?;
+            SearchRequest::ListDirectories { limit: p.limit }
+        }
+        other => {
+            return Err(bad_request(&format!("unknown verb '{other}'")));
+        }
+    };
+    Ok(req)
+}
+
+#[cfg(unix)]
+fn bad_request(message: &str) -> ResponseEnvelope {
+    ResponseEnvelope::err(ResponseError {
+        code: BAD_REQUEST.to_string(),
+        message: message.to_string(),
+        engine_version: None,
+        client_version: None,
+    })
+}
+
+// Shared fire-and-forget frecency write for both encodings.
+#[cfg(unix)]
+fn record_access(state: &EngineState, path: String) {
+    let frecency = state.shared_frecency.clone();
+    let base = state.base_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let abs_path = if std::path::Path::new(&path).is_absolute() {
+            PathBuf::from(&path)
+        } else {
+            base.join(&path)
+        };
+        if let Ok(guard) = frecency.read()
+            && let Some(tracker) = guard.as_ref()
+            && let Err(e) = tracker.track_access(&abs_path)
+        {
+            tracing::warn!(?abs_path, "RecordAccess failed: {e}");
+        }
+    });
 }
 
 // Merge a subsumed child's frecency history into the parent's DB, in-process,

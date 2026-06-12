@@ -216,3 +216,34 @@ pub(crate) async fn dispatch_request(
 
     response
 }
+
+// Convert a dispatched SearchResponse into the JSON `result` payload for the
+// versioned envelope. Error maps to an INTERNAL ResponseError; the result-bearing
+// Wire* variants serialize as-is, mirroring the bincode → JSON contract.
+pub(crate) fn searchresponse_to_json_value(
+    response: fff_ipc::types::SearchResponse,
+) -> Result<serde_json::Value, fff_ipc::ResponseError> {
+    use fff_ipc::types::SearchResponse;
+    let internal = |e: serde_json::Error| fff_ipc::ResponseError {
+        code: fff_ipc::INTERNAL.to_string(),
+        message: format!("failed to serialize result: {e}"),
+        engine_version: None,
+        client_version: None,
+    };
+    match response {
+        SearchResponse::GrepResults(w) => serde_json::to_value(w).map_err(internal),
+        SearchResponse::SearchResults(v) | SearchResponse::RecentFiles(v) => {
+            serde_json::to_value(v).map_err(internal)
+        }
+        SearchResponse::GitStatus(v) => serde_json::to_value(v).map_err(internal),
+        SearchResponse::Directories(v) => serde_json::to_value(v).map_err(internal),
+        SearchResponse::Health(h) => serde_json::to_value(h).map_err(internal),
+        SearchResponse::Ack => Ok(serde_json::json!({ "ack": true })),
+        SearchResponse::Error(message) => Err(fff_ipc::ResponseError {
+            code: fff_ipc::INTERNAL.to_string(),
+            message,
+            engine_version: None,
+            client_version: None,
+        }),
+    }
+}

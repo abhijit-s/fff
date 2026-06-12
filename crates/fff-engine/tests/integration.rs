@@ -2,10 +2,12 @@
 //! Integration tests for fff-engine covering:
 //! - U3: Worker socket binding, protocol enforcement, Connect/Ack, cleanup on SIGTERM
 //! - U4: Master lockfile, socket, single-instance guard, Handshake, ListWorkers,
-//!       WorkerStatus, routing.json persistence, startup with dead-PID routing.json, cleanup
+//!   WorkerStatus, routing.json persistence, startup with dead-PID routing.json, cleanup
 //! - U5: Routing table fast path, scale-out on roots_per_worker_max, stable re-routing,
-//!       routing.json updated after each Handshake mutation
+//!   routing.json updated after each Handshake mutation
 //! - U6: Worker crash detection and respawn, startup dead-vs-live PID recovery
+//! - U3 (JSON): dual-read connect+grep, fire-and-forget record_access, version
+//!   mismatch rejection, legacy bincode regression, bad first-verb rejection
 
 use std::{
     cell::RefCell,
@@ -18,10 +20,19 @@ use std::{
 };
 
 use fff_ipc::{
-    codec::{read_message_sync, write_message_sync},
+    codec::{
+        read_json_message_sync, read_message_sync, write_json_message_sync, write_message_sync,
+    },
+    protocol::{
+        BasePathParams, GrepParams, PROTOCOL_MISMATCH, PROTOCOL_VERSION, RecordAccessParams,
+        RequestEnvelope, ResponseEnvelope, verbs,
+    },
     routing::{RoutingTable, WorkerEntry},
-    types::{FindOptions, MasterRequest, MasterResponse, SearchRequest, SearchResponse},
+    types::{
+        FindOptions, GrepOptions, MasterRequest, MasterResponse, SearchRequest, SearchResponse,
+    },
 };
+use serde_json::json;
 use tempfile::TempDir;
 
 const ENGINE_BIN: &str = env!("CARGO_BIN_EXE_fff-engine");
@@ -251,6 +262,23 @@ impl TestEnv {
             matches!(resp, SearchResponse::Ack),
             "expected Ack from worker Connect, got {resp:?}"
         );
+        stream
+    }
+
+    /// JSON two-phase: connect to a worker socket, send a versioned `connect`
+    /// envelope, expect an ok ack response. Returns the open stream for verbs.
+    fn worker_connect_json(&self, worker_sock: &PathBuf, base_path: &str) -> UnixStream {
+        let mut stream = UnixStream::connect(worker_sock).expect("connect to worker");
+        let env = RequestEnvelope::new(
+            verbs::CONNECT,
+            serde_json::to_value(BasePathParams {
+                base_path: base_path.into(),
+            })
+            .unwrap(),
+        );
+        write_json_message_sync(&mut stream, &env).expect("write JSON connect");
+        let resp: ResponseEnvelope = read_json_message_sync(&mut stream).expect("read JSON ack");
+        assert!(resp.ok, "expected ok ack from JSON connect, got {resp:?}");
         stream
     }
 
@@ -1114,4 +1142,245 @@ fn worker_self_exits_when_master_dies_without_sigterm() {
         env.wait_socket_gone(&env.worker_socket(0), Duration::from_secs(10)),
         "orphaned worker-0 must self-exit after losing its master"
     );
+}
+
+// ── U3: JSON dual-read on the worker socket ───────────────────────────────────────
+
+/// U3-J1: JSON `connect` + `grep` returns a WireGrepResponse-shaped result with
+/// `frecency_score` present on each matched file.
+#[test]
+fn u3_json_connect_then_grep_returns_grep_response() {
+    let env = TestEnv::new();
+    let mut worker = env.spawn_worker(0);
+    assert!(env.wait_worker(0, SOCKET_TIMEOUT));
+
+    let project = env.dir.path().join("j1_project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("hello.rs"), b"fn needle() {}\n").unwrap();
+    let base_path = project.to_str().unwrap();
+
+    let mut stream = env.worker_connect_json(&env.worker_socket(0), base_path);
+
+    // Poll grep until the async scan indexes the file and a match appears.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let result = loop {
+        let req = RequestEnvelope::new(
+            verbs::GREP,
+            serde_json::to_value(GrepParams {
+                query: "needle".into(),
+                options: GrepOptions::default(),
+            })
+            .unwrap(),
+        );
+        write_json_message_sync(&mut stream, &req).expect("write JSON grep");
+        let resp: ResponseEnvelope = read_json_message_sync(&mut stream).expect("read JSON grep");
+        assert!(resp.ok, "grep should be ok, got {resp:?}");
+        let result = resp.result.expect("ok response carries a result");
+        let has_match = result["matches"].as_array().is_some_and(|m| !m.is_empty());
+        if has_match || std::time::Instant::now() >= deadline {
+            break result;
+        }
+        sleep(POLL_MS);
+    };
+
+    // WireGrepResponse shape: matches[].frecency_score is present.
+    assert!(
+        result["matches"].as_array().is_some_and(|m| !m.is_empty()),
+        "expected a grep match for 'needle', last result: {result:#?}"
+    );
+    let first = &result["matches"][0];
+    assert!(
+        first.get("frecency_score").is_some(),
+        "matched file must carry frecency_score: {first:#?}"
+    );
+    assert!(first.get("path").is_some(), "matched file must carry path");
+
+    sigterm_and_wait(&mut worker, Duration::from_secs(5));
+}
+
+/// U3-J2: JSON `record_access` is fire-and-forget — the worker writes and sends
+/// NO reply. We assert the socket has no frame waiting (read times out), and a
+/// subsequent grep still round-trips on the same connection (proving the worker
+/// did not enqueue a stray frame ahead of it).
+#[test]
+fn u3_json_record_access_sends_no_reply() {
+    let env = TestEnv::new();
+    let mut worker = env.spawn_worker(0);
+    assert!(env.wait_worker(0, SOCKET_TIMEOUT));
+
+    let project = env.dir.path().join("j2_project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("a.txt"), b"x").unwrap();
+    let base_path = project.to_str().unwrap();
+
+    let mut stream = env.worker_connect_json(&env.worker_socket(0), base_path);
+
+    let req = RequestEnvelope::new(
+        verbs::RECORD_ACCESS,
+        serde_json::to_value(RecordAccessParams {
+            path: "a.txt".into(),
+        })
+        .unwrap(),
+    );
+    write_json_message_sync(&mut stream, &req).expect("write JSON record_access");
+
+    // No reply must arrive: a short read times out rather than yielding a frame.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let no_reply: Result<ResponseEnvelope, _> = read_json_message_sync(&mut stream);
+    assert!(
+        no_reply.is_err(),
+        "record_access must send no reply, but a frame arrived: {no_reply:?}"
+    );
+
+    // The connection is still usable for a subsequent verb (no stray frame).
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let grep = RequestEnvelope::new(
+        verbs::GREP,
+        serde_json::to_value(GrepParams {
+            query: "x".into(),
+            options: GrepOptions::default(),
+        })
+        .unwrap(),
+    );
+    write_json_message_sync(&mut stream, &grep).expect("write JSON grep after record_access");
+    let resp: ResponseEnvelope = read_json_message_sync(&mut stream).expect("read JSON grep");
+    assert!(
+        resp.ok && resp.result.is_some(),
+        "grep after record_access should round-trip, got {resp:?}"
+    );
+
+    sigterm_and_wait(&mut worker, Duration::from_secs(5));
+}
+
+/// U3-J3: A JSON `connect` with an incompatible protocol_version is rejected
+/// with PROTOCOL_MISMATCH carrying both versions, and the connection closes.
+#[test]
+fn u3_json_connect_version_mismatch_is_rejected() {
+    let env = TestEnv::new();
+    let mut worker = env.spawn_worker(0);
+    assert!(env.wait_worker(0, SOCKET_TIMEOUT));
+
+    let base_path = env.dir.path().to_str().unwrap();
+    let mut stream = UnixStream::connect(env.worker_socket(0)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Hand-build an envelope with an incompatible version.
+    let bad = RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION + 1,
+        verb: verbs::CONNECT.into(),
+        params: json!({ "base_path": base_path }),
+    };
+    write_json_message_sync(&mut stream, &bad).expect("write mismatched connect");
+
+    let resp: ResponseEnvelope = read_json_message_sync(&mut stream).expect("read mismatch");
+    assert!(!resp.ok, "version mismatch must not be ok");
+    let err = resp.error.expect("error present");
+    assert_eq!(err.code, PROTOCOL_MISMATCH);
+    assert_eq!(err.engine_version, Some(PROTOCOL_VERSION));
+    assert_eq!(err.client_version, Some(PROTOCOL_VERSION + 1));
+
+    // Connection closes: next read hits EOF.
+    let after: Result<ResponseEnvelope, _> = read_json_message_sync(&mut stream);
+    assert!(
+        after.is_err(),
+        "worker should close after PROTOCOL_MISMATCH"
+    );
+
+    assert!(
+        worker.try_wait().expect("try_wait").is_none(),
+        "worker should survive a mismatched client"
+    );
+
+    sigterm_and_wait(&mut worker, Duration::from_secs(5));
+}
+
+/// U3-J4 (regression, R5): a legacy bincode `Connect` + `Grep` still round-trips
+/// on the same worker that now also speaks JSON.
+#[test]
+fn u3_bincode_connect_then_grep_still_round_trips() {
+    let env = TestEnv::new();
+    let mut worker = env.spawn_worker(0);
+    assert!(env.wait_worker(0, SOCKET_TIMEOUT));
+
+    let project = env.dir.path().join("j4_project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("legacy.rs"), b"fn marker() {}\n").unwrap();
+    let base_path = project.to_str().unwrap();
+
+    // Legacy bincode Connect → Ack (existing helper asserts Ack).
+    let mut stream = env.worker_connect(&env.worker_socket(0), base_path);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let matched = loop {
+        let req = SearchRequest::Grep {
+            query: "marker".into(),
+            options: GrepOptions::default(),
+        };
+        write_message_sync(&mut stream, &req).expect("write bincode grep");
+        let resp: SearchResponse = read_message_sync(&mut stream).expect("read bincode grep");
+        match resp {
+            SearchResponse::GrepResults(w) => {
+                if !w.matches.is_empty() {
+                    break true;
+                }
+            }
+            other => panic!("expected GrepResults, got {other:?}"),
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        sleep(POLL_MS);
+    };
+    assert!(matched, "legacy bincode grep must still return matches");
+
+    sigterm_and_wait(&mut worker, Duration::from_secs(5));
+}
+
+/// U3-J5: a non-`connect`/`health` JSON first message is rejected and the
+/// connection closes (mirrors the legacy first-message discipline).
+#[test]
+fn u3_json_non_connect_first_message_is_rejected() {
+    let env = TestEnv::new();
+    let mut worker = env.spawn_worker(0);
+    assert!(env.wait_worker(0, SOCKET_TIMEOUT));
+
+    let mut stream = UnixStream::connect(env.worker_socket(0)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // A `grep` as the very first JSON message — not connect/health.
+    let req = RequestEnvelope::new(
+        verbs::GREP,
+        serde_json::to_value(GrepParams {
+            query: "main".into(),
+            options: GrepOptions::default(),
+        })
+        .unwrap(),
+    );
+    write_json_message_sync(&mut stream, &req).expect("write bad first JSON");
+
+    let resp: ResponseEnvelope = read_json_message_sync(&mut stream).expect("read rejection");
+    assert!(!resp.ok, "bad first JSON verb must be rejected");
+    assert_eq!(resp.error.expect("error").code, fff_ipc::BAD_REQUEST);
+
+    // Connection closes afterward.
+    let after: Result<ResponseEnvelope, _> = read_json_message_sync(&mut stream);
+    assert!(
+        after.is_err(),
+        "worker should close after rejecting first verb"
+    );
+
+    assert!(
+        worker.try_wait().expect("try_wait").is_none(),
+        "worker should survive a bad first JSON message"
+    );
+
+    sigterm_and_wait(&mut worker, Duration::from_secs(5));
 }
