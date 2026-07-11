@@ -9,6 +9,7 @@ local M = {}
 --- @field min_list_height number
 --- @field show_scrollbar boolean
 --- @field path_shorten_strategy string
+--- @field border? 'single'|'double'|'rounded'|'solid'|'shadow'|'none' Border preset; falls back to `vim.o.winborder` when nil
 
 --- @class FffPreviewConfig
 --- @field enabled boolean
@@ -35,6 +36,8 @@ local M = {}
 --- @field cycle_grep_modes string
 --- @field cycle_previous_query string
 --- @field cycle_forward_query string
+--- @field grep_jump_to_next_file string|string[]
+--- @field grep_jump_to_prev_file string|string[]
 --- @field toggle_select string
 --- @field send_to_quickfix string
 --- @field focus_list string
@@ -59,6 +62,11 @@ local M = {}
 --- @field trim_whitespace boolean
 --- @field location_format string
 
+--- @alias FffSelectAction 'edit' | 'split' | 'vsplit' | 'tab'
+
+--- @class FffSelectConfig
+--- @field select_window fun(current_buf: integer, action: FffSelectAction): integer|nil
+
 --- @class FffConfig
 --- @field base_path string
 --- @field prompt string
@@ -68,12 +76,15 @@ local M = {}
 --- @field lazy_sync boolean
 --- @field prompt_vim_mode boolean
 --- @field follow_symlinks boolean
+--- @field enable_fs_root_scanning boolean
+--- @field enable_home_dir_scanning boolean
 --- @field layout FffLayoutConfig
 --- @field preview FffPreviewConfig
 --- @field keymaps FffKeymapsConfig
 --- @field hl table<string, string>
 --- @field frecency FffFrecencyConfig
 --- @field history FffHistoryConfig
+--- @field select FffSelectConfig
 --- @field git table
 --- @field debug table
 --- @field logging table
@@ -205,12 +216,20 @@ local function init()
     prompt_vim_mode = false, -- set to true to enable vim-mode in the prompt: <Esc> leaves insert for normal mode bindings (also allows <leader>p or <leader>l to jump around) the second <Esc> closes the picker
     wrap_around = false, -- set to true to wrap cursor to the opposite end when reaching the first/last item
     follow_symlinks = false, -- set to true to follow symbolic links during file indexing
+    -- Allow fff in the user's $HOME director.
+    enable_home_dir_scanning = true,
+    -- Allow fff in a filesystem root (e.g. `/`, `C:\`)
+    enable_fs_root_scanning = false,
     layout = {
       height = 0.8,
       width = 0.8,
       prompt_position = 'bottom', -- or 'top'
       preview_position = 'right', -- or 'left', 'right', 'top', 'bottom'
       preview_size = 0.5,
+      -- Border style for the picker windows: 'single', 'double', 'rounded',
+      -- 'solid', 'shadow' or 'none'. Leave unset (nil) to follow the global
+      -- `vim.o.winborder` setting.
+      border = nil,
       flex = { -- set to nil to disable flex layout
         size = 130, -- column threshold: if screen width >= size, use preview_position; otherwise use wrap
         wrap = 'top', -- position to use when screen is narrower than size
@@ -257,6 +276,9 @@ local function init()
       toggle_debug = '<F2>',
       -- grep mode: cycle between plain text, regex, and fuzzy search
       cycle_grep_modes = '<S-Tab>',
+      -- grep mode only: jump cursor to first item of next/prev file group
+      grep_jump_to_next_file = { '<C-A-n>', '<A-Down>' },
+      grep_jump_to_prev_file = { '<C-A-p>', '<A-Up>' },
       -- goes to the previous query in history
       cycle_previous_query = '<C-Up>',
       -- goes to the next query in history (forward)
@@ -343,6 +365,23 @@ local function init()
       min_combo_count = 3, -- Minimum selections before combo boost applies (3 = boost starts on 3rd selection)
       combo_boost_score_multiplier = 100, -- Score multiplier for combo matches (files repeatedly opened with same query)
     },
+    select = {
+      --- Returns winid to open the file in. Return nil to open in the invoking
+      --- window. Default retargets when the invoking window can't host a file
+      --- buffer (special buftype, non-modifiable, or winfixbuf).
+      --- @param current_buf integer
+      --- @param action FffSelectAction
+      --- @return integer|nil
+      select_window = function(current_buf, action)
+        if action ~= 'edit' then return nil end
+        local current_win = vim.api.nvim_get_current_win()
+        local buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
+        local modifiable = vim.api.nvim_get_option_value('modifiable', { buf = current_buf })
+        local winfixbuf = require('fff.utils').window_has_winfixbuf(current_win)
+        if buftype == '' and modifiable and not winfixbuf then return nil end
+        return require('fff.utils').find_suitable_window()
+      end,
+    },
     -- Git integration
     git = {
       status_text_color = false, -- Apply git status colors to filename text (default: false, only sign column)
@@ -362,8 +401,15 @@ local function init()
     },
     logging = {
       enabled = true,
+      -- Path-shape hint: each nvim startup writes a fresh sibling file
+      -- `<stem>+<UTC-timestamp>+<pid>.<ext>` next to this path. The literal
+      -- path itself is never written to — multiple concurrent nvim instances
+      -- get their own per-pid file with no locking.
       log_file = vim.fn.stdpath('log') .. '/fff.log',
       log_level = 'info',
+      -- How many session log files to retain. Newest are kept, older are
+      -- pruned on the next startup. Set to 0 to disable retention.
+      retain_runs = 20,
     },
     -- find_files settings
     file_picker = {
@@ -377,6 +423,11 @@ local function init()
       time_budget_ms = 150, -- Max search time in ms per call (prevents UI freeze, 0 = no limit)
       modes = { 'plain', 'regex', 'fuzzy' }, -- Available grep modes and their cycling order
       trim_whitespace = false, -- Strip leading whitespace from matched lines (useful for cleaner display)
+      -- Treat filename-like tokens (e.g. `score.rs`, `src/main.rs`) in a grep query as a
+      -- file-path filter, scoping the content search to matching files. When off, such
+      -- tokens are searched as literal text. A token is a filename if it has a valid-looking
+      -- extension and no wildcards.
+      enable_filename_constraint = false,
       -- Format string for the line/column location prefix in grep results.
       -- Uses vim's printf-style format: %d placeholders for line and column (1-based).
       -- Default ':%d:%d' renders as ':356:1'. Use ':%d' for line-only ':356'.

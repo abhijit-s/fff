@@ -127,6 +127,7 @@ export class FileFinder implements FileFinderApi {
       options.cacheBudgetMaxFileSize ?? 0,
       options.enableFsRootScanning ?? false,
       options.enableHomeDirScanning ?? false,
+      options.followSymlinks ?? false,
     );
 
     if (!result.ok) {
@@ -517,7 +518,7 @@ export class FileFinder implements FileFinderApi {
     if (!guard.ok) return guard;
 
     const deadline = Date.now() + timeoutMs;
-    while(true) {
+    while (true) {
       const progress = this.getScanProgress();
       if (!progress.ok) return progress;
       if (!progress.value.isScanning && progress.value.isWarmupComplete) {

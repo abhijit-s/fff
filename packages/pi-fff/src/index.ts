@@ -304,6 +304,21 @@ export default function fffExtension(pi: ExtensionAPI) {
     process.env.FFF_HISTORY_DB ??
     undefined;
 
+  // Root scanning opt-in: flag (boolean) > env ("1"/"true") > false.
+  // FFF refuses to init at / unless this is set. Home dir scanning is on by
+  // default for pi — launching pi from $HOME is a normal flow.
+  function resolveBoolOpt(flagName: string, envName: string): boolean {
+    const flag = pi.getFlag(flagName);
+    if (typeof flag === "boolean") return flag;
+    if (typeof flag === "string") return flag === "true" || flag === "1";
+    const env = process.env[envName];
+    return env === "1" || env === "true";
+  }
+  const enableFsRootScanning = resolveBoolOpt(
+    "fff-enable-root-scan",
+    "FFF_ENABLE_ROOT_SCAN",
+  );
+
   function getMode(): FffMode {
     return currentMode;
   }
@@ -333,6 +348,8 @@ export default function fffExtension(pi: ExtensionAPI) {
         frecencyDbPath,
         historyDbPath,
         aiMode: true,
+        enableHomeDirScanning: true,
+        enableFsRootScanning,
       });
 
       if (!result.ok)
@@ -386,11 +403,15 @@ export default function fffExtension(pi: ExtensionAPI) {
 
   function registerAutocompleteProvider(ctx: {
     ui: {
-      addAutocompleteProvider: (
+      addAutocompleteProvider?: (
         factory: (current: AutocompleteProvider) => AutocompleteProvider,
       ) => void;
     };
   }) {
+    // pi forks (e.g. omp) may not expose addAutocompleteProvider; skip UI wiring
+    // and let tools continue to work instead of failing session_start.
+    if (typeof ctx.ui.addAutocompleteProvider !== "function") return;
+
     ctx.ui.addAutocompleteProvider((current) => {
       const mentionProvider = createFffMentionProvider(getMentionItems);
 
@@ -441,9 +462,39 @@ export default function fffExtension(pi: ExtensionAPI) {
     type: "string",
   });
 
+  pi.registerFlag("fff-enable-root-scan", {
+    description:
+      "Allow indexing when launched from the filesystem root (also: FFF_ENABLE_ROOT_SCAN env)",
+    type: "boolean",
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     try {
       activeCwd = ctx.cwd;
+
+      // Restore persisted mode from session entries. This handles session
+      // resume after process restart where env vars are lost, and ensures
+      // the env var is set for the next /reload in the same session.
+      const entries = ctx.sessionManager?.getEntries();
+      if (entries) {
+        const modeEntry = [...entries]
+          .reverse()
+          .find(
+            (e: { type: string; customType?: string }) =>
+              e.type === "custom" && e.customType === "fff-mode",
+          );
+        if (
+          modeEntry &&
+          typeof (modeEntry as any).data?.mode === "string" &&
+          VALID_MODES.includes((modeEntry as any).data.mode as FffMode)
+        ) {
+          const restored = (modeEntry as any).data.mode as FffMode;
+          if (restored !== currentMode) {
+            currentMode = restored;
+          }
+        }
+      }
+
       registerAutocompleteProvider(ctx);
       await ensureFinder(activeCwd);
     } catch (e: unknown) {
@@ -897,8 +948,7 @@ export default function fffExtension(pi: ExtensionAPI) {
       if (!arg) {
         const mode = getMode();
         const flag = pi.getFlag("fff-mode") ?? "unset";
-        const env = process.env.PI_FFF_MODE ?? "unset";
-        ctx.ui.notify(`Current mode: '${mode}'\nFlag: ${flag}, Env: ${env}`, "info");
+        ctx.ui.notify(`Current mode: '${mode}' (flag: ${flag})`, "info");
         return;
       }
 
@@ -912,9 +962,11 @@ export default function fffExtension(pi: ExtensionAPI) {
       const oldMode = getMode();
       setMode(newMode);
 
+      pi.appendEntry("fff-mode", { mode: newMode });
+
       const note =
         (oldMode === "override") !== (newMode === "override")
-          ? " (tool name change requires restart)"
+          ? " (tool name change requires /reload)"
           : "";
       ctx.ui.notify(`Mode changed: '${oldMode}' → '${newMode}'${note}`, "info");
     },

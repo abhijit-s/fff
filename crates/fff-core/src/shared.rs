@@ -2,13 +2,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
-use crate::dbs::lmdb::spawn_lmdb_gc;
+use crate::dbs::lmdb::{LmdbStore, spawn_lmdb_gc};
 use crate::error::Error;
 use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
 use crate::query_tracker::QueryTracker;
 use crate::scan::ScanJob;
+use git2::Repository;
 
 /// Poll `.git/index.lock` until it disappears (git write completed), giving up
 /// after [`GIT_LOCK_MAX_WAIT`]. Used by [`SharedPicker::refresh_git_status`]
@@ -36,6 +37,19 @@ fn wait_for_git_index_lock_release(git_root: &Path) {
             lock.display()
         );
     }
+}
+
+/// Poll `done` every 10ms until it returns `true`, or until `timeout` elapses.
+/// Returns `true` if the condition was met, `false` on timeout.
+fn poll_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while !done() {
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
 }
 
 /// Thread-safe shared handle to the [`FilePicker`] instance.
@@ -99,6 +113,16 @@ impl SharedFilePicker {
         Ok(self.0.picker.write())
     }
 
+    /// Signal the background scan to cancel. Non-blocking: post-scan
+    /// threads check this flag and bail out at their next cancellation point.
+    pub fn cancel(&self) {
+        if let Ok(guard) = self.read()
+            && let Some(picker) = guard.as_ref()
+        {
+            picker.cancel();
+        }
+    }
+
     /// Produce a non-owning handle to the same inner picker.
     /// Use it if you don't need to block internal threads from dropping while owning this ref
     pub(crate) fn weaken(&self) -> WeakFilePicker {
@@ -125,14 +149,9 @@ impl SharedFilePicker {
             }
         };
 
-        let start = std::time::Instant::now();
-        while signal.load(std::sync::atomic::Ordering::Acquire) {
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        true
+        poll_until(timeout, || {
+            !signal.load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     /// Block until the background file watcher is ready.
@@ -146,14 +165,9 @@ impl SharedFilePicker {
             }
         };
 
-        let start = std::time::Instant::now();
-        while !watch_ready_signal.load(std::sync::atomic::Ordering::Acquire) {
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        true
+        poll_until(timeout, || {
+            watch_ready_signal.load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     /// Blocks until both the filesystem walk and post-scan indexing are done.
@@ -170,18 +184,10 @@ impl SharedFilePicker {
             }
         };
 
-        let start = std::time::Instant::now();
-        loop {
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            let s = scanning.load(std::sync::atomic::Ordering::Acquire);
-            let p = post_scan_active.load(std::sync::atomic::Ordering::Acquire);
-            if !s && !p {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        poll_until(timeout, || {
+            !scanning.load(std::sync::atomic::Ordering::Acquire)
+                && !post_scan_active.load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     /// Trigger a full filesystem rescan without blocking the caller.
@@ -211,19 +217,19 @@ impl SharedFilePicker {
         Ok(())
     }
 
-    /// Refresh git statuses for all indexed files.
+    /// Refresh git statuses for all indexed files
+    #[tracing::instrument(level = "info", skip_all)]
     pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
         use tracing::debug;
 
         let git_status = {
-            let guard = self.read()?;
-            let Some(ref picker) = *guard else {
-                return Err(Error::FilePickerMissing);
+            let git_root = {
+                let guard = self.read()?;
+                let Some(ref picker) = *guard else {
+                    return Err(Error::FilePickerMissing);
+                };
+                picker.git_root().map(|p| p.to_path_buf())
             };
-
-            let git_root = picker.git_root().map(|p| p.to_path_buf());
-            drop(guard); // updating git status could take very long time, there is not risky as we
-            // do not allow any mutations and deletions of files from the sync
 
             debug!(?git_root, "Refreshing git status for picker");
 
@@ -250,16 +256,62 @@ impl SharedFilePicker {
 
         Ok(statuses_count)
     }
+
+    /// Recompute and apply git status for a specific set of paths.
+    pub fn update_git_status_for_paths(
+        &self,
+        paths: &[PathBuf],
+        shared_frecency: &SharedFrecency,
+    ) -> Result<(), Error> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let git_root = {
+            let guard = self.read()?;
+            let Some(ref picker) = *guard else {
+                return Err(Error::FilePickerMissing);
+            };
+            picker.git_root().map(|p| p.to_path_buf())
+        };
+        let Some(git_root) = git_root else {
+            return Ok(());
+        };
+
+        wait_for_git_index_lock_release(&git_root);
+
+        let repo = Repository::open(&git_root)?;
+        let status = GitStatusCache::git_status_for_paths(&repo, paths)?;
+
+        let mut guard = self.write()?;
+        let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
+        picker.update_git_statuses(status, shared_frecency)
+    }
 }
 
-/// Thread-safe shared handle to the [`FrecencyTracker`] instance.
-#[derive(Clone)]
-pub struct SharedFrecency {
-    inner: Arc<RwLock<Option<FrecencyTracker>>>,
+/// Thread-safe shared handle to an LMDB-backed store. A disabled (`noop`)
+/// instance silently ignores writes. See the [`SharedFrecency`] and
+/// [`SharedQueryTracker`] aliases.
+///
+/// `LmdbStore` is intentionally crate-private, so the store type is sealed:
+/// only `FrecencyTracker` / `QueryTracker` can ever instantiate this.
+#[allow(private_bounds)]
+pub struct SharedDb<T: LmdbStore> {
+    inner: Arc<RwLock<Option<T>>>,
     enabled: bool,
 }
 
-impl Default for SharedFrecency {
+// Hand-written to avoid a spurious `T: Clone` bound — `Arc` is always `Clone`.
+impl<T: LmdbStore> Clone for SharedDb<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            enabled: self.enabled,
+        }
+    }
+}
+
+impl<T: LmdbStore> Default for SharedDb<T> {
     fn default() -> Self {
         Self {
             inner: Arc::new(RwLock::new(None)),
@@ -268,13 +320,14 @@ impl Default for SharedFrecency {
     }
 }
 
-impl std::fmt::Debug for SharedFrecency {
+impl<T: LmdbStore> std::fmt::Debug for SharedDb<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SharedFrecency").field(&"..").finish()
+        f.debug_tuple("SharedDb").field(&T::LABEL).finish()
     }
 }
 
-impl SharedFrecency {
+#[allow(private_bounds)]
+impl<T: LmdbStore> SharedDb<T> {
     /// Creates a disabled instance that silently ignores all writes.
     pub fn noop() -> Self {
         Self {
@@ -283,15 +336,16 @@ impl SharedFrecency {
         }
     }
 
-    pub fn read(&self) -> Result<RwLockReadGuard<'_, Option<FrecencyTracker>>, Error> {
+    pub fn read(&self) -> Result<RwLockReadGuard<'_, Option<T>>, Error> {
         self.inner.read().map_err(|_| Error::AcquireFrecencyLock)
     }
 
-    pub fn write(&self) -> Result<RwLockWriteGuard<'_, Option<FrecencyTracker>>, Error> {
+    pub fn write(&self) -> Result<RwLockWriteGuard<'_, Option<T>>, Error> {
         self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
     }
 
-    pub fn init(&self, tracker: FrecencyTracker) -> Result<(), Error> {
+    /// Initialize the store + spawn GC in the background. No-op when disabled.
+    pub fn init(&self, tracker: T) -> Result<(), Error> {
         if !self.enabled {
             return Ok(());
         }
@@ -301,8 +355,7 @@ impl SharedFrecency {
             *guard = Some(tracker);
         }
 
-        // GC holds a read guard on this lock, so destroy / re-init wait
-        // for it naturally — no join handle, no race against file removal.
+        // GC holds a read guard on this lock, so destroy / re-init wait won't race
         spawn_lmdb_gc(self.inner.clone());
         Ok(())
     }
@@ -313,14 +366,13 @@ impl SharedFrecency {
     /// access) are finished before the LMDB environment is closed and the files
     /// are removed.
     ///
-    /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no
-    /// tracker was initialized.
+    /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no tracker was initialized.
     pub fn destroy(&self) -> Result<Option<PathBuf>, Error> {
         let mut guard = self.write()?;
         let Some(tracker) = guard.take() else {
             return Ok(None);
         };
-        let db_path = tracker.db_path().to_path_buf();
+        let db_path = tracker.env().path().to_path_buf();
         // Drop closes the LMDB env and unmaps the files
         drop(tracker);
         drop(guard);
@@ -332,80 +384,8 @@ impl SharedFrecency {
     }
 }
 
+/// Thread-safe shared handle to the [`FrecencyTracker`] instance.
+pub type SharedFrecency = SharedDb<FrecencyTracker>;
+
 /// Thread-safe shared handle to the [`QueryTracker`] instance.
-#[derive(Clone)]
-pub struct SharedQueryTracker {
-    inner: Arc<RwLock<Option<QueryTracker>>>,
-    enabled: bool,
-}
-
-impl Default for SharedQueryTracker {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(None)),
-            enabled: true,
-        }
-    }
-}
-
-impl std::fmt::Debug for SharedQueryTracker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SharedQueryTracker").field(&"..").finish()
-    }
-}
-
-impl SharedQueryTracker {
-    /// Creates a disabled instance that silently ignores all writes.
-    pub fn noop() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(None)),
-            enabled: false,
-        }
-    }
-
-    pub fn read(&self) -> Result<RwLockReadGuard<'_, Option<QueryTracker>>, Error> {
-        self.inner.read().map_err(|_| Error::AcquireFrecencyLock)
-    }
-
-    pub fn write(&self) -> Result<RwLockWriteGuard<'_, Option<QueryTracker>>, Error> {
-        self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
-    }
-
-    /// Initialize the query tracker + spawn GC in the background.
-    /// No-op if this is a disabled instance.
-    pub fn init(&self, tracker: QueryTracker) -> Result<(), Error> {
-        if !self.enabled {
-            return Ok(());
-        }
-        {
-            let mut guard = self.write()?;
-            *guard = Some(tracker);
-        }
-
-        spawn_lmdb_gc(self.inner.clone());
-        Ok(())
-    }
-
-    ///Drop the in-memory tracker and delete the on-disk database directory.
-    ///
-    /// Acquires the write lock, ensuring all readers (including any active mmap
-    /// access) are finished before the LMDB environment is closed and the files
-    /// are removed.
-    ///
-    /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no
-    /// tracker was initialized.
-    pub fn destroy(&self) -> Result<Option<PathBuf>, Error> {
-        let mut guard = self.write()?;
-        let Some(tracker) = guard.take() else {
-            return Ok(None);
-        };
-        let db_path = tracker.db_path().to_path_buf();
-        drop(tracker);
-        drop(guard);
-        std::fs::remove_dir_all(&db_path).map_err(|source| Error::RemoveDbDir {
-            path: db_path.clone(),
-            source,
-        })?;
-        Ok(Some(db_path))
-    }
-}
+pub type SharedQueryTracker = SharedDb<QueryTracker>;

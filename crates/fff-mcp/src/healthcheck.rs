@@ -82,13 +82,31 @@ pub fn run_healthcheck(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 4. Log file
-    if let Some(ref log_path) = args.log_file {
-        let parent_ok = std::path::Path::new(log_path)
+    // 4. Query history database
+    if let Some(ref db_path) = args.history_db_path {
+        let parent_ok = std::path::Path::new(db_path)
             .parent()
             .is_some_and(|p| p.is_dir());
         all_ok &= check(
-            "Log file",
+            "History DB",
+            parent_ok,
+            if parent_ok {
+                db_path
+            } else {
+                "parent directory does not exist"
+            },
+        );
+    } else {
+        check("History DB", false, "path not resolved");
+    }
+
+    // 5. Log path hint (per-session files written next to this path)
+    if let Some(ref log_path) = args.log_file {
+        let parent_ok = std::path::Path::new(log_path)
+            .parent()
+            .is_some_and(|p| p.is_dir() || p.parent().is_some());
+        all_ok &= check(
+            "Log path",
             parent_ok,
             if parent_ok {
                 log_path
@@ -97,7 +115,7 @@ pub fn run_healthcheck(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             },
         );
     } else {
-        check("Log file", false, "path not resolved");
+        check("Log path", false, "path not resolved");
     }
 
     if all_ok {

@@ -116,7 +116,7 @@ pub const MCP_INSTRUCTIONS: &str = concat!(
     "- **record_access**: Tell fff you opened a file. The file will rank higher in future find_files and list_recent_files results. Call this after reading a key file.",
 );
 
-/// FFF MCP Server — high-performance file finder for AI code assistants.
+/// FFF MCP Server -- a high performance & accuracy file finder for AI code assistants.
 #[derive(Parser)]
 #[command(name = "fff-mcp", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("FFF_GIT_HASH"), ")"))]
 pub(crate) struct Args {
@@ -145,7 +145,8 @@ pub(crate) struct Args {
     #[allow(dead_code)]
     history_db_path: Option<String>,
 
-    /// Path to the log file.
+    /// Path-shape hint for per-session log files.
+    /// Each fff-mcp startup writes a fresh sibling file `<stem>+<UTC-timestamp>+<pid>.<ext>`
     #[arg(long = "log-file")]
     log_file: Option<String>,
 
@@ -185,6 +186,11 @@ pub(crate) struct Args {
     #[arg(long = "max-cached-files", env = "FFF_MAX_CACHED_FILES")]
     max_cached_files: Option<usize>,
 
+    /// Follow symlinks during scan and watcher walks. Off by default —
+    /// enabling on cyclic symlink layouts can wedge the watcher.
+    #[arg(long = "follow-symlinks")]
+    follow_symlinks: bool,
+
     /// Run a health check and print diagnostic information, then exit.
     #[arg(long = "healthcheck")]
     pub(crate) healthcheck: bool,
@@ -197,6 +203,14 @@ pub(crate) struct Args {
     /// Print a shell completion script to stdout and exit.
     #[arg(long = "completions", value_name = "SHELL")]
     completions: Option<clap_complete::Shell>,
+
+    /// Exit after this many seconds of inactivity. 0 = never exit.
+    #[arg(
+        long = "idle-timeout-secs",
+        env = "FFF_MCP_IDLE_TIMEOUT_SECS",
+        default_value_t = 900
+    )]
+    idle_timeout_secs: u64,
 }
 
 /// Assemble a `RootRegistry` from CLI args + an optional `--config` TOML.
@@ -335,13 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let log_file = args.log_file.as_deref().unwrap_or("");
-    if std::env::var("RUST_LOG").is_err()
-        && let Some(level) = args.log_level.as_deref()
-    {
-        // SAFETY: single-threaded at this point — no other threads exist yet.
-        unsafe { std::env::set_var("RUST_LOG", level) };
-    }
-    if let Err(e) = fff::log::init_tracing(log_file, Some("info")) {
+    if let Err(e) = fff::log::init_tracing(log_file, args.log_level.as_deref(), None) {
         eprintln!("Warning: Failed to init tracing: {}", e);
     }
 
@@ -448,7 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache_budget: args
                 .max_cached_files
                 .map(fff::ContentCacheBudget::new_for_repo),
-            follow_symlinks: false,
+            follow_symlinks: args.follow_symlinks,
             ..Default::default()
         },
     )
@@ -459,7 +467,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create and start the MCP server
-    let server = FffServer::new(shared_picker.clone(), shared_frecency.clone());
+    let server = FffServer::new(shared_picker.clone(), shared_frecency);
+    let last_activity = server.last_activity();
+    let idle_timeout_secs = args.idle_timeout_secs;
 
     // Wait for initial scan in background — don't block server startup
     let picker_clone_for_scan = shared_picker.clone();
@@ -480,10 +490,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let service = server
-        .serve(stdio())
-        .await
-        .map_err(|e| format!("Failed to start MCP server: {}", e))?;
+    const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let service = match tokio::time::timeout(STARTUP_TIMEOUT, server.serve(stdio())).await {
+        Ok(res) => res.map_err(|e| format!("Failed to start MCP server: {}", e))?,
+        Err(_) => {
+            return Err("MCP initialize handshake did not complete within 60s".into());
+        }
+    };
+
+    if idle_timeout_secs > 0 {
+        last_activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        let last_activity_for_watchdog = last_activity.clone();
+        tokio::spawn(async move {
+            let tick = std::time::Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(tick).await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                let last = last_activity_for_watchdog.load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(last) >= idle_timeout_secs {
+                    tracing::info!(
+                        "Exiting after {}s of inactivity (idle_timeout_secs={})",
+                        now.saturating_sub(last),
+                        idle_timeout_secs
+                    );
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
     let picker_for_shutdown = shared_picker.clone();
     tokio::spawn(async move {

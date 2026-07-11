@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .to_string_lossy()
                 .into()
         });
-        if let Err(e) = fff::log::init_tracing(&log_path_str, Some("info")) {
+        if let Err(e) = fff::log::init_tracing(&log_path_str, Some("info"), None) {
             eprintln!("Warning: failed to init tracing: {e}");
         }
         tracing::info!("fff-engine master starting");
@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .to_string_lossy()
                 .into()
         });
-        if let Err(e) = fff::log::init_tracing(&log_path_str, Some("info")) {
+        if let Err(e) = fff::log::init_tracing(&log_path_str, Some("info"), None) {
             eprintln!("Warning: failed to init tracing: {e}");
         }
         tracing::info!("fff-engine worker-{index} starting");
@@ -127,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(&default_log_str)
         .to_string();
 
-    if let Err(e) = fff::log::init_tracing(&log_path, Some("info")) {
+    if let Err(e) = fff::log::init_tracing(&log_path, Some("info"), None) {
         eprintln!("Warning: failed to init tracing: {e}");
     }
 

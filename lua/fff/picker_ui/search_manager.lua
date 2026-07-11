@@ -101,7 +101,14 @@ function M.update_results_sync()
 
   if S.suggestion_items and #S.suggestion_items > 0 then S.filtered_items = S.suggestion_items end
 
-  S.cursor = 1
+  -- On resume, restore the saved cursor onto the fresh results (clamped, since
+  -- the result set may have changed since close). Otherwise reset to the top.
+  if S.pending_restore_cursor then
+    S.cursor = math.max(1, math.min(S.pending_restore_cursor, #S.filtered_items))
+    S.pending_restore_cursor = nil
+  else
+    S.cursor = 1
+  end
 
   P.render_debounced()
 end
@@ -315,11 +322,18 @@ function M.cycle_forward_query()
   if not P.state.active then return end
 
   if S.history_offset == nil then
-    S.history_offset = 0
-  elseif S.history_offset > 0 then
-    S.history_offset = S.history_offset - 1
-  else
+    -- At top of stack (fresh open or resume with pre-filled input).
+    -- Clear input to return to a clean slate.
+    S.history_offset = nil
+    vim.api.nvim_buf_set_lines(S.input_buf, 0, -1, false, { S.config.prompt })
     return
+  elseif S.history_offset == 0 then
+    -- At the most recent history entry, go back to present
+    S.history_offset = nil
+    vim.api.nvim_buf_set_lines(S.input_buf, 0, -1, false, { S.config.prompt })
+    return
+  else
+    S.history_offset = S.history_offset - 1
   end
 
   local fuzzy = require('fff.core').ensure_initialized()

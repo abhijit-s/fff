@@ -57,9 +57,11 @@ M.get_suggestion_renderer = search_manager.get_suggestion_renderer
 -- Wire renderer module (list rendering, scroll, empty state)
 renderer.init(M)
 M.render_list = renderer.render_list
+M.render_after_cursor_move = renderer.render_after_cursor_move
 
 -- Wire preview_manager module (preview rendering, debounce, clear)
 preview_manager.init(M)
+M.close_preview_timer = preview_manager.close_preview_timer
 M.update_preview_debounced = preview_manager.update_preview_debounced
 M.update_preview_smart = preview_manager.update_preview_smart
 M.update_preview_title = preview_manager.update_preview_title
@@ -74,6 +76,8 @@ M.move_up = navigation.move_up
 M.move_down = navigation.move_down
 M.scroll_preview_up = navigation.scroll_preview_up
 M.scroll_preview_down = navigation.scroll_preview_down
+M.grep_jump_to_next_file = navigation.grep_jump_to_next_file
+M.grep_jump_to_prev_file = navigation.grep_jump_to_prev_file
 
 -- Expose helpers used by navigation
 M.scroll_to_bottom = renderer.scroll_to_bottom
@@ -81,7 +85,174 @@ M.scroll_to_bottom = renderer.scroll_to_bottom
 -- Wire layout_manager module (relayout, close)
 layout_manager.init(M)
 M.relayout = layout_manager.relayout
-M.close = layout_manager.close
+
+--- @class fff.ResumeState
+--- @field files table|nil Snapshot from last find_files session
+--- @field grep table|nil Snapshot from last live_grep session
+--- @field last_mode 'files'|'grep'|nil Mode of the most recently closed picker
+local resume_state = { files = nil, grep = nil, last_mode = nil }
+
+--- Save the current picker state for later resume, then close.
+function M.close()
+  if M.state.query == '' then
+    layout_manager.close()
+    return
+  end
+  if not M.state.active then return end
+
+  local snapshot = vim.deepcopy(M.state)
+  snapshot.base_path = M.state.config and M.state.config.base_path or nil
+
+  if M.state.mode == 'grep' then
+    resume_state.grep = snapshot
+    resume_state.last_mode = 'grep'
+  else
+    resume_state.files = snapshot
+    resume_state.last_mode = 'files'
+  end
+
+  layout_manager.close()
+end
+
+--- Internal: restore picker from a saved state snapshot.
+---@param state table The saved state table
+---@param source_label string Label for error messages
+---@return boolean
+local function restore_from_state(state, source_label)
+  -- Ensure the file picker is initialized
+  if not file_picker.is_initialized() then
+    if not file_picker.setup() then
+      vim.notify('Failed to initialize file picker', vim.log.levels.ERROR)
+      return false
+    end
+  end
+
+  -- Restore the picker with the saved config and mode
+  M.state.renderer = state.renderer
+  M.state.mode = state.mode
+  M.state.grep_config = state.grep_config
+  M.state.grep_mode = state.grep_mode
+  M.state.selected_files = vim.deepcopy(state.selected_files or {})
+  M.state.selected_file_order = vim.deepcopy(state.selected_file_order or {})
+  M.state.selected_items = vim.deepcopy(state.selected_items or {})
+
+  -- Restore the saved base_path for the indexer if it differs from the current CWD
+  if state.base_path then require('fff.core').change_indexing_directory(state.base_path) end
+
+  -- Use the saved config directly to restore the exact picker state
+  M.state.config = state.config
+
+  if not M.create_ui() then
+    vim.notify('FFF: failed to create picker UI for ' .. source_label, vim.log.levels.ERROR)
+    return false
+  end
+
+  M.state.active = true
+  M.state.current_file_cache = state.current_file_cache
+
+  -- Restore the full picker state
+  M.state.query = state.query
+  M.state.items = state.items or {}
+  M.state.filtered_items = state.filtered_items or {}
+  M.state.cursor = math.min(state.cursor or 1, #(state.filtered_items or {}))
+  M.state.cursor = math.max(M.state.cursor, 1)
+  M.state.location = state.location
+  M.state.pagination = vim.deepcopy(state.pagination or {
+    page_index = 0,
+    page_size = 20,
+    total_matched = 0,
+    prefetch_margin = 5,
+    grep_file_offsets = {},
+    grep_next_file_offset = 0,
+  })
+  M.state.combo_visible = state.combo_visible ~= false
+  M.state.combo_initial_cursor = state.combo_initial_cursor
+  M.state.suggestion_items = state.suggestion_items
+  M.state.suggestion_source = state.suggestion_source
+
+  -- Writing the query below triggers on_lines -> on_input_change, which re-runs
+  -- the search (results may have changed since close). Stash the saved cursor so
+  -- that re-search restores the position instead of resetting it to the top.
+  if state.query and state.query ~= '' then
+    M.state.pending_restore_cursor = M.state.cursor
+    vim.api.nvim_buf_set_lines(M.state.input_buf, 0, -1, false, { M.state.config.prompt .. state.query })
+  end
+
+  -- Render the restored state
+  M.render_list()
+  M.update_preview()
+  M.update_status()
+
+  vim.api.nvim_set_current_win(M.state.input_win)
+
+  -- Position cursor at end of query
+  vim.schedule(function()
+    if M.state.active and M.state.input_win and vim.api.nvim_win_is_valid(M.state.input_win) then
+      local prompt_len = #M.state.config.prompt
+      vim.api.nvim_win_set_cursor(M.state.input_win, { 1, prompt_len + #state.query })
+      vim.cmd('stopinsert')
+    end
+  end)
+
+  return true
+end
+
+--- Close any active picker before resuming so the user can re-trigger
+--- resume to recreate the previous results without manually closing first.
+local function close_active_for_resume()
+  if M.state.active then layout_manager.close() end
+end
+
+---@return boolean|nil true if a picker was resumed, false otherwise
+function M.resume()
+  close_active_for_resume()
+
+  if resume_state.last_mode == 'grep' then
+    return M.resume_live_grep()
+  elseif resume_state.last_mode == 'files' then
+    return M.resume_find_files()
+  end
+
+  if resume_state.grep then return restore_from_state(resume_state.grep, 'grep resume') end
+  if resume_state.files then return restore_from_state(resume_state.files, 'files resume') end
+
+  return M.open()
+end
+
+--- Resume the last file picker (find_files mode).
+--- Falls back to opening a new find_files picker if nothing to resume.
+---@param opts? table Optional config overrides for fallback open
+---@return boolean|nil
+function M.resume_find_files(opts)
+  close_active_for_resume()
+
+  if not resume_state.files then return M.open(opts) end
+
+  return restore_from_state(resume_state.files, 'find_files resume')
+end
+
+--- Resume the last live_grep picker.
+--- Falls back to opening a new live_grep picker if nothing to resume.
+---@param opts? table Optional config overrides for fallback open
+---@return boolean
+function M.resume_live_grep(opts)
+  close_active_for_resume()
+
+  if not resume_state.grep then
+    local config = conf.get()
+    local grep_renderer = require('fff.picker_ui.grep_renderer')
+    local grep_config = vim.tbl_deep_extend('force', config.grep or {}, (opts and opts.grep) or {})
+    M.open(vim.tbl_deep_extend('force', {
+      mode = 'grep',
+      renderer = grep_renderer,
+      grep_config = grep_config,
+      title = 'Live Grep',
+    }, opts or {}))
+    return true
+  end
+
+  return restore_from_state(resume_state.grep, 'live_grep resume')
+end
 
 function M.toggle_debug()
   local config_changed = conf.toggle_debug()
@@ -96,6 +267,7 @@ function M.toggle_debug()
     local current_grep_config = M.state.grep_config
     local current_filtered_items = M.state.filtered_items
     local current_selected_files = M.state.selected_files
+    local current_selected_file_order = M.state.selected_file_order
     local current_selected_items = M.state.selected_items
 
     M.close()
@@ -111,6 +283,7 @@ function M.toggle_debug()
     M.state.grep_mode = current_grep_mode
     M.state.filtered_items = current_filtered_items
     M.state.selected_files = current_selected_files
+    M.state.selected_file_order = current_selected_file_order
     M.state.selected_items = current_selected_items
     M.render_list()
     M.update_preview()
@@ -244,18 +417,6 @@ end
 --- pcall-guarded so this stays safe on Neovim versions that predate the option.
 local window_has_winfixbuf = utils.window_has_winfixbuf
 
---- Find the first visible window with a normal file buffer, skipping the
---- picker's own floats.
---- @return number|nil Window ID of the first suitable window, or nil if none found
-local function find_suitable_window()
-  local exclude = {}
-  exclude[M.state.input_win or -1] = true
-  exclude[M.state.list_win or -1] = true
-  exclude[M.state.preview_win or -1] = true
-  exclude[M.state.file_info_win or -1] = true
-  return utils.find_suitable_window(exclude)
-end
-
 --- Toggle selection for the current item.
 --- In grep mode, selection is per-occurrence; in file mode, per-file.
 function M.toggle_select()
@@ -299,9 +460,16 @@ function M.select(action)
   local query = M.state.query -- Capture query before closing for tracking
   local mode = M.state.mode -- Capture mode before closing for tracking
   local suggestion_source = M.state.suggestion_source -- Capture suggestion context
+  local config = M.state.config -- Capture config before M.close() resets state
 
   -- In grep mode (or when selecting a grep suggestion), derive location from the match item
   local is_grep_item = mode == 'grep' or suggestion_source == 'grep'
+
+  -- When opening with selections active, open every selected file. The first
+  -- selected file is focused; the rest are added as listed buffers.
+  local selected_file_entries = {}
+  if action == 'edit' and not is_grep_item then selected_file_entries = picker_ui_state.get_selected_file_entries() end
+
   if is_grep_item and item.line_number and item.line_number > 0 then
     location = { line = item.line_number }
     if item.col and item.col > 0 then
@@ -326,52 +494,78 @@ function M.select(action)
     end
   end
 
+  -- The focused file is the first selection, which may differ from the cursor
+  -- item; a cursor-derived location no longer applies, so drop it.
+  if #selected_file_entries > 0 and selected_file_entries[1].relative_path ~= item.relative_path then location = nil end
+
   vim.cmd('stopinsert')
   M.close()
+
+  local on_submit = config and config.on_submit
 
   -- Defer file open past picker float teardown. Without this, foldexpr is not
   -- recomputed on the new window (folds appear missing) on some platforms.
   vim.schedule(function()
-    if action == 'edit' then
-      local current_win = vim.api.nvim_get_current_win()
-      local current_buf = vim.api.nvim_get_current_buf()
-      local current_buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
-      local current_buf_modifiable = vim.api.nvim_get_option_value('modifiable', { buf = current_buf })
-      local current_winfixbuf = window_has_winfixbuf(current_win)
-
-      -- If the current window can't host a new buffer (special buftype, non-modifiable,
-      -- or 'winfixbuf' locking it), retarget a suitable window or fall back to a split.
-      -- Without this, :edit raises E1513 ("Cannot switch buffer. 'winfixbuf' is enabled")
-      -- whenever the picker is invoked from a window pinned via :h winfixbuf.
-      local opened_via_split = false
-      if current_buftype ~= '' or not current_buf_modifiable or current_winfixbuf then
-        local suitable_win = find_suitable_window()
-        if suitable_win then
-          vim.api.nvim_set_current_win(suitable_win)
-        elseif current_winfixbuf then
-          vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
-          opened_via_split = true
+    if type(on_submit) == 'function' then
+      local ok, err = pcall(on_submit, item, {
+        action = action,
+        path = abs_path,
+        relative_path = relative_path,
+        location = location,
+        query = query,
+        mode = mode,
+      })
+      if not ok then vim.notify('FFF: on_submit error: ' .. tostring(err), vim.log.levels.ERROR) end
+    else
+      if config and config.select and type(config.select.select_window) == 'function' then
+        local ok, win = pcall(config.select.select_window, vim.api.nvim_get_current_buf(), action)
+        if not ok then
+          vim.notify('FFF: select.select_window error: ' .. tostring(win), vim.log.levels.WARN)
+        elseif type(win) == 'number' and vim.api.nvim_win_is_valid(win) then
+          vim.api.nvim_set_current_win(win)
         end
       end
 
-      if not opened_via_split then vim.cmd('edit ' .. vim.fn.fnameescape(relative_path)) end
-    elseif action == 'split' then
-      vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
-    elseif action == 'vsplit' then
-      vim.cmd('vsplit ' .. vim.fn.fnameescape(relative_path))
-    elseif action == 'tab' then
-      vim.cmd('tabedit ' .. vim.fn.fnameescape(relative_path))
+      if action == 'edit' then
+        -- Add every additional selection as a listed buffer before focusing one.
+        for _, entry in ipairs(selected_file_entries) do
+          local buf = vim.fn.bufadd(entry.edit_path)
+          vim.bo[buf].buflisted = true
+        end
+
+        local edit_path = #selected_file_entries > 0 and selected_file_entries[1].edit_path or relative_path
+
+        -- Hard guard against E1513 ("Cannot switch buffer. 'winfixbuf' is enabled"):
+        -- if the (post-hook) current window is pinned, fall back to :split.
+        local opened_via_split = false
+        if window_has_winfixbuf(vim.api.nvim_get_current_win()) then
+          vim.cmd('split ' .. vim.fn.fnameescape(edit_path))
+          opened_via_split = true
+        end
+
+        if not opened_via_split then vim.cmd('edit ' .. vim.fn.fnameescape(edit_path)) end
+      elseif action == 'split' then
+        vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
+      elseif action == 'vsplit' then
+        vim.cmd('vsplit ' .. vim.fn.fnameescape(relative_path))
+      elseif action == 'tab' then
+        vim.cmd('tabedit ' .. vim.fn.fnameescape(relative_path))
+      end
+
+      if location then location_utils.jump_to_location(location) end
     end
 
-    if location then location_utils.jump_to_location(location) end
-
     if query and query ~= '' then
-      local config = conf.get()
-      if config.history and config.history.enabled then
+      local cfg = config or conf.get()
+      if cfg.history and cfg.history.enabled then
         local fff = require('fff.core').ensure_initialized()
         -- Track in background thread (non-blocking, handled by Rust)
         if mode == 'grep' then
           pcall(fff.track_grep_query, query)
+        elseif #selected_file_entries > 0 then
+          for _, entry in ipairs(selected_file_entries) do
+            pcall(fff.track_query_completion, query, entry.relative_path)
+          end
         else
           pcall(fff.track_query_completion, query, item.relative_path)
         end
@@ -531,6 +725,7 @@ function M.open(opts)
   if M.state.active then return end
 
   M.state.selected_files = {}
+  M.state.selected_file_order = {}
   M.state.selected_items = {}
   M.state.renderer = opts and opts.renderer or nil
   M.state.mode = opts and opts.mode or nil

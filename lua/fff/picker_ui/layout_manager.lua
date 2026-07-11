@@ -102,18 +102,12 @@ function M.close()
   for _, buf in ipairs(buffers) do
     if buf and vim.api.nvim_buf_is_valid(buf) then
       vim.api.nvim_buf_clear_namespace(buf, -1, 0, -1)
-
       if buf == S.preview_buf then preview.clear_buffer(buf) end
-
       vim.api.nvim_buf_delete(buf, { force = true })
     end
   end
 
-  if S.preview_timer then
-    S.preview_timer:stop()
-    S.preview_timer:close()
-    S.preview_timer = nil
-  end
+  P.close_preview_timer()
 
   S.input_win = nil
   S.list_win = nil
@@ -126,6 +120,9 @@ function M.close()
   S.preview_visible = false
   S.items = {}
   S.filtered_items = {}
+  S.line_to_item = {}
+  S.item_to_lines = {}
+  S.last_render_ctx = nil
   S.cursor = 1
   S.query = ''
   S.ns_id = nil
@@ -134,6 +131,7 @@ function M.close()
   S.current_file_cache = nil
   S.location = nil
   S.selected_files = {}
+  S.selected_file_order = {}
   S.selected_items = {}
   S.mode = nil
   S.grep_config = nil

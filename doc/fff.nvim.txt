@@ -1,5 +1,5 @@
 *fff.nvim.txt*
-                             For Neovim >= 0.10.0    Last change: 2026 June 02
+                             For Neovim >= 0.10.0    Last change: 2026 June 30
 
 ==============================================================================
 Table of Contents                                 *fff.nvim-table-of-contents*
@@ -46,9 +46,10 @@ LAZY.NVIM
           function() require('fff').live_grep({ grep = { modes = { 'fuzzy', 'plain' } } }) end,
           desc = 'Live fffuzy grep',
         },
-        { "fc",
-          function() require('fff').live_grep({ query = vim.fn.expand("<cword>") }) end,
-          desc = 'Search current word',
+        { "fw",
+          function() require('fff').live_grep_under_cursor() end,
+          mode = { 'n', 'x' },
+          desc = 'Search current word / selection',
         },
       },
     }
@@ -84,6 +85,7 @@ PUBLIC API ~
 >lua
     require('fff').find_files()                        -- find files in current repo
     require('fff').live_grep()                         -- live content grep
+    require('fff').live_grep_under_cursor()            -- grep <cword> in normal, selection in visual
     require('fff').scan_files()                        -- force rescan
     require('fff').refresh_git_status()                -- refresh git status
     require('fff').find_files_in_dir(path)             -- find in a specific dir
@@ -182,12 +184,21 @@ Defaults are sensible. Override only what you care about.
       max_threads = 4,
       lazy_sync = true,
       prompt_vim_mode = false,
+      follow_symlinks = false,
+      -- Allow indexing the user's $HOME directory. Enabled by default.
+      -- Disable if you strictly sure you don't want this, as it makes whole fff error hard
+      enable_home_dir_scanning = true,
+      -- Allow indexing a filesystem root (e.g. `/`, `C:\`). Disabled by default
+      enable_fs_root_scanning = false,
       layout = {
         height = 0.8,
         width = 0.8,
         prompt_position = 'bottom',   -- or 'top'
         preview_position = 'right',   -- 'left' | 'right' | 'top' | 'bottom'
         preview_size = 0.5,
+        -- Border style for the picker windows. Leave unset (nil) to follow the
+        -- global `vim.o.winborder`; set it to override fff's borders independently.
+        border = nil, -- 'single' | 'double' | 'rounded' | 'solid' | 'shadow' | 'none'
         flex = { size = 130, wrap = 'top' },
         min_list_height = 10, --  do not display anything except the list below this threshold
         show_scrollbar = true,
@@ -221,6 +232,9 @@ Defaults are sensible. Override only what you care about.
         preview_scroll_down = '<C-d>',
         toggle_debug = '<F2>',
         cycle_grep_modes = '<S-Tab>',
+        -- grep mode only: jump cursor to first match of next/prev file group
+        grep_jump_to_next_file = { '<C-A-n>', '<A-Down>' },
+        grep_jump_to_prev_file = { '<C-A-p>', '<A-Up>' },
         cycle_previous_query = '<C-Up>',
         toggle_select = '<Tab>',
         send_to_quickfix = '<C-q>',
@@ -240,6 +254,10 @@ Defaults are sensible. Override only what you care about.
       git = {
         status_text_color = false, -- true to color filenames by git status
       },
+      select = {
+        -- Return winid to open the chosen file in, or nil to open in the original window
+        select_window = function(current_buf, action) --[[ default impl ]] end,
+      },
       grep = {
         max_file_size = 10 * 1024 * 1024,
         max_matches_per_file = 100,
@@ -247,6 +265,7 @@ Defaults are sensible. Override only what you care about.
         time_budget_ms = 150,
         modes = { 'plain', 'regex', 'fuzzy' },
         trim_whitespace = false,
+        enable_filename_constraint = false, -- treat filename-like tokens (e.g. `score.rs`) in a grep query as a file-path filter scoping the search; off = searched as literal text
         location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
       },
       debug = {
@@ -266,9 +285,11 @@ Defaults are sensible. Override only what you care about.
         },
       },
       logging = {
-        enabled = true,
+        -- logs will be written in a parent directory of this file path in files like
+        -- `<stem>+<UTC-timestamp>+<pid>.<ext>`. Run :FFFOpenLog to open current one
         log_file = vim.fn.stdpath('log') .. '/fff.log',
         log_level = 'info',
+        retain_runs = 20,
       },
     })
 <
@@ -303,6 +324,25 @@ Grep-only:
 - `src/main.rs`. Grep inside a single file.
 
 Mix freely: `git:modified src/**/*.rs !src/**/mod.rs user controller`.
+
+
+OPEN IN INVOKING WINDOW ~
+
+By default fff.nvim will try to open a file in the most suitable window, so any
+non-file buffers are not affected. You can customize or disable this by
+providing:
+
+>lua
+    require('fff').setup({
+      select = {
+        select_window = function(_current_buf, _action) return nil end,
+      },
+    })
+<
+
+Caveat: the chosen file replaces the buffer in the invoking window even if
+it’s a non-modifiable / special buftype. `winfixbuf` windows still fall back
+to `:split` to avoid `E1513`.
 
 
 MULTI-SELECT AND QUICKFIX ~
@@ -356,16 +396,15 @@ disabled individually via `debug.show_file_info`.
 
 Customise the panel via `hl`:
 
-  -----------------------------------------------------------------------
+  --------------------------------------------------------------------------
   key                     default           used for
-  ----------------------- ----------------- -----------------------------
+  ----------------------- ----------------- --------------------------------
   file_info_section       Title             section header label
 
   file_info_separator     FloatBorder       dashes that act as section
                                             borders
 
-  file_info_label         Comment           row labels (Size, Type, Git,
-                                            …)
+  file_info_label         Comment           row labels (Size, Type, Git, …)
 
   file_info_value         Normal fg         plain values
 
@@ -385,7 +424,7 @@ Customise the panel via `hl`:
   file_info_score_pos     DiagnosticOk      positive score components
 
   file_info_score_neg     DiagnosticError   negative score components
-  -----------------------------------------------------------------------
+  --------------------------------------------------------------------------
 
 FILE FILTERING ~
 
@@ -403,7 +442,9 @@ Run `:FFFScan` to force a rescan.
 TROUBLESHOOTING ~
 
 - `:FFFHealth` verifies picker init, optional dependencies, and DB connectivity.
-- `:FFFOpenLog` opens the log file.
+- `:FFFOpenLog` opens the current session’s log file.
+- Historical log files are stored near the main log file `<state>/log/fff+<UTC-timestamp>+<pid>.log` (up to 20 files)
+- For a crash backtrace, run `lldb -- nvim` or `gdb -- nvim` and reproduce
 
 Generated by panvimdoc <https://github.com/kdheepak/panvimdoc>
 

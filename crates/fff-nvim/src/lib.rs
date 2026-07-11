@@ -5,8 +5,8 @@ use fff::frecency::FrecencyTracker;
 use fff::path_utils::expand_tilde;
 use fff::query_tracker::QueryTracker;
 use fff::{
-    DbHealthChecker, DirSearchConfig, Error, FFFMode, FileSearchConfig, FuzzySearchOptions,
-    GrepConfig, MixedSearchConfig, PaginationArgs, QueryParser, Score, SearchResult,
+    DbHealthChecker, DirSearchConfig, Error, FFFMode, FFFQuery, FileSearchConfig,
+    FuzzySearchOptions, MixedSearchConfig, PaginationArgs, QueryParser, Score, SearchResult,
     SharedFilePicker, SharedFrecency, SharedQueryTracker,
 };
 use mimalloc::MiMalloc;
@@ -15,12 +15,14 @@ use once_cell::sync::Lazy;
 use path_shortening::PathShortenStrategy;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use user_config::{NvimGrepConfig, UserConfigOptions, set_global_user_config};
 
 mod error;
 mod hex_dump;
 mod log;
 mod lua_types;
 mod path_shortening;
+mod user_config;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -57,9 +59,51 @@ pub fn destroy_query_db(_: &Lua, _: ()) -> LuaResult<bool> {
     Ok(QUERY_TRACKER.destroy().into_lua_result()?.is_some())
 }
 
+/// Opts table accepted by `init_file_picker` / `restart_index_in_path`.
+/// Backwards compat: positional `follow_symlinks: bool` argument still works
+/// — callers that pass a table use the named fields instead.
+#[derive(Default)]
+struct PickerInitOpts {
+    follow_symlinks: bool,
+    enable_fs_root_scanning: bool,
+    enable_home_dir_scanning: bool,
+    enable_filename_constraint: bool,
+}
+
+impl PickerInitOpts {
+    fn from_lua_value(value: Option<mlua::Value>) -> LuaResult<Self> {
+        let Some(value) = value else {
+            return Ok(Self::default());
+        };
+        match value {
+            mlua::Value::Nil => Ok(Self::default()),
+            mlua::Value::Boolean(b) => Ok(Self {
+                follow_symlinks: b,
+                ..Default::default()
+            }),
+            mlua::Value::Table(t) => Ok(Self {
+                follow_symlinks: t.get::<Option<bool>>("follow_symlinks")?.unwrap_or(false),
+                enable_fs_root_scanning: t
+                    .get::<Option<bool>>("enable_fs_root_scanning")?
+                    .unwrap_or(false),
+                enable_home_dir_scanning: t
+                    .get::<Option<bool>>("enable_home_dir_scanning")?
+                    .unwrap_or(false),
+                enable_filename_constraint: t
+                    .get::<Option<bool>>("enable_filename_constraint")?
+                    .unwrap_or(false),
+            }),
+            other => Err(LuaError::RuntimeError(format!(
+                "init opts must be a table, boolean, or nil — got {}",
+                other.type_name()
+            ))),
+        }
+    }
+}
+
 pub fn init_file_picker(
     _: &Lua,
-    (base_path, follow_symlinks): (String, Option<bool>),
+    (base_path, opts): (String, Option<mlua::Value>),
 ) -> LuaResult<bool> {
     {
         let guard = FILE_PICKER.read().into_lua_result()?;
@@ -67,6 +111,11 @@ pub fn init_file_picker(
             return Ok(false);
         }
     }
+
+    let opts = PickerInitOpts::from_lua_value(opts)?;
+    set_global_user_config(UserConfigOptions {
+        enable_filename_constraint: opts.enable_filename_constraint,
+    });
 
     FilePicker::new_with_shared_state(
         FILE_PICKER.clone(),
@@ -76,7 +125,9 @@ pub fn init_file_picker(
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Neovim,
-            follow_symlinks: follow_symlinks.unwrap_or(false),
+            follow_symlinks: opts.follow_symlinks,
+            enable_fs_root_scanning: opts.enable_fs_root_scanning,
+            enable_home_dir_scanning: opts.enable_home_dir_scanning,
             ..Default::default()
         },
     )
@@ -85,7 +136,10 @@ pub fn init_file_picker(
     Ok(true)
 }
 
-pub fn restart_index_in_path(_: &Lua, new_path: String) -> LuaResult<()> {
+pub fn restart_index_in_path(
+    _: &Lua,
+    (new_path, opts): (String, Option<mlua::Value>),
+) -> LuaResult<()> {
     let path = std::path::PathBuf::from(&new_path);
     if !path.exists() {
         return Err(LuaError::RuntimeError(format!(
@@ -97,6 +151,11 @@ pub fn restart_index_in_path(_: &Lua, new_path: String) -> LuaResult<()> {
     let canonical_path = fff::path_utils::canonicalize(&path).map_err(|e| {
         LuaError::RuntimeError(format!("Failed to canonicalize path '{}': {}", new_path, e))
     })?;
+
+    let opts = PickerInitOpts::from_lua_value(opts)?;
+    set_global_user_config(UserConfigOptions {
+        enable_filename_constraint: opts.enable_filename_constraint,
+    });
 
     // Spawn a background thread BEFORE touching the picker lock. The
     // same-dir short-circuit previously called `FILE_PICKER.read()` on
@@ -112,7 +171,11 @@ pub fn restart_index_in_path(_: &Lua, new_path: String) -> LuaResult<()> {
             ?canonical_path,
             "restart_index_in_path: spawned worker running"
         );
-        {
+
+        // Inherit current picker's scanning flags when caller didn't pass
+        // explicit opts — otherwise a `:cd ~` after init would silently lose
+        // the user's `enable_home_dir_scanning = true` setting.
+        let (follow_symlinks, fs_root, home_dir) = {
             let guard = match FILE_PICKER.read() {
                 Ok(g) => g,
                 Err(_) => return,
@@ -124,7 +187,20 @@ pub fn restart_index_in_path(_: &Lua, new_path: String) -> LuaResult<()> {
                 tracing::info!(?canonical_path, "restart_index_in_path: same dir, skipping");
                 return;
             }
-        }
+
+            match guard.as_ref() {
+                Some(p) => (
+                    p.follows_symlinks() || opts.follow_symlinks,
+                    p.fs_root_scanning_enabled() || opts.enable_fs_root_scanning,
+                    p.home_dir_scanning_enabled() || opts.enable_home_dir_scanning,
+                ),
+                None => (
+                    opts.follow_symlinks,
+                    opts.enable_fs_root_scanning,
+                    opts.enable_home_dir_scanning,
+                ),
+            }
+        };
 
         ::tracing::info!(
             ?canonical_path,
@@ -141,6 +217,9 @@ pub fn restart_index_in_path(_: &Lua, new_path: String) -> LuaResult<()> {
                 enable_mmap_cache: true,
                 enable_content_indexing: true,
                 mode: FFFMode::Neovim,
+                follow_symlinks,
+                enable_fs_root_scanning: fs_root,
+                enable_home_dir_scanning: home_dir,
                 ..Default::default()
             },
         ) {
@@ -210,11 +289,9 @@ pub fn fuzzy_search_files(
         "Fuzzy search parameters"
     );
 
-    let parser = QueryParser::new(FileSearchConfig);
-    let parsed = parser.parse(&query);
-
+    let parsed_query = FFFQuery::parse(&query, FileSearchConfig);
     let results = picker.fuzzy_search(
-        &parsed,
+        &parsed_query,
         query_tracker_guard.as_ref(),
         FuzzySearchOptions {
             max_threads,
@@ -230,7 +307,7 @@ pub fn fuzzy_search_files(
     );
 
     if results.items.is_empty() && query.contains(std::path::MAIN_SEPARATOR) {
-        let pure_query = match &parsed.fuzzy_query {
+        let pure_query = match &parsed_query.fuzzy_query {
             fff_query_parser::FuzzyQuery::Text(t) => t.trim(),
             _ => query.trim(),
         };
@@ -247,7 +324,7 @@ pub fn fuzzy_search_files(
                     }],
                     total_matched: 1,
                     total_files: results.total_files,
-                    location: parsed.location,
+                    location: parsed_query.location,
                 };
 
                 return lua_types::SearchResultLua::new(found, picker).into_lua(lua);
@@ -376,7 +453,7 @@ pub fn live_grep(
         return Err(error::to_lua_error(Error::FilePickerMissing));
     };
 
-    let parsed = fff::grep::parse_grep_query(&query);
+    let parsed_query = FFFQuery::parse(&query, NvimGrepConfig);
     let mode = match grep_mode.as_deref() {
         Some("regex") => fff::GrepMode::Regex,
         Some("fuzzy") => fff::GrepMode::Fuzzy,
@@ -398,7 +475,7 @@ pub fn live_grep(
         abort_signal: None,
     };
 
-    let result = picker.grep(&parsed, &options);
+    let result = picker.grep(&parsed_query, &options);
     lua_types::GrepResultLua::new(result, picker).into_lua(lua)
 }
 
@@ -706,10 +783,10 @@ pub fn get_historical_grep_query(_: &Lua, offset: usize) -> LuaResult<Option<Str
 
 /// Parse a grep query string and return its text portion (with constraints stripped).
 ///
-/// Uses the Rust `GrepConfig` parser as the single source of truth, so Lua
-/// code never needs to re-implement constraint detection.
+/// Uses the Neovim grep parser config so filename-constraint detection follows
+/// the user's setting, keeping Lua from re-implementing constraint detection.
 pub fn parse_grep_query(lua: &Lua, query: String) -> LuaResult<LuaTable> {
-    let parser = QueryParser::new(GrepConfig);
+    let parser = QueryParser::new(NvimGrepConfig);
     let parsed = parser.parse(&query);
     let table = lua.create_table()?;
     table.set("grep_text", parsed.grep_text())?;
@@ -724,9 +801,9 @@ pub fn wait_for_initial_scan(_: &Lua, timeout_ms: Option<u64>) -> LuaResult<bool
 
 pub fn init_tracing(
     _: &Lua,
-    (log_file_path, log_level): (String, Option<String>),
+    (log_file_path, log_level, retain_runs): (String, Option<String>, Option<usize>),
 ) -> LuaResult<String> {
-    crate::log::init_tracing(&log_file_path, log_level.as_deref())
+    crate::log::init_tracing(&log_file_path, log_level.as_deref(), retain_runs)
         .map_err(|e| LuaError::RuntimeError(format!("Failed to initialize tracing: {}", e)))
 }
 
@@ -948,8 +1025,9 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
 // https://github.com/mlua-rs/mlua/issues/318
 #[mlua::lua_module(skip_memory_check)]
 fn fff_nvim(lua: &Lua) -> LuaResult<LuaTable> {
-    // Install panic hook IMMEDIATELY on module load
-    // This ensures any panics are logged even if init_tracing is never called
+    // Install panic hook + SIGSEGV chain handler IMMEDIATELY on module load.
+    // Without this, a crash inside fff produces a silent nvim death — neovim's
+    // own handler does not log a Rust-side backtrace.
     crate::log::install_panic_hook();
 
     create_exports(lua)

@@ -14,11 +14,13 @@ name = "fff_mcp"
 path = "src/lib.rs"
 
 [features]
-default = ["zlob"]
-zlob = ["fff/zlob"]
+# Pure-Rust walker by default; opt into zlob explicitly (needs Zig).
+default = ["ripgrep"]
+ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep"]
+zlob = ["fff/zlob", "fff-query-parser/zlob"]
 
 [dependencies]
-fff = { package = "fff-search", path = "../fff-core", default-features = false , version = "0.17.0" }
+fff = { package = "fff-search", path = "../fff-core", default-features = false , version = "0.17.0", features = ["definitions"] }
 fff-ipc = { path = "../fff-ipc", version = "0.17.0" }
 fff-query-parser = { path = "../fff-query-parser", default-features = false , version = "0.17.0" }
 dirs = { workspace = true }

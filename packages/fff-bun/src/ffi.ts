@@ -10,6 +10,7 @@
 
 import { CString, dlopen, FFIType, type Pointer, ptr, read } from "bun:ffi";
 import { findBinary } from "./download";
+import { embeddedLibPath } from "./embedded";
 import type {
   DirItem,
   DirSearchResult,
@@ -290,15 +291,32 @@ let lib: FFFLibrary | null = null;
 function loadLibrary(): FFFLibrary {
   if (lib) return lib;
 
-  const binaryPath = findBinary();
+  const isEmbedded = embeddedLibPath?.includes("$bunfs") ?? false;
+  const binaryPath = isEmbedded ? embeddedLibPath : (findBinary() ?? embeddedLibPath);
   if (!binaryPath) {
-    throw new Error(
-      "fff native library not found. Build from source with `cargo build --release -p fff-c` or install the platform package.",
-    );
+    throw new Error(libNotFoundMessage());
   }
 
   lib = dlopen(binaryPath, ffiDefinition);
   return lib;
+}
+
+function libNotFoundMessage(): string {
+  if (import.meta.url.includes("$bunfs")) {
+    if (process.platform === "linux") {
+      return [
+        "You are running bun --compile with fff native library which CAN NOT resolve a binary",
+        "On Linux the libc must be supplied at compile time so the native lib is bundled.",
+        "Rebuild with:",
+        "  bun build --compile --define FFF_LIBC='\"gnu\"'  ...   # glibc",
+        "  bun build --compile --define FFF_LIBC='\"musl\"' ...   # musl / Alpine",
+      ].join("\n");
+    }
+
+    return "fff native library was not embedded into this executable. Rebuild with `bun build --compile` and ensure the @ff-labs/fff-bin-* package for this platform is installed.";
+  }
+
+  return "fff native library not found. Build from source with `cargo build --release -p fff-c` or install the platform package.";
 }
 
 /**
@@ -860,7 +878,10 @@ function parseMixedSearchResult(resultPtr: Pointer | null): Result<MixedSearchRe
   } else if (locTag === 3) {
     location = {
       type: "range",
-      start: { line: read.i32(hp, MSR_LOC_LINE), col: read.i32(hp, MSR_LOC_COL) },
+      start: {
+        line: read.i32(hp, MSR_LOC_LINE),
+        col: read.i32(hp, MSR_LOC_COL),
+      },
       end: {
         line: read.i32(hp, MSR_LOC_END_LINE),
         col: read.i32(hp, MSR_LOC_END_COL),

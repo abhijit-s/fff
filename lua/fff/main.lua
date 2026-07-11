@@ -6,23 +6,38 @@ M.state = { initialized = false }
 --- @param config table Configuration options
 function M.setup(config) vim.g.fff = config end
 
---- Find files in current directory
---- @param opts? table Optional configuration {renderer = custom_renderer}
+--- Find files in current directory.
+--- When opts.resume is true, resumes the last find_files picker (or opens a new one if none saved).
+--- When opts.on_submit is set, it replaces the default `:edit` action on user selection.
+--- Signature: `fun(item: table, ctx: { action: string, path: string, relative_path: string, location: table|nil, query: string, mode: string|nil })`.
+--- @param opts? table Optional configuration {renderer = custom_renderer, resume = boolean, on_submit = function}
 function M.find_files(opts)
   local picker_ok, picker_ui = pcall(require, 'fff.picker_ui.picker_ui')
-  if picker_ok then
-    picker_ui.open(opts)
-  else
+  if not picker_ok then
     vim.notify('Failed to load picker UI: ' .. picker_ui, vim.log.levels.ERROR)
+    return
   end
+
+  if opts and opts.resume then
+    picker_ui.resume_find_files(opts)
+    return
+  end
+
+  picker_ui.open(opts)
 end
 
---- Live grep: search file contents in the current directory
---- @param opts? {cwd?: string, title?: string, prompt?: string, layout?: table, grep?: {max_file_size?: number, smart_case?: boolean, max_matches_per_file?: number, modes?: string[]}, query?: string} Optional configuration overrides
+--- Live grep: search file contents in the current directory.
+--- When opts.resume is true, resumes the last live_grep picker (or opens a new one if none saved).
+--- @param opts? {cwd?: string, title?: string, prompt?: string, layout?: table, grep?: {max_file_size?: number, smart_case?: boolean, max_matches_per_file?: number, modes?: string[]}, query?: string, resume?: boolean} Optional configuration overrides
 function M.live_grep(opts)
   local picker_ok, picker_ui = pcall(require, 'fff.picker_ui.picker_ui')
   if not picker_ok then
     vim.notify('Failed to load picker UI: ' .. picker_ui, vim.log.levels.ERROR)
+    return
+  end
+
+  if opts and opts.resume then
+    picker_ui.resume_live_grep(opts)
     return
   end
 
@@ -39,6 +54,27 @@ function M.live_grep(opts)
   }, opts or {})
 
   picker_ui.open(picker_opts)
+end
+
+--- Live grep prefilled with the current word (normal mode) or the visual selection (visual mode).
+--- @param opts? table Forwarded to `live_grep`; `query` is overwritten by the resolved text.
+function M.live_grep_under_cursor(opts)
+  local mode = vim.fn.mode()
+  local query
+  if mode == 'v' or mode == 'V' or mode == '\22' then
+    -- Exit visual so '< / '> marks settle, then read the range directly —
+    -- no yank, no register clobber.
+    vim.cmd('normal! ' .. vim.api.nvim_replace_termcodes('<Esc>', true, false, true))
+    local s = vim.fn.getpos("'<")
+    local e = vim.fn.getpos("'>")
+    local lines = vim.fn.getregion(s, e, { type = mode })
+    query = table.concat(lines, ' ')
+  else
+    query = vim.fn.expand('<cword>')
+  end
+
+  opts = vim.tbl_deep_extend('force', opts or {}, { query = query })
+  M.live_grep(opts)
 end
 
 --- Changes the directory indexed by the file picker to the git root and opens the file picker
@@ -426,6 +462,18 @@ end
 --- @param new_path string New directory path to use as base
 --- @return boolean `true` if successful, `false` otherwise
 function M.change_indexing_directory(new_path) return require('fff.core').change_indexing_directory(new_path) end
+
+--- Resume the most recently closed picker (find_files or live_grep).
+--- Similar to Telescope's `require('telescope.builtin').resume()`.
+---@return boolean true if a picker was resumed, false if there is nothing to resume
+function M.resume()
+  local picker_ok, picker_ui = pcall(require, 'fff.picker_ui.picker_ui')
+  if not picker_ok then
+    vim.notify('Failed to load picker UI: ' .. picker_ui, vim.log.levels.ERROR)
+    return false
+  end
+  return picker_ui.resume()
+end
 
 -- Strip wrapper punctuation that frequently surrounds paths in prose: leading
 -- markdown-link `[`, parens `(`, brackets `<`, quotes; trailing sentence

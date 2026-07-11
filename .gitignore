@@ -16,6 +16,7 @@ result
 *.data
 node_modules/
 crates/fff-notify-debouncer-full/
+packages/fff-bun/glob-bench-bin
 
 dist/
 scripts/benchmark-results/
@@ -24,6 +25,7 @@ scripts/benchmark-results/
 *.dylib
 *.so
 *.dll
+*.pdb
 
 # Instruments traces
 *.trace/
@@ -33,3 +35,34 @@ fff-test.log
 
 # Agent worktrees (created by Claude Code background agents)
 .claude/worktrees/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+build/
+*.whl
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+# uv
+# Testing / linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
