@@ -3,8 +3,14 @@
 
 use std::sync::OnceLock;
 
-const REPO: &str = "abhijit-s/fff";
+const DEFAULT_REPO: &str = "abhijit-s/fff";
 const BUILD_HASH: &str = env!("FFF_GIT_HASH");
+
+/// GitHub `owner/repo` to check for updates. Overridable via `FFF_UPDATE_REPO`;
+/// defaults to the fork so a stock build never advertises another repo.
+fn update_repo() -> String {
+    std::env::var("FFF_UPDATE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string())
+}
 
 /// Holds the result of the update check (empty string = up to date or check failed).
 static UPDATE_NOTICE: OnceLock<String> = OnceLock::new();
@@ -44,7 +50,8 @@ fn compare_versions(build_hash: &str, release_tag: &str) -> String {
     }
 
     format!(
-        "\n[fff update available: `curl -fsSL https://raw.githubusercontent.com/{REPO}/main/install-mcp.sh | bash`]\n"
+        "\n[fff update available: `curl -fsSL https://raw.githubusercontent.com/{}/main/install-mcp.sh | bash`]\n",
+        update_repo()
     )
 }
 
@@ -57,7 +64,10 @@ fn fetch_latest_tag() -> Result<String, Box<dyn std::error::Error>> {
             "5",
             "-H",
             "Accept: application/vnd.github.v3+json",
-            &format!("https://api.github.com/repos/{REPO}/releases?per_page=1"),
+            &format!(
+                "https://api.github.com/repos/{}/releases?per_page=1",
+                update_repo()
+            ),
         ])
         .output()?;
 
