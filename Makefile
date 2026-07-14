@@ -45,12 +45,13 @@ sync-js-api-check:
 build:
 	cargo build --release --no-default-features --features zlob
 
-# Build the daemon stack without the zlob feature (no Zig required).
+# Build the daemon stack with the default pure-Rust ripgrep backend (no Zig
+# required). zlob is opt-in, so the default features already exclude it.
 # Produces target/release/fff-engine, target/release/fff-mcp, target/release/fffctl.
 BUILD_BASE_PATH ?= .
 
 build-daemon:
-	cargo build --release --no-default-features -p fff-engine -p fff-mcp -p fff-ctl
+	cargo build --release -p fff-engine -p fff-mcp -p fff-ctl
 
 ENGINE_LOG ?= $(HOME)/.cache/fff_engine.log
 MCP_LOG    ?= $(HOME)/.cache/fff_mcp.log
@@ -92,7 +93,7 @@ healthcheck: build-daemon
 
 # Run unit tests for the new daemon crates only (no Zig, no Lua, no JS).
 test-daemon:
-	cargo test --no-default-features -p fff-ipc -p fff-engine -p fff-mcp -p fff-ctl
+	cargo test -p fff-ipc -p fff-engine -p fff-mcp -p fff-ctl
 
 build-c-lib:
 	cargo build --release -p fff-c --no-default-features --features zlob

@@ -9,6 +9,12 @@ license = "MIT"
 name = "fff-engine"
 path = "src/main.rs"
 
+[features]
+# Pure-Rust walker by default; opt into zlob explicitly (needs Zig).
+default = ["ripgrep"]
+ripgrep = ["fff/ripgrep"]
+zlob = ["fff/zlob"]
+
 [dependencies]
 fff = { package = "fff-search", path = "../fff-core", default-features = false, version = "0.17.0" }
 fff-ipc = { path = "../fff-ipc", version = "0.17.0" }
