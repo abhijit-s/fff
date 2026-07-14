@@ -929,7 +929,6 @@ impl FffServer {
         Parameters(params): Parameters<FindFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.bump_activity();
-        self.wait_for_scan(SCAN_READY_TIMEOUT)?;
 
         let max_results = normalize_max_results(params.max_results, 20);
         let query = &params.query;
@@ -945,6 +944,10 @@ impl FffServer {
             self.maybe_append_update_notice(&mut r);
             return Ok(r);
         }
+
+        // Local (non-proxy) path only: the scan-readiness gate polls the
+        // in-process picker, which is absent in proxy mode.
+        self.wait_for_scan(SCAN_READY_TIMEOUT)?;
 
         let page_offset = params
             .cursor
@@ -1056,7 +1059,6 @@ impl FffServer {
         Parameters(params): Parameters<GrepParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.bump_activity();
-        self.wait_for_scan(SCAN_READY_TIMEOUT)?;
 
         let max_results = normalize_max_results(params.max_results, 20);
         let output_mode = OutputMode::new(params.output_mode.as_deref());
@@ -1074,6 +1076,10 @@ impl FffServer {
             self.maybe_append_update_notice(&mut r);
             return Ok(r);
         }
+
+        // Local (non-proxy) path only: the scan-readiness gate polls the
+        // in-process picker, which is absent in proxy mode.
+        self.wait_for_scan(SCAN_READY_TIMEOUT)?;
 
         let parsed = QueryParser::new(AiGrepConfig).parse(&params.query);
         let grep_text = parsed.grep_text();
