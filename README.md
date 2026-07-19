@@ -127,6 +127,33 @@ fffctl restart                    # stop --all + clean (run after upgrading fff)
 
 `fffctl stop` triggers a clean shutdown: the engine removes its lockfile and socket on exit. `fffctl clean` exists for the case where a daemon crashed without cleanup. `fffctl restart` combines the two — run it after `brew upgrade fff` so the old daemon is replaced by the new binary on the next request.
 
+### Codex setup
+
+Register the installed binary using its absolute path, since Codex desktop sessions may not inherit your interactive shell's `PATH`.
+
+Homebrew:
+
+```bash
+codex mcp add fff -- "$(brew --prefix)/bin/fff-mcp"
+```
+
+One-line installer:
+
+```bash
+codex mcp add fff -- "$HOME/.local/bin/fff-mcp"
+```
+
+This creates an entry in `~/.codex/config.toml` similar to:
+
+```toml
+[mcp_servers.fff]
+command = "/opt/homebrew/bin/fff-mcp"
+```
+
+Use the actual installed path for your system, then restart Codex or start a new task so it loads the server.
+
+Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
+
 ### Recommended agent prompt
 
 Drop this into your project's `CLAUDE.md` or equivalent:
