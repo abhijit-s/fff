@@ -1,6 +1,6 @@
 [package]
 name = "fff-c"
-version = "0.17.0"
+version = "0.17.1"
 edition = "2024"
 description = "Raw C api of FFF file finder"
 license = "MIT"
