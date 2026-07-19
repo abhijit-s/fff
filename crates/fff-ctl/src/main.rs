@@ -93,6 +93,13 @@ enum Cmd {
     ListWorkers,
     /// Report per-root index freshness for every loaded worker.
     Health,
+    /// Audit all lockfiles, sockets, and PIDs. Reports live, stale, and zombie artifacts.
+    /// With --deep, also cross-references routing.json and checks base-path existence.
+    Audit {
+        /// Deep audit: include routing.json cross-reference and base-path existence checks.
+        #[arg(long)]
+        deep: bool,
+    },
 }
 
 fn main() {
@@ -127,6 +134,7 @@ fn main() {
         ),
         Cmd::Restart { timeout } => cmd_restart(Duration::from_secs(timeout), json),
         Cmd::Clean { dry_run } => cmd_clean(dry_run, json),
+        Cmd::Audit { deep } => cmd_audit(deep, json),
         Cmd::Health => cmd_health(json),
     };
     std::process::exit(exit);
@@ -219,6 +227,31 @@ struct CleanJson {
     removed: Vec<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     dry_run: bool,
+}
+
+#[derive(Serialize)]
+struct AuditEntryJson {
+    kind: String,
+    label: String,
+    pid: u32,
+    status: String,
+    lockfile: String,
+    socket: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AuditSummaryJson {
+    total: usize,
+    live: usize,
+    stale: usize,
+    zombie: usize,
+}
+
+#[derive(Serialize)]
+struct AuditJson {
+    artifacts: Vec<AuditEntryJson>,
+    summary: AuditSummaryJson,
 }
 
 fn print_json<T: Serialize>(value: &T) {
@@ -1001,6 +1034,218 @@ fn clean_master_artifacts(dry_run: bool, json: bool, removed_paths: &mut Vec<Str
     }
 
     removed
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit
+
+#[cfg(unix)]
+fn socket_reachable(path: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn socket_reachable(_path: &std::path::Path) -> bool {
+    false
+}
+
+fn cmd_audit(deep: bool, json: bool) -> i32 {
+    let cache = fff_ipc::xdg_cache_dir().join("fff");
+    let mut artifacts: Vec<AuditEntryJson> = Vec::new();
+
+    // 1. Master
+    let master_lock = fff_ipc::master_lockfile_path();
+    if let Some(lock) = lockfile::read(&master_lock) {
+        let live = lock.is_alive();
+        let sock = fff_ipc::master_socket_path();
+        let sock_ok = live && socket_reachable(&sock);
+        let (status, detail) = classify(live, sock_ok, None);
+        artifacts.push(AuditEntryJson {
+            kind: "master".into(),
+            label: "master".into(),
+            pid: lock.pid,
+            status,
+            lockfile: master_lock.display().to_string(),
+            socket: Some(sock.display().to_string()),
+            detail,
+        });
+    }
+
+    // 2. Workers
+    let workers_dir = cache.join("workers");
+    if let Ok(dir) = std::fs::read_dir(&workers_dir) {
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("lock") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
+                continue;
+            };
+            let Some(lock) = lockfile::read(&path) else { continue };
+
+            let live = lock.is_alive();
+            let sock = path.with_extension("sock");
+            let sock_ok = live && socket_reachable(&sock);
+            let (status, detail) = classify(live, sock_ok, None);
+
+            artifacts.push(AuditEntryJson {
+                kind: "worker".into(),
+                label: stem,
+                pid: lock.pid,
+                status,
+                lockfile: path.display().to_string(),
+                socket: Some(sock.display().to_string()),
+                detail,
+            });
+        }
+    }
+
+    // 3. Legacy per-root daemons (locks/<slug>.lock)
+    let locks_dir = cache.join("locks");
+    if let Ok(dir) = std::fs::read_dir(&locks_dir) {
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("lock") {
+                continue;
+            }
+            let Some(slug) = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
+                continue;
+            };
+            let Some(lock) = lockfile::read(&path) else { continue };
+
+            let live = lock.is_alive();
+            let sock = cache.join("sockets").join(format!("{slug}.sock"));
+            let sock_ok = live && socket_reachable(&sock);
+
+            // Check base_path existence (deep only)
+            let detail = if deep {
+                let bp_exists = lock.base_path.as_ref().is_some_and(|p| p.exists());
+                let bp_str = lock.base_path.as_ref().map(|p| p.display().to_string());
+                match (bp_str, bp_exists) {
+                    (Some(p), true) => Some(format!("{p} (exists)")),
+                    (Some(p), false) => Some(format!("{p} (GONE)")),
+                    (None, _) => None,
+                }
+            } else {
+                lock.base_path.as_ref().map(|p| p.display().to_string())
+            };
+
+            let (status, extra) = classify(live, sock_ok, None);
+            let detail = match (detail, extra) {
+                (Some(d), Some(e)) => Some(format!("{d} — {e}")),
+                (Some(d), None) => Some(d),
+                (None, Some(e)) => Some(e),
+                (None, None) => None,
+            };
+
+            artifacts.push(AuditEntryJson {
+                kind: "legacy".into(),
+                label: slug,
+                pid: lock.pid,
+                status,
+                lockfile: path.display().to_string(),
+                socket: Some(sock.display().to_string()),
+                detail,
+            });
+        }
+    }
+
+    // 4. Deep: routing.json cross-reference
+    if deep {
+        let routing_path = fff_ipc::routing_table_path();
+        if let Ok(table) = fff_ipc::routing::RoutingTable::load(&routing_path) {
+            for (&idx, entry) in &table.workers {
+                let wl_path = fff_ipc::worker_lockfile_path(idx);
+                let ws_path = fff_ipc::worker_socket_path(idx);
+                let exists = artifacts.iter().any(|a| {
+                    a.kind == "worker"
+                        && a.label == format!("worker-{idx}")
+                });
+
+                if !exists {
+                    let lock_pid = lockfile::read(&wl_path).map(|l| l.pid);
+                    let pid = lock_pid.unwrap_or(entry.pid);
+                    let lock_live = lock_pid.is_some_and(|p| {
+                        Lockfile { pid: p, base_path: None }.is_alive()
+                    });
+                    let sock_ok = socket_reachable(&ws_path);
+
+                    let (status, extra) = classify(lock_live, sock_ok, {
+                        if let Some(lp) = lock_pid {
+                            (lp != entry.pid).then(|| {
+                                format!("routing.json PID {} ≠ lockfile PID {}", entry.pid, lp)
+                            })
+                        } else {
+                            Some("in routing.json but no lockfile".into())
+                        }
+                    });
+
+                    artifacts.push(AuditEntryJson {
+                        kind: "routing_ref".into(),
+                        label: format!("worker-{idx}"),
+                        pid,
+                        status,
+                        lockfile: wl_path.display().to_string(),
+                        socket: Some(ws_path.display().to_string()),
+                        detail: extra,
+                    });
+                }
+            }
+        }
+    }
+
+    // Summary
+    let total = artifacts.len();
+    let live = artifacts.iter().filter(|a| a.status == "live").count();
+    let stale = artifacts.iter().filter(|a| a.status == "stale").count();
+    let zombie = artifacts.iter().filter(|a| a.status == "zombie").count();
+
+    if json {
+        print_json(&AuditJson {
+            summary: AuditSummaryJson { total, live, stale, zombie },
+            artifacts,
+        });
+    } else {
+        println!("{:<12}  {:<22}  {:<8}  {:<6}  DETAIL", "KIND", "LABEL", "PID", "STATUS");
+        println!("{}", "-".repeat(80));
+        for a in &artifacts {
+            let icon = match a.status.as_str() {
+                "live" => "✓",
+                "stale" => "✗",
+                "zombie" => "⚠",
+                _ => "?",
+            };
+            println!(
+                "{:<12}  {:<22}  {:<8}  {:<6}  {}",
+                a.kind,
+                a.label,
+                a.pid,
+                format!("{icon} {}", a.status),
+                a.detail.as_deref().unwrap_or(""),
+            );
+        }
+        println!("{}", "-".repeat(80));
+        println!(
+            "{total} artifact(s): {live} live, {stale} stale, {zombie} zombie",
+        );
+    }
+
+    if stale > 0 || zombie > 0 {
+        eprintln!("Tip: run `fffctl clean` to remove stale artifacts.");
+    }
+    0
+}
+
+/// Classify an artifact.
+fn classify(live: bool, socket_ok: bool, extra_hint: Option<String>) -> (String, Option<String>) {
+    if !live {
+        ("stale".into(), None)
+    } else if socket_ok {
+        ("live".into(), extra_hint)
+    } else {
+        ("zombie".into(), extra_hint.or(Some("PID alive but socket unreachable".into())))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
