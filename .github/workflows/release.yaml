@@ -278,7 +278,6 @@ jobs:
           mv "${{ matrix.artifact_name }}" "c-lib-${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Prepare npm package
-        if: "!contains(matrix.target, 'android')"
         shell: bash
         run: |
           # Copy the built binary into the platform npm package directory
@@ -291,7 +290,6 @@ jobs:
           path: c-lib-${{ matrix.target }}.*
 
       - name: Upload npm package artifact
-        if: "!contains(matrix.target, 'android')"
         uses: actions/upload-artifact@v4
         with:
           name: npm-${{ matrix.npm_package }}
