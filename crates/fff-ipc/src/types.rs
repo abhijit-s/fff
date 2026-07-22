@@ -300,6 +300,7 @@ pub struct HealthResponse {
 pub struct WorkerHealth {
     pub index: u32,
     pub pid: u32,
+    pub socket_path: String,
     pub roots: Vec<RootHealth>,
 }
 
@@ -637,6 +638,7 @@ mod tests {
             workers: vec![WorkerHealth {
                 index: 0,
                 pid: 22,
+                socket_path: "/tmp/fff/worker-0.sock".into(),
                 roots: vec![RootHealth {
                     slug: "abc".into(),
                     base_path: "/proj/a".into(),
@@ -654,6 +656,7 @@ mod tests {
                 assert_eq!(r.uptime_sec, 1200);
                 assert_eq!(r.workers.len(), 1);
                 assert_eq!(r.workers[0].index, 0);
+                assert_eq!(r.workers[0].socket_path, "/tmp/fff/worker-0.sock");
                 assert_eq!(r.workers[0].roots[0].slug, "abc");
                 assert_eq!(r.workers[0].roots[0].indexed_files, Some(100));
             }

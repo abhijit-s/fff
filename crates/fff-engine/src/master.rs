@@ -203,7 +203,12 @@ impl MasterState {
                         Vec::new()
                     }
                 };
-                WorkerHealth { index, pid, roots }
+                WorkerHealth {
+                    index,
+                    pid,
+                    socket_path: sock.to_string_lossy().into_owned(),
+                    roots,
+                }
             }));
         }
 

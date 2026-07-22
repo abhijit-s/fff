@@ -219,6 +219,7 @@ struct HealthJson<'a> {
 struct WorkerHealthJson<'a> {
     index: u32,
     pid: u32,
+    socket: &'a str,
     roots: &'a [RootHealth],
 }
 
@@ -444,6 +445,7 @@ fn print_health_json(report: &HealthReport) {
         .map(|w| WorkerHealthJson {
             index: w.index,
             pid: w.pid,
+            socket: &w.socket_path,
             roots: &w.roots,
         })
         .collect();
@@ -462,7 +464,7 @@ fn print_health_text(report: &HealthReport) {
         report.workers.len()
     );
     for w in &report.workers {
-        println!("WORKER-{} (pid={})", w.index, w.pid);
+        println!("WORKER-{} (pid={})  socket: {}", w.index, w.pid, w.socket_path);
         if w.roots.is_empty() {
             println!("  <no roots loaded>");
             continue;
@@ -1513,6 +1515,7 @@ mod tests {
         let workers = vec![WorkerHealthJson {
             index: 0,
             pid: 22,
+            socket: "/tmp/fff/worker-0.sock",
             roots: &roots,
         }];
         let v: Value = serde_json::to_value(HealthJson {
@@ -1525,6 +1528,7 @@ mod tests {
         assert_eq!(v["uptime_sec"], 1200);
         assert_eq!(v["workers"][0]["index"], 0);
         assert_eq!(v["workers"][0]["pid"], 22);
+        assert_eq!(v["workers"][0]["socket"], "/tmp/fff/worker-0.sock");
         assert_eq!(v["workers"][0]["roots"][0]["slug"], "abc");
         assert_eq!(v["workers"][0]["roots"][0]["base_path"], "/proj/a");
         assert_eq!(v["workers"][0]["roots"][0]["indexed_files"], 8421);
