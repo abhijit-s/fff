@@ -372,7 +372,7 @@ jobs:
           cp "${{ matrix.artifact_name }}" "fff-mcp-${{ matrix.target }}"
           # Build engine and ctl for Homebrew bundle (no zlob needed)
           MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} \
-            -p fff-engine -p fff-ctl --no-default-features
+            -p fff-engine -p fff-ctl --no-default-features --features ripgrep
           cp "target/${{ matrix.target }}/ci/fff-engine" "fff-engine-${{ matrix.target }}"
           cp "target/${{ matrix.target }}/ci/fffctl" "fffctl-${{ matrix.target }}"
 
