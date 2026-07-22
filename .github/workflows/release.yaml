@@ -680,7 +680,8 @@ jobs:
     name: Publish Python wheels to PyPI
     needs: [build-python, build-python-sdist]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/use-trusted-publishing' || startsWith(github.ref, 'refs/tags/v'))
+    # PyPI trusted publishing is only configured for upstream's project.
+    if: github.repository_owner == 'dmtrKovalenko' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/use-trusted-publishing' || startsWith(github.ref, 'refs/tags/v'))
     environment:
       name: pypi
       url: https://pypi.org/p/fff-search
