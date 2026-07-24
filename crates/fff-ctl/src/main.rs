@@ -12,7 +12,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use fff_ipc::lockfile::{self, Lockfile};
 use fff_ipc::routing::RootEntry;
@@ -34,12 +34,22 @@ struct Cli {
     #[arg(long, short = 'j', global = true)]
     json: bool,
 
+    /// Output format. Takes precedence over --json when both are given.
+    #[arg(long, value_name = "FORMAT", global = true)]
+    format: Option<OutputFormat>,
+
     /// Print a shell completion script to stdout and exit.
     #[arg(long = "completions", value_name = "SHELL", exclusive = true)]
     completions: Option<Shell>,
 
     #[command(subcommand)]
     command: Option<Cmd>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    Json,
+    Table,
 }
 
 #[derive(Subcommand, Debug)]
@@ -111,7 +121,11 @@ fn main() {
         return;
     }
 
-    let json = cli.json;
+    let json = match cli.format {
+        Some(OutputFormat::Json) => true,
+        Some(OutputFormat::Table) => false,
+        None => cli.json,
+    };
     let Some(command) = cli.command else {
         let _ = Cli::command().print_help();
         std::process::exit(2);
