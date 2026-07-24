@@ -470,35 +470,96 @@ fn print_health_json(report: &HealthReport) {
     });
 }
 
+const HEALTH_HEADERS: [&str; 6] = ["ROOT", "SLUG", "FILES", "SCAN AGE", "BACKLOG", "DIRTY"];
+// ROOT/SLUG left-aligned; numeric columns right-aligned.
+const HEALTH_RIGHT: [bool; 6] = [false, false, true, true, true, true];
+
 fn print_health_text(report: &HealthReport) {
     println!(
-        "master PID: {}  uptime: {}s  workers: {}",
+        "master PID {} · uptime {}s · workers {}",
         report.master_pid,
         report.uptime_sec,
         report.workers.len()
     );
     for w in &report.workers {
-        println!("WORKER-{} (pid={})  socket: {}", w.index, w.pid, w.socket_path);
+        println!();
+        let title = format!("WORKER-{} · pid {} · {}", w.index, w.pid, w.socket_path);
         if w.roots.is_empty() {
+            println!("{title}");
             println!("  <no roots loaded>");
             continue;
         }
-        for r in &w.roots {
-            println!(
-                "  {}  (slug: {})  files={}  scan_age={}  watcher_backlog={}  dirty={}",
-                if r.base_path.is_empty() {
-                    "<unknown>"
-                } else {
-                    r.base_path.as_str()
-                },
-                r.slug,
-                opt_u64(r.indexed_files),
-                opt_secs(r.last_scan_age_sec),
-                opt_u64(r.watcher_backlog),
-                opt_u64(r.dirty_count),
-            );
+        let header = HEALTH_HEADERS.map(String::from);
+        let rows: Vec<[String; 6]> = w.roots.iter().map(health_row).collect();
+        print_table(&title, &header, &rows, &HEALTH_RIGHT);
+    }
+}
+
+fn health_row(r: &RootHealth) -> [String; 6] {
+    [
+        if r.base_path.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            r.base_path.clone()
+        },
+        r.slug.clone(),
+        opt_u64(r.indexed_files),
+        opt_secs(r.last_scan_age_sec),
+        opt_u64(r.watcher_backlog),
+        opt_u64(r.dirty_count),
+    ]
+}
+
+// AWS-CLI-style bordered table: dashed top rule, centered title bar, then
+// a bordered header and rows. Column widths size to the widest cell.
+fn print_table<const N: usize>(
+    title: &str,
+    header: &[String; N],
+    rows: &[[String; N]],
+    right: &[bool; N],
+) {
+    let mut w = header.each_ref().map(|h| h.chars().count());
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            w[i] = w[i].max(cell.chars().count());
         }
     }
+
+    let mut sep = String::from("+");
+    for width in &w {
+        sep.push_str(&"-".repeat(width + 2));
+        sep.push('+');
+    }
+    let total = sep.chars().count();
+
+    println!("{}", "-".repeat(total));
+    let pad = (total - 2).saturating_sub(title.chars().count());
+    println!(
+        "|{}{}{}|",
+        " ".repeat(pad / 2),
+        title,
+        " ".repeat(pad - pad / 2)
+    );
+    println!("{sep}");
+    print_table_row(header, &w, right);
+    println!("{sep}");
+    for row in rows {
+        print_table_row(row, &w, right);
+    }
+    println!("{sep}");
+}
+
+fn print_table_row<const N: usize>(cells: &[String; N], w: &[usize; N], right: &[bool; N]) {
+    let mut line = String::from("|");
+    for (i, cell) in cells.iter().enumerate() {
+        let pad = " ".repeat(w[i] - cell.chars().count());
+        if right[i] {
+            line.push_str(&format!(" {pad}{cell} |"));
+        } else {
+            line.push_str(&format!(" {cell}{pad} |"));
+        }
+    }
+    println!("{line}");
 }
 
 fn opt_u64(v: Option<u64>) -> String {
