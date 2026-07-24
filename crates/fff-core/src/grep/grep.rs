@@ -213,6 +213,7 @@ pub(crate) fn grep_search<'a>(
         base_path,
         arena,
         overflow_arena,
+        recheck,
     );
 
     // Constraint parsing can swallow tokens the user meant literally (e.g. `!=`
@@ -248,6 +249,7 @@ pub(crate) fn grep_search<'a>(
         base_path,
         arena,
         overflow_arena,
+        recheck,
     );
 
     if fallback.matches.is_empty() {
@@ -270,6 +272,7 @@ fn grep_search_parsed<'a>(
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
+    recheck: bool,
 ) -> GrepResult<'a> {
     let total_files = files.live_count();
     let constraints_from_query = &query.constraints[..];
