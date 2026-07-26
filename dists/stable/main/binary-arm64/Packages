@@ -1,0 +1,19 @@
+Package: fff
+Version: 0.17.2-1
+Architecture: arm64
+Maintainer: Abhijit Salvi <a.salvi@easygo.io>
+Installed-Size: 20694
+Depends: libc6:arm64 (>= 2.39)
+Filename: pool/main/f/fff/fff_0.17.2-1_arm64.deb
+Size: 5536096
+MD5sum: f587cc3b73d6bd70c0869b4a45177b2b
+SHA1: 564fb5acf4f2c66d8888a682c086256ae2e07d19
+SHA256: 14438863dd6842f24d2e9e1f413ed2948e8e64f9be751806a9da46cfaf0e6e68
+Section: utils
+Priority: optional
+Description: MCP server for FFF file finder - drop-in replacement for AI code assistant
+ search tools
+ Fast frecency-ranked file finder for AI code assistants. Ships the daemon trio:
+ fff-mcp (MCP server), fff-engine (index-owning daemon), and fffctl (operator
+ CLI).
+
