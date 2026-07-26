@@ -159,6 +159,9 @@ pub(crate) mod walk;
 #[cfg(test)]
 mod content_staleness_recheck;
 
+#[cfg(test)]
+mod git_status_staleness;
+
 /// Filesystem watch subscriptions with glob filtering and batched delivery,
 /// plus the background OS watcher.
 #[path = "watcher/mod.rs"]

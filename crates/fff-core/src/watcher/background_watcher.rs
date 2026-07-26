@@ -422,22 +422,23 @@ fn handle_debounced_events(
         // When macOS FSEvents (or other backends) overflow their event buffer, the kernel
         // drops individual events and emits a rescan flag telling us to re-scan the subtree
         if debounced_event.event.need_rescan() {
-            if debounced_event.event.paths.len() < 16 // this should be usually one event
+            // A rescan flag means the OS dropped events. If the batch is a small
+            // set of known real files, the paths are concrete — fall through and
+            // process them normally (index + git-status refresh) instead of
+            // dropping them, which would leave the index/status permanently stale.
+            let small_known_batch = debounced_event.event.paths.len() < 16
                 && debounced_event
                     .paths
                     .iter()
-                    // but we are smart enough and not falling into the paths
-                    .all(|p| !p.is_dir() && !filter.is_ignored(p))
-            {
+                    .all(|p| !p.is_dir() && !filter.is_ignored(p));
+            if !small_known_batch {
+                warn!(
+                    "Received rescan event for paths {:?}, triggering full rescan",
+                    debounced_event.event.paths
+                );
+                need_full_rescan = true;
                 break;
             }
-
-            warn!(
-                "Received rescan event for paths {:?}, triggering full rescan",
-                debounced_event.event.paths
-            );
-            need_full_rescan = true;
-            break;
         }
 
         tracing::debug!(event = ?debounced_event.event, "Processing FS event");

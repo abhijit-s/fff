@@ -235,6 +235,25 @@ pub async fn handle_get_git_status(state: &EngineState, include_clean: bool) -> 
     use fff::git::format_git_status_opt;
     use fff_ipc::types::WireGitFile;
 
+    // The served cache is maintained only by FS-watcher events; macOS FSEvents
+    // can coalesce/drop out-of-band edits (e.g. an editor saving a tracked file),
+    // leaving it stale-clean. get_git_status is an explicit, human-paced query,
+    // so recompute when the cache is older than the TTL — making the query
+    // authoritative while rapid repeated calls reuse a fresh-enough result.
+    const GIT_STATUS_TTL: Duration = Duration::from_secs(3);
+    let needs_refresh = match state.last_git_refresh.lock() {
+        Ok(g) => (*g).map_or(true, |t| t.elapsed() >= GIT_STATUS_TTL),
+        Err(_) => true,
+    };
+    if needs_refresh {
+        let picker = state.shared_picker.clone();
+        let frecency = state.shared_frecency.clone();
+        let _ = tokio::task::spawn_blocking(move || picker.refresh_git_status(&frecency)).await;
+        if let Ok(mut g) = state.last_git_refresh.lock() {
+            *g = Some(std::time::Instant::now());
+        }
+    }
+
     let picker_arc = state.shared_picker.clone();
     let result = tokio::task::spawn_blocking(move || {
         let guard = picker_arc.read().map_err(|e| e.to_string())?;

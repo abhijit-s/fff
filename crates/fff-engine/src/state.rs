@@ -20,6 +20,9 @@ pub struct EngineState {
     pub shared_picker: SharedFilePicker,
     pub shared_frecency: SharedFrecency,
     pub base_path: PathBuf,
+    // Last time the get_git_status serve path recomputed status. TTL-gates a
+    // live refresh so out-of-band edits the watcher missed still surface.
+    pub last_git_refresh: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 pub fn init(args: &EffectiveArgs) -> Result<EngineState, Box<dyn std::error::Error>> {
@@ -71,6 +74,7 @@ pub fn init(args: &EffectiveArgs) -> Result<EngineState, Box<dyn std::error::Err
         shared_picker,
         shared_frecency,
         base_path,
+        last_git_refresh: std::sync::Mutex::new(None),
     })
 }
 
