@@ -44,3 +44,23 @@ clap_complete = "4"
 [dev-dependencies]
 tempfile = "3"
 libc = "0.2"
+
+# One `fff` .deb bundling the daemon trio. Built with --no-build after a
+# workspace build of all three; cargo-deb rewrites target/release -> the
+# per-target dir when --target is passed. See scripts/build-apt-repo.sh.
+[package.metadata.deb]
+name = "fff"
+maintainer = "Abhijit Salvi <a.salvi@easygo.io>"
+copyright = "2026, ff-labs"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+Fast frecency-ranked file finder for AI code assistants. Ships the daemon \
+trio: fff-mcp (MCP server), fff-engine (index-owning daemon), and fffctl \
+(operator CLI)."""
+assets = [
+  ["target/release/fff-mcp", "usr/bin/", "755"],
+  ["target/release/fff-engine", "usr/bin/", "755"],
+  ["target/release/fffctl", "usr/bin/", "755"],
+]

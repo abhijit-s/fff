@@ -71,6 +71,20 @@ claude mcp add -s user fff -- $(brew --prefix)/bin/fff-mcp
 
 It prints the exact wiring instructions for your client. Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
 
+### Debian / Ubuntu (apt)
+
+Prebuilt `fff` packages (bundling `fff-mcp`, `fff-engine`, and `fffctl`) are published to an APT repository on GitHub Pages for `amd64` and `arm64`.
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://abhijit-s.github.io/fff/fff.gpg | sudo tee /etc/apt/keyrings/fff.asc > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/fff.asc] https://abhijit-s.github.io/fff stable main" \
+  | sudo tee /etc/apt/sources.list.d/fff.list > /dev/null
+sudo apt update && sudo apt install fff
+```
+
+Upgrade with the usual `sudo apt update && sudo apt upgrade fff`. The three binaries install to `/usr/bin`, so `fff-mcp` finds `fff-engine` on `PATH` at runtime.
+
 ### Multiple project roots
 
 To search several projects from one server, declare them under `[mcp]` in `~/.config/fff/config.toml`:

@@ -887,3 +887,107 @@ jobs:
             git commit -m "chore: bump fff to ${{ steps.version.outputs.version }}"
             git push origin HEAD:main
           fi
+
+  # Debian/Ubuntu daemon packages. Ripgrep backend, no Zig. Bundles the
+  # fff-mcp/fff-engine/fffctl trio into one `fff` .deb per arch.
+  build-deb:
+    name: Build .deb ${{ matrix.deb_arch }}
+    if: github.repository_owner == 'abhijit-s' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            deb_arch: amd64
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+            cross: true
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          key: deb-${{ matrix.target }}
+
+      - name: Install aarch64 cross compiler
+        if: matrix.cross
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      # Default features give the ripgrep walker across the trio (no Zig).
+      # cargo-deb rewrites target/release -> target/<triple>/release under --target.
+      - name: Build binaries
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p fff-mcp -p fff-engine -p fff-ctl
+
+      - name: Package .deb
+        run: |
+          cargo deb -p fff-mcp --target ${{ matrix.target }} --no-build
+          mkdir -p deb-out
+          cp target/${{ matrix.target }}/debian/*.deb deb-out/
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.deb_arch }}
+          path: deb-out/*.deb
+
+  # Assemble the signed flat APT repo and publish it to the gh-pages branch,
+  # served at https://abhijit-s.github.io/fff/. Runs only for our fork.
+  publish-apt:
+    name: Publish APT repo
+    needs: [build-deb]
+    if: github.repository_owner == 'abhijit-s' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Download .deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: ./debs
+          merge-multiple: true
+
+      - name: Build signed APT repo
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          ls -la ./debs
+          bash scripts/build-apt-repo.sh ./debs ./apt-repo
+
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./apt-repo
+          publish_branch: gh-pages
+          keep_files: false
+          user_name: github-actions[bot]
+          user_email: github-actions[bot]@users.noreply.github.com
+          commit_message: "chore: publish APT repo"
