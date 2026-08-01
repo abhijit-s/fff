@@ -14,7 +14,7 @@ SHELL := bash
 # string rather than the literal `-o` / `pipefail` tokens.
 .SHELLFLAGS := -o pipefail -euc
 
-.PHONY: build build-c-lib build-daemon run-engine run-mcp healthcheck log-debug log-info install uninstall test test-rust test-daemon test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile
+.PHONY: build build-c-lib build-daemon run-engine run-mcp healthcheck log-debug log-info install install-fff uninstall test test-rust test-daemon test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile
 
 all: format test lint
 
@@ -128,6 +128,12 @@ uninstall:
 	rm -f $(DESTDIR)$(LIBDIR)/fff_c.dll
 	rm -f $(DESTDIR)$(INCLUDEDIR)/fff.h
 	@echo "Removed fff-c from $(DESTDIR)$(PREFIX)"
+
+# Install the daemon toolkit (fff-mcp + fff-engine + fffctl) for end use.
+# macOS -> Homebrew tap; Debian/Ubuntu -> APT repo; else build from source.
+# FFF_CHANNEL=head builds from current main instead of the stable channel.
+install-fff:
+	bash scripts/install-fff.sh
 
 test-setup:
 	@if [ ! -d "$(PLENARY_DIR)" ]; then \
