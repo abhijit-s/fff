@@ -42,6 +42,8 @@ struct MasterState {
     exe_path: PathBuf,
     routing: Mutex<RoutingTable>,
     ring: Mutex<HashRing>,
+    /// Single-flight latch for the empty-ring bootstrap spawn (see assign_new_root).
+    bootstrap: Mutex<()>,
     /// Workers spawned this session (have Child handles for try_wait monitoring).
     children: Mutex<HashMap<u32, tokio::process::Child>>,
     /// PIDs of workers adopted from routing.json (master restart — no Child handle).
@@ -83,6 +85,7 @@ impl MasterState {
             exe_path,
             routing: Mutex::new(routing),
             ring: Mutex::new(ring),
+            bootstrap: Mutex::new(()),
             children: Mutex::new(HashMap::new()),
             adopted_pids: Mutex::new(adopted_pids),
             next_index: Mutex::new(next_index),
@@ -379,13 +382,27 @@ impl MasterState {
         let index = match index {
             Some(idx) => idx,
             None => {
-                let new_idx = self.alloc_index().await;
-                tracing::info!("master: ring empty, spawning first worker on demand ({new_idx})");
-                if let Err(e) = self.spawn_worker(new_idx).await {
-                    tracing::error!("master: on-demand spawn failed: {e}");
-                    return None;
+                // Single-flight the empty-ring bootstrap so a burst of cold-start
+                // Handshakes doesn't each spawn a worker; re-check under the latch.
+                let _bootstrap = self.bootstrap.lock().await;
+                let reassigned = {
+                    let ring = self.ring.lock().await;
+                    ring.assign(std::path::Path::new(base_path))
+                };
+                match reassigned {
+                    Some(idx) => idx,
+                    None => {
+                        let new_idx = self.alloc_index().await;
+                        tracing::info!(
+                            "master: ring empty, spawning first worker on demand ({new_idx})"
+                        );
+                        if let Err(e) = self.spawn_worker(new_idx).await {
+                            tracing::error!("master: on-demand spawn failed: {e}");
+                            return None;
+                        }
+                        new_idx
+                    }
                 }
-                new_idx
             }
         };
 
