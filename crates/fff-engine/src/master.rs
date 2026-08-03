@@ -123,6 +123,24 @@ impl MasterState {
         i
     }
 
+    // Spawn workers until at least `target` exist, single-flighted via the
+    // bootstrap latch so the startup n_min fill and the on-demand Handshake
+    // bootstrap can't both spawn for the same empty ring.
+    async fn ensure_min_workers(&self, target: u32) {
+        let _bootstrap = self.bootstrap.lock().await;
+        loop {
+            let have = self.routing.lock().await.workers.len() as u32;
+            if have >= target {
+                break;
+            }
+            let index = self.alloc_index().await;
+            if let Err(e) = self.spawn_worker(index).await {
+                tracing::error!("master: initial spawn failed: {e}");
+                break;
+            }
+        }
+    }
+
     // Spawn a new worker process and register it in the ring and routing table.
     async fn spawn_worker(&self, index: u32) -> Result<(), String> {
         let socket = worker_socket_path(index);
@@ -707,17 +725,13 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
     }
     tracing::info!("fff-engine master listening on {}", socket.display());
 
-    // Spawn workers to reach n_min in the background — don't delay socket availability.
-    let to_spawn = worker_cfg.n_min.saturating_sub(surviving);
-    if to_spawn > 0 {
+    // Fill to n_min in the background — don't delay socket availability. Shares
+    // the bootstrap latch with on-demand spawn so the two never double-spawn.
+    if worker_cfg.n_min > surviving {
         let ms_init = Arc::clone(&master_state);
+        let target = worker_cfg.n_min;
         tokio::spawn(async move {
-            for _ in 0..to_spawn {
-                let index = ms_init.alloc_index().await;
-                if let Err(e) = ms_init.spawn_worker(index).await {
-                    tracing::error!("master: initial spawn failed: {e}");
-                }
-            }
+            ms_init.ensure_min_workers(target).await;
         });
     }
 
