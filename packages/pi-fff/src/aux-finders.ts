@@ -1,7 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import type { FileFinderApi } from "@ff-labs/fff-node";
+import { HOME_DIR } from "./paths";
 import { loadSdk, SCAN_TIMEOUT_MS } from "./sdk";
 
 export const MAX_AUX = 3;
@@ -15,6 +15,9 @@ interface AuxPicker {
 
 export interface AuxOpts {
   enableFsRootScanning: boolean;
+  enableHomeDirScanning?: boolean;
+  // Called before a newly spawned aux picker starts a scan that covers $HOME.
+  onHomeDirScan?: (root: string) => void;
 }
 
 export class AuxFinderPool {
@@ -84,10 +87,16 @@ export class AuxFinderPool {
   private async create(root: string): Promise<AuxPicker> {
     if (this.entries.length >= MAX_AUX) {
       let oldest = this.entries[0];
-      for (const e of this.entries)
-        if (e.lastUsed < oldest.lastUsed) oldest = e;
+      for (const e of this.entries) if (e.lastUsed < oldest.lastUsed) oldest = e;
       if (!oldest.finder.isDestroyed) oldest.finder.destroy();
       this.entries = this.entries.filter((e) => e !== oldest);
+    }
+
+    const enableHomeDirScanning = this.opts.enableHomeDirScanning ?? true;
+    // A fresh picker rooted at (or above) $HOME walks the whole home tree, so
+    // the user gets told every time the agent spawns one — see issue #743.
+    if (enableHomeDirScanning && rootCovers(root, HOME_DIR)) {
+      this.opts.onHomeDirScan?.(root);
     }
 
     const { FileFinder } = await loadSdk();
@@ -97,13 +106,11 @@ export class AuxFinderPool {
     const result = FileFinder.create({
       basePath: root,
       aiMode: true,
-      enableHomeDirScanning: true,
+      enableHomeDirScanning,
       enableFsRootScanning: this.opts.enableFsRootScanning,
     });
     if (!result.ok)
-      throw new Error(
-        `Failed to create aux file finder for ${root}: ${result.error}`,
-      );
+      throw new Error(`Failed to create aux file finder for ${root}: ${result.error}`);
 
     await result.value.waitForScan(SCAN_TIMEOUT_MS);
     const entry: AuxPicker = {
@@ -125,9 +132,7 @@ export class AuxFinderPool {
 // remainder usable as a fuzzy path constraint relative to that root. Glob and
 // nonexistent segments both go into the suffix: we walk up to the nearest
 // existing ancestor so partially-wrong paths still resolve to a search root.
-export function resolveAuxRoot(
-  absPath: string,
-): { root: string; suffix: string } | null {
+export function resolveAuxRoot(absPath: string): { root: string; suffix: string } | null {
   const trimmed = path.normalize(absPath.trim()).replace(/\/+$/, "") || "/";
   if (!path.isAbsolute(trimmed)) return null;
   if (trimmed === path.sep) return { root: path.sep, suffix: "" };
@@ -176,7 +181,7 @@ export function routePathConstraint(
   let candidate = pathConstraint.trim();
   if (!candidate) return null;
   if (candidate === "~" || candidate.startsWith("~/"))
-    candidate = path.join(os.homedir(), candidate.slice(1));
+    candidate = path.join(HOME_DIR, candidate.slice(1));
   if (!path.isAbsolute(candidate)) {
     // Plain workspace-relative constraints stay on the workspace finder.
     if (candidate !== ".." && !candidate.startsWith("../")) return null;
@@ -186,7 +191,6 @@ export function routePathConstraint(
   if (!isOutsideWorkspaceRelativePath(rel)) return null;
   return resolveAuxRoot(candidate);
 }
-
 
 export function rootCovers(root: string, target: string): boolean {
   if (root === target) return true;
