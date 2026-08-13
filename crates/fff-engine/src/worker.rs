@@ -5,10 +5,7 @@ use std::{
     collections::HashMap,
     fs::OpenOptions,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 #[cfg(unix)]
@@ -46,9 +43,6 @@ struct RootEntry {
     // Canonicalized base_path, precomputed once so ancestor matching in
     // get_or_init stays I/O-free under the read lock.
     canonical_base: PathBuf,
-    // Milliseconds since Unix epoch; updated atomically on every access.
-    // Allows fast-path reads to hold roots.read() instead of roots.write().
-    last_access_ms: AtomicU64,
     // Set once when the root finishes its initial scan. Acts as the
     // last-full-scan timestamp surfaced via `fffctl health`.
     loaded_at: Instant,
@@ -81,7 +75,6 @@ impl WorkerState {
     pub async fn get_or_init(&self, base_path: PathBuf) -> Result<Arc<EngineState>, String> {
         let slug = base_path_slug(&base_path);
         let max_roots = self.config.worker.roots_per_worker_max as usize;
-        let now = now_ms();
 
         // Canonicalize once (I/O kept outside the lock) for ancestor matching.
         let canonical_req = std::fs::canonicalize(&base_path).unwrap_or_else(|_| base_path.clone());
@@ -90,7 +83,7 @@ impl WorkerState {
         // The master routes a sub-path Handshake to the containing root's worker;
         // here we bind the Connect to that root's EngineState instead of minting
         // a duplicate index for the sub-path.
-        if let Some(state) = self.resolve_loaded(&slug, &canonical_req, now) {
+        if let Some(state) = self.resolve_loaded(&slug, &canonical_req) {
             return Ok(state);
         }
 
@@ -106,7 +99,7 @@ impl WorkerState {
         let _gate_guard = gate.lock().await;
 
         // Double-check after acquiring gate.
-        if let Some(state) = self.resolve_loaded(&slug, &canonical_req, now) {
+        if let Some(state) = self.resolve_loaded(&slug, &canonical_req) {
             return Ok(state);
         }
 
@@ -137,7 +130,6 @@ impl WorkerState {
             RootEntry {
                 state: Arc::clone(&new_state),
                 canonical_base,
-                last_access_ms: AtomicU64::new(now_ms()),
                 loaded_at: Instant::now(),
             },
         );
@@ -148,15 +140,10 @@ impl WorkerState {
     // Resolve a request to an already-loaded root: exact slug first, then the
     // longest-prefix ancestor (containment). Updates last_access on a hit.
     // Held entirely under one read lock — no I/O (canonical paths precomputed).
-    fn resolve_loaded(
-        &self,
-        slug: &str,
-        canonical_req: &Path,
-        now: u64,
-    ) -> Option<Arc<EngineState>> {
+    fn resolve_loaded(&self, slug: &str, canonical_req: &Path) -> Option<Arc<EngineState>> {
         let map = self.roots.read();
         if let Some(entry) = map.get(slug) {
-            entry.last_access_ms.store(now, Ordering::Relaxed);
+            entry.state.touch_last_access();
             return Some(Arc::clone(&entry.state));
         }
         let mut best: Option<&RootEntry> = None;
@@ -169,7 +156,7 @@ impl WorkerState {
             }
         }
         best.map(|entry| {
-            entry.last_access_ms.store(now, Ordering::Relaxed);
+            entry.state.touch_last_access();
             Arc::clone(&entry.state)
         })
     }
@@ -179,6 +166,29 @@ impl WorkerState {
     // the master during containment subsumption. Arcs are cloned under a brief
     // read lock; the merge runs lock-free; removal takes the write lock.
     fn drop_root(&self, slug: &str, merge_into_slug: &str) {
+        // Empty merge target ⇒ plain eviction (idle/stale reaper): no frecency
+        // merge. The per-slug LMDB persists on disk, so a later re-load of the
+        // root is lossless. Never remove a root a live connection still holds
+        // (strong_count > 1) — mirrors evict_lru — else a concurrent query
+        // reconnects and mints a duplicate EngineState/index/watcher.
+        if merge_into_slug.is_empty() {
+            let mut map = self.roots.write();
+            match map.get(slug) {
+                Some(e) if Arc::strong_count(&e.state) > 1 => {
+                    tracing::debug!(
+                        "worker-{}: skip idle-evict {slug}: live connection holds it",
+                        self.index
+                    );
+                }
+                Some(_) => {
+                    map.remove(slug);
+                    tracing::info!("worker-{}: dropped idle root {slug}", self.index);
+                }
+                None => {}
+            }
+            return;
+        }
+
         let (child, parent) = {
             let map = self.roots.read();
             (
@@ -196,7 +206,7 @@ impl WorkerState {
             _ => {}
         }
         if self.roots.write().remove(slug).is_some() {
-            tracing::info!("worker-{}: dropped subsumed root {slug}", self.index);
+            tracing::info!("worker-{}: dropped root {slug}", self.index);
         }
     }
 
@@ -205,17 +215,25 @@ impl WorkerState {
     // the actual file count / dirty count read happens after dropping the
     // worker-level lock by going through each EngineState's picker.
     fn collect_health(&self) -> HealthResponse {
-        let snapshot: Vec<(String, Arc<EngineState>, Instant)> = {
+        let snapshot: Vec<(String, Arc<EngineState>, Instant, u64)> = {
             let map = self.roots.read();
             map.iter()
-                .map(|(slug, entry)| (slug.clone(), Arc::clone(&entry.state), entry.loaded_at))
+                .map(|(slug, entry)| {
+                    (
+                        slug.clone(),
+                        Arc::clone(&entry.state),
+                        entry.loaded_at,
+                        entry.state.last_access_ms(),
+                    )
+                })
                 .collect()
         };
 
         let now = Instant::now();
+        let now_wall = now_ms();
         let roots = snapshot
             .into_iter()
-            .map(|(slug, state, loaded_at)| {
+            .map(|(slug, state, loaded_at, last_access_ms)| {
                 let (indexed_files, dirty_count) = read_picker_freshness(&state);
                 RootHealth {
                     slug,
@@ -224,6 +242,7 @@ impl WorkerState {
                     last_scan_age_sec: Some(now.duration_since(loaded_at).as_secs()),
                     watcher_backlog: None,
                     dirty_count,
+                    last_access_age_sec: Some(now_wall.saturating_sub(last_access_ms) / 1000),
                 }
             })
             .collect();
@@ -239,7 +258,7 @@ impl WorkerState {
             let map = self.roots.read();
             map.iter()
                 .filter(|(_, e)| Arc::strong_count(&e.state) == 1)
-                .min_by_key(|(_, e)| e.last_access_ms.load(Ordering::Relaxed))
+                .min_by_key(|(_, e)| e.state.last_access_ms())
                 .map(|(slug, _)| slug.clone())
         };
 
@@ -783,4 +802,101 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use fff_ipc::types::FindOptions;
+
+    // No watcher / no content warmup keeps init cheap; frecency DB is redirected
+    // into a tempdir so the test never touches the user's XDG data dir.
+    fn light_config(frecency_db: &Path) -> FffConfig {
+        let mut c = FffConfig::default();
+        c.index.no_watch = true;
+        c.index.no_warmup = true;
+        c.frecency.db = Some(frecency_db.to_string_lossy().into_owned());
+        c
+    }
+
+    // Regression for the idle-signal-frozen bug: a pooled connection reuses one
+    // connect-time state, so a SECOND query on an already-loaded root must still
+    // advance last_access. Fails pre-fix (only Connect stamped); passes now that
+    // dispatch_request stamps every served request.
+    #[tokio::test]
+    async fn second_query_advances_last_access() {
+        let root = tempfile::tempdir().expect("root");
+        let frec = tempfile::tempdir().expect("frec");
+        let ws = WorkerState::new(0, light_config(frec.path()));
+        let state = ws
+            .get_or_init(root.path().to_path_buf())
+            .await
+            .expect("init root");
+
+        let before = state.last_access_ms();
+        // Sleep past ms resolution so a fresh stamp is observably newer.
+        std::thread::sleep(Duration::from_millis(5));
+
+        crate::server::dispatch_request(
+            &state,
+            SearchRequest::FindFiles {
+                query: String::new(),
+                options: FindOptions::default(),
+            },
+        )
+        .await;
+
+        let after = state.last_access_ms();
+        assert!(
+            after > before,
+            "second query must advance last_access ({after} !> {before})"
+        );
+
+        // collect_health reads the SAME field: its age derives from `after`, so
+        // a freshly-stamped root reports a near-zero last_access_age_sec.
+        let health = ws.collect_health();
+        let root_health = health.roots.first().expect("one loaded root");
+        assert!(
+            root_health.last_access_age_sec.expect("age surfaced") <= 1,
+            "health must surface the freshly-stamped last_access"
+        );
+    }
+
+    // Plain (idle/stale) eviction must never drop a root a live connection still
+    // holds, or a concurrent reconnect mints a duplicate EngineState. The live
+    // ref is the returned state Arc (strong_count > 1); dropping it makes the
+    // root evictable (strong_count == 1).
+    #[tokio::test]
+    async fn plain_eviction_respects_live_connection() {
+        let root = tempfile::tempdir().expect("root");
+        let frec = tempfile::tempdir().expect("frec");
+        let ws = WorkerState::new(0, light_config(frec.path()));
+        let state = ws
+            .get_or_init(root.path().to_path_buf())
+            .await
+            .expect("init root");
+        let slug = ws
+            .collect_health()
+            .roots
+            .first()
+            .expect("one loaded root")
+            .slug
+            .clone();
+
+        // Live connection holds `state`: plain eviction is a no-op.
+        ws.drop_root(&slug, "");
+        assert_eq!(
+            ws.collect_health().roots.len(),
+            1,
+            "root with a live connection must survive idle eviction"
+        );
+
+        // Release the live ref, then the reaper may reclaim it.
+        drop(state);
+        ws.drop_root(&slug, "");
+        assert!(
+            ws.collect_health().roots.is_empty(),
+            "idle root with no live connection must be dropped"
+        );
+    }
 }

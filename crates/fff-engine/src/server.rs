@@ -138,6 +138,12 @@ pub(crate) async fn dispatch_request(
     };
     use std::time::Instant;
 
+    // Stamp the root's idle signal on every served request — not just at
+    // Connect. A pooled connection reuses one connect-time state Arc for the
+    // process life, so without this a live root's last_access never advances
+    // and the reaper evicts it out from under the connection at the TTL.
+    state.touch_last_access();
+
     let start = Instant::now();
 
     let (label, response) = match req {

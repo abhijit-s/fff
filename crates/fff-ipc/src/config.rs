@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 /// no_watch = false
 /// no_warmup = false
 /// max_cached_files = 30000
+/// idle_root_ttl_secs = 21600  # evict on-demand roots unqueried this long
+/// #                             (0 = no idle eviction; deleted-worktree roots still reaped)
 ///
 /// [frecency]
 /// # db = "~/.local/share/fff/frecency/"  # set to share one DB across projects
@@ -174,6 +176,34 @@ pub struct IndexConfig {
     pub no_warmup: bool,
     /// Maximum number of files to keep content-cached in memory.
     pub max_cached_files: Option<usize>,
+    /// Seconds an on-demand root may go unqueried before the master evicts it
+    /// (reclaiming its worker slot and watcher). Unset ⇒ 21600 (6h). `0`
+    /// disables idle-age eviction only — deleted-directory / dangling-worktree
+    /// roots are still reaped. Env override: `FFF_IDLE_ROOT_TTL_SECS`. Configured
+    /// `[[mcp.roots]]` are always exempt.
+    pub idle_root_ttl_secs: Option<u64>,
+}
+
+impl IndexConfig {
+    pub const DEFAULT_IDLE_ROOT_TTL_SECS: u64 = 21600;
+
+    /// Resolve the idle-root TTL: `FFF_IDLE_ROOT_TTL_SECS` env override wins,
+    /// then the config value, then the 6h default. `0` means disabled.
+    pub fn resolved_idle_root_ttl_secs(&self) -> u64 {
+        // A set-but-unparseable env override is a user mistake worth surfacing
+        // rather than silently discarding. eprintln! (not tracing) mirrors the
+        // rest of this module — tracing may not be initialised yet.
+        if let Ok(raw) = std::env::var("FFF_IDLE_ROOT_TTL_SECS") {
+            match raw.parse() {
+                Ok(secs) => return secs,
+                Err(_) => {
+                    eprintln!("Warning: FFF_IDLE_ROOT_TTL_SECS={raw:?} is not a valid u64; ignoring")
+                }
+            }
+        }
+        self.idle_root_ttl_secs
+            .unwrap_or(Self::DEFAULT_IDLE_ROOT_TTL_SECS)
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -242,6 +272,30 @@ mod tests {
         assert_eq!(c.n_max, 4);
         assert_eq!(c.roots_per_worker_max, 8);
         assert_eq!(c.idle_ttl_secs, 300);
+    }
+
+    #[test]
+    fn index_idle_root_ttl_parses_and_defaults() {
+        let cfg: FffConfig = toml::from_str("[index]\nidle_root_ttl_secs = 600\n").unwrap();
+        assert_eq!(cfg.index.idle_root_ttl_secs, Some(600));
+
+        let bare: FffConfig = toml::from_str("[index]\nno_watch = true\n").unwrap();
+        assert_eq!(bare.index.idle_root_ttl_secs, None);
+    }
+
+    #[test]
+    fn resolved_idle_root_ttl_uses_default_when_unset() {
+        // No env override in this test process ⇒ config value, then the 6h default.
+        let unset = IndexConfig::default();
+        assert_eq!(
+            unset.resolved_idle_root_ttl_secs(),
+            IndexConfig::DEFAULT_IDLE_ROOT_TTL_SECS
+        );
+        let set = IndexConfig {
+            idle_root_ttl_secs: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(set.resolved_idle_root_ttl_secs(), 0);
     }
 
     #[test]
