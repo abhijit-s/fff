@@ -470,9 +470,10 @@ fn print_health_json(report: &HealthReport) {
     });
 }
 
-const HEALTH_HEADERS: [&str; 6] = ["ROOT", "SLUG", "FILES", "SCAN AGE", "BACKLOG", "DIRTY"];
+const HEALTH_HEADERS: [&str; 7] =
+    ["ROOT", "SLUG", "FILES", "SCAN AGE", "BACKLOG", "DIRTY", "IDLE"];
 // ROOT/SLUG left-aligned; numeric columns right-aligned.
-const HEALTH_RIGHT: [bool; 6] = [false, false, true, true, true, true];
+const HEALTH_RIGHT: [bool; 7] = [false, false, true, true, true, true, true];
 
 fn print_health_text(report: &HealthReport) {
     println!(
@@ -490,12 +491,12 @@ fn print_health_text(report: &HealthReport) {
             continue;
         }
         let header = HEALTH_HEADERS.map(String::from);
-        let rows: Vec<[String; 6]> = w.roots.iter().map(health_row).collect();
+        let rows: Vec<[String; 7]> = w.roots.iter().map(health_row).collect();
         print_table(&title, &header, &rows, &HEALTH_RIGHT);
     }
 }
 
-fn health_row(r: &RootHealth) -> [String; 6] {
+fn health_row(r: &RootHealth) -> [String; 7] {
     [
         if r.base_path.is_empty() {
             "<unknown>".to_string()
@@ -507,6 +508,7 @@ fn health_row(r: &RootHealth) -> [String; 6] {
         opt_secs(r.last_scan_age_sec),
         opt_u64(r.watcher_backlog),
         opt_u64(r.dirty_count),
+        opt_secs(r.last_access_age_sec),
     ]
 }
 

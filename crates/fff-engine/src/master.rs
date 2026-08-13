@@ -824,30 +824,31 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
         loop {
             ticker.tick().await;
 
-            // Phase 1: evict idle/stale on-demand roots. Decide under no lock
-            // (health snapshot + pure predicate), then tear each victim down
-            // without holding a lock across the worker DropRoot RPC. A worker
-            // left empty here is stopped by Phase 2 once idle_ttl elapses.
-            if idle_root_ttl_secs > 0 {
-                let report = ms_idle.collect_health().await;
-                let victims = roots_to_evict(
-                    &report,
-                    &ms_idle.configured_slugs,
-                    idle_root_ttl_secs,
-                    root_path_gone,
-                );
-                for (widx, slug) in victims {
-                    let socket = worker_socket_path(widx);
-                    if let Err(e) = send_drop_root(&socket, slug.clone(), String::new()).await {
-                        tracing::warn!(
-                            "master: eviction DropRoot for {slug} on worker-{widx} failed: {e}"
-                        );
-                    }
-                    ms_idle.handle_evicted_root(&slug).await;
-                    tracing::info!(
-                        "master: evicted idle/stale on-demand root {slug} from worker-{widx}"
+            // Phase 1: evict stale on-demand roots. Path-gone roots (deleted dir
+            // or dangling worktree) are reaped every tick regardless of TTL;
+            // idle-age eviction additionally applies when idle_root_ttl_secs > 0.
+            // Decide under no lock (health snapshot + pure predicate), then tear
+            // each victim down without holding a lock across the worker DropRoot
+            // RPC. A worker left empty here is stopped by Phase 2 once idle_ttl
+            // elapses.
+            let report = ms_idle.collect_health().await;
+            let victims = roots_to_evict(
+                &report,
+                &ms_idle.configured_slugs,
+                idle_root_ttl_secs,
+                root_path_gone,
+            );
+            for (widx, slug) in victims {
+                let socket = worker_socket_path(widx);
+                if let Err(e) = send_drop_root(&socket, slug.clone(), String::new()).await {
+                    tracing::warn!(
+                        "master: eviction DropRoot for {slug} on worker-{widx} failed: {e}"
                     );
                 }
+                ms_idle.handle_evicted_root(&slug).await;
+                tracing::info!(
+                    "master: evicted idle/stale on-demand root {slug} from worker-{widx}"
+                );
             }
 
             // Phase 2: stop workers with no loaded roots after idle_ttl_secs.
@@ -1150,11 +1151,11 @@ fn build_list_roots(configured: &[ConfiguredRoot], live: &[String]) -> Vec<WireR
 }
 
 // Decide which loaded roots to evict this reaper tick. Configured roots (by
-// slug) are always exempt. An on-demand root is evicted when it has gone
-// unqueried for `idle_ttl_secs` OR its path is gone (`path_gone`).
-// `idle_ttl_secs == 0` disables the whole pass. Pure over its inputs — the
-// clock lives in the health snapshot and the filesystem in the closure — so it
-// unit-tests without a running daemon.
+// slug) are always exempt. Path-gone eviction (`path_gone`) is unconditional; an
+// on-demand root also goes when unqueried for `idle_ttl_secs`. `idle_ttl_secs ==
+// 0` disables only the idle-age branch — path-gone roots are still reaped. Pure
+// over its inputs — the clock lives in the health snapshot and the filesystem in
+// the closure — so it unit-tests without a running daemon.
 #[cfg(unix)]
 fn roots_to_evict(
     report: &HealthReport,
@@ -1162,16 +1163,14 @@ fn roots_to_evict(
     idle_ttl_secs: u64,
     path_gone: impl Fn(&str) -> bool,
 ) -> Vec<(u32, String)> {
-    if idle_ttl_secs == 0 {
-        return Vec::new();
-    }
     let mut out = Vec::new();
     for w in &report.workers {
         for r in &w.roots {
             if configured_slugs.contains(&r.slug) {
                 continue;
             }
-            let idle_expired = r.last_access_age_sec.is_some_and(|age| age >= idle_ttl_secs);
+            let idle_expired = idle_ttl_secs > 0
+                && r.last_access_age_sec.is_some_and(|age| age >= idle_ttl_secs);
             if idle_expired || path_gone(&r.base_path) {
                 out.push((w.index, r.slug.clone()));
             }
@@ -1273,11 +1272,15 @@ mod tests {
     }
 
     #[test]
-    fn ttl_zero_disables_all_eviction() {
-        // Idle and path-gone, but ttl=0 disables the whole pass.
-        let report = health_report(vec![health_root("x", "/proj/x", Some(99999))]);
-        let evict = roots_to_evict(&report, &HashSet::new(), 0, |_| true);
-        assert!(evict.is_empty());
+    fn ttl_zero_keeps_idle_but_evicts_path_gone() {
+        // ttl=0 disables idle-age eviction only: the long-idle root is kept, but
+        // the path-gone root (queried seconds ago) is still reaped.
+        let report = health_report(vec![
+            health_root("idle", "/proj/idle", Some(99999)),
+            health_root("gone", "/proj/gone", Some(0)),
+        ]);
+        let evict = roots_to_evict(&report, &HashSet::new(), 0, |bp| bp == "/proj/gone");
+        assert_eq!(evict, vec![(7, "gone".to_string())]);
     }
 
     // A master state with one worker already holding `base_path`, so a handshake

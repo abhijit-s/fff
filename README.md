@@ -140,7 +140,9 @@ reaper reclaims these:
   = 6h) is evicted. "Queried" means any routed search/grep/git-status/etc.,
   not scan time.
 - **Path-gone**: an on-demand root whose directory no longer exists (or is a
-  dangling git worktree) is evicted on the next tick, regardless of idle time.
+  dangling git worktree) is evicted on the next tick, regardless of idle time —
+  and regardless of `idle_root_ttl_secs`, so deleted-worktree roots are reaped
+  even when idle eviction is turned off.
 - Roots declared under `[[mcp.roots]]` (and the `default`) are **exempt** from
   both — they are intentional and permanent.
 
@@ -148,7 +150,7 @@ Configure it under `[index]` in `~/.config/fff/config.toml`:
 
 ```toml
 [index]
-idle_root_ttl_secs = 21600   # 0 disables idle + path-gone eviction entirely
+idle_root_ttl_secs = 21600   # 0 = no idle eviction; deleted-worktree roots still reaped
 ```
 
 `FFF_IDLE_ROOT_TTL_SECS` overrides the config value. A frecency database persists

@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 /// no_watch = false
 /// no_warmup = false
 /// max_cached_files = 30000
-/// idle_root_ttl_secs = 21600  # evict on-demand roots unqueried this long (0 = never)
+/// idle_root_ttl_secs = 21600  # evict on-demand roots unqueried this long
+/// #                             (0 = no idle eviction; deleted-worktree roots still reaped)
 ///
 /// [frecency]
 /// # db = "~/.local/share/fff/frecency/"  # set to share one DB across projects
@@ -176,9 +177,10 @@ pub struct IndexConfig {
     /// Maximum number of files to keep content-cached in memory.
     pub max_cached_files: Option<usize>,
     /// Seconds an on-demand root may go unqueried before the master evicts it
-    /// (reclaiming its worker slot and watcher). Unset ⇒ 21600 (6h); `0`
-    /// disables idle- and path-gone eviction. Env override:
-    /// `FFF_IDLE_ROOT_TTL_SECS`. Configured `[[mcp.roots]]` are always exempt.
+    /// (reclaiming its worker slot and watcher). Unset ⇒ 21600 (6h). `0`
+    /// disables idle-age eviction only — deleted-directory / dangling-worktree
+    /// roots are still reaped. Env override: `FFF_IDLE_ROOT_TTL_SECS`. Configured
+    /// `[[mcp.roots]]` are always exempt.
     pub idle_root_ttl_secs: Option<u64>,
 }
 
