@@ -1586,6 +1586,7 @@ mod tests {
             last_scan_age_sec: Some(12),
             watcher_backlog: None,
             dirty_count: Some(47),
+            last_access_age_sec: Some(90),
         }];
         let workers = vec![WorkerHealthJson {
             index: 0,

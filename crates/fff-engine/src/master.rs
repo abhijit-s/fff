@@ -1,6 +1,6 @@
 #[cfg(unix)]
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -59,6 +59,10 @@ struct MasterState {
     /// Configured `[mcp]` roots (name, canonical path, is_default), default-first.
     /// Source of name/default for the `list_roots` verb.
     configured_roots: Vec<ConfiguredRoot>,
+    /// Slugs of configured roots — exempt from idle/path-gone eviction.
+    /// Precomputed from `configured_roots` so a later path-gone canonicalization
+    /// can't shift the slug and un-exempt a configured root.
+    configured_slugs: HashSet<String>,
 }
 
 // A configured `[mcp]` root, canonicalized and tagged with its default flag.
@@ -80,6 +84,10 @@ impl MasterState {
         adopted_pids: HashMap<u32, u32>,
         configured_roots: Vec<ConfiguredRoot>,
     ) -> Self {
+        let configured_slugs = configured_roots
+            .iter()
+            .map(|c| base_path_slug(&c.path))
+            .collect();
         Self {
             config,
             exe_path,
@@ -93,6 +101,7 @@ impl MasterState {
             save_fail_count: AtomicU32::new(0),
             started_at: Instant::now(),
             configured_roots,
+            configured_slugs,
         }
     }
 
@@ -661,6 +670,7 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
 
     let exe_path = std::env::current_exe()?;
     let configured_roots = configured_roots_from_mcp(&config.mcp);
+    let idle_root_ttl_secs = config.index.resolved_idle_root_ttl_secs();
     let worker_cfg = config.worker;
 
     // Load routing.json and probe surviving workers.
@@ -804,13 +814,43 @@ pub async fn run(config: fff_ipc::config::FffConfig) -> Result<(), Box<dyn std::
         }
     });
 
-    // Background: idle TTL — stop workers with no loaded roots after idle_ttl_secs.
+    // Background: idle TTL reaper. First evicts idle/stale on-demand roots
+    // (freeing their worker slots), then stops workers left with no loaded roots
+    // after idle_ttl_secs. Configured roots are exempt from eviction.
     let ms_idle = Arc::clone(&master_state);
     let idle_ttl = Duration::from_secs(worker_cfg.idle_ttl_secs);
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(60));
         loop {
             ticker.tick().await;
+
+            // Phase 1: evict idle/stale on-demand roots. Decide under no lock
+            // (health snapshot + pure predicate), then tear each victim down
+            // without holding a lock across the worker DropRoot RPC. A worker
+            // left empty here is stopped by Phase 2 once idle_ttl elapses.
+            if idle_root_ttl_secs > 0 {
+                let report = ms_idle.collect_health().await;
+                let victims = roots_to_evict(
+                    &report,
+                    &ms_idle.configured_slugs,
+                    idle_root_ttl_secs,
+                    root_path_gone,
+                );
+                for (widx, slug) in victims {
+                    let socket = worker_socket_path(widx);
+                    if let Err(e) = send_drop_root(&socket, slug.clone(), String::new()).await {
+                        tracing::warn!(
+                            "master: eviction DropRoot for {slug} on worker-{widx} failed: {e}"
+                        );
+                    }
+                    ms_idle.handle_evicted_root(&slug).await;
+                    tracing::info!(
+                        "master: evicted idle/stale on-demand root {slug} from worker-{widx}"
+                    );
+                }
+            }
+
+            // Phase 2: stop workers with no loaded roots after idle_ttl_secs.
             let now = Instant::now();
             let mut to_stop: Vec<u32> = vec![];
             {
@@ -1109,6 +1149,51 @@ fn build_list_roots(configured: &[ConfiguredRoot], live: &[String]) -> Vec<WireR
     out
 }
 
+// Decide which loaded roots to evict this reaper tick. Configured roots (by
+// slug) are always exempt. An on-demand root is evicted when it has gone
+// unqueried for `idle_ttl_secs` OR its path is gone (`path_gone`).
+// `idle_ttl_secs == 0` disables the whole pass. Pure over its inputs — the
+// clock lives in the health snapshot and the filesystem in the closure — so it
+// unit-tests without a running daemon.
+#[cfg(unix)]
+fn roots_to_evict(
+    report: &HealthReport,
+    configured_slugs: &HashSet<String>,
+    idle_ttl_secs: u64,
+    path_gone: impl Fn(&str) -> bool,
+) -> Vec<(u32, String)> {
+    if idle_ttl_secs == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for w in &report.workers {
+        for r in &w.roots {
+            if configured_slugs.contains(&r.slug) {
+                continue;
+            }
+            let idle_expired = r.last_access_age_sec.is_some_and(|age| age >= idle_ttl_secs);
+            if idle_expired || path_gone(&r.base_path) {
+                out.push((w.index, r.slug.clone()));
+            }
+        }
+    }
+    out
+}
+
+// A root's path is gone if the directory no longer exists, or it is a dangling
+// git worktree — a `.git` marker present yet no working tree resolves (e.g.
+// `git worktree remove` deleted the admin dir but left the checkout). A path
+// that was never a git root (no `.git` marker) is left to idle eviction only,
+// so legitimate non-repo roots are never reaped for lacking a working tree.
+#[cfg(unix)]
+fn root_path_gone(base_path: &str) -> bool {
+    let p = std::path::Path::new(base_path);
+    if !p.exists() {
+        return true;
+    }
+    p.join(".git").exists() && fff::git::working_tree_root(p).is_none()
+}
+
 // Collapse a result-serialization failure into an INTERNAL error envelope.
 #[cfg(unix)]
 fn ok_or_internal<E: std::fmt::Display>(r: Result<ResponseEnvelope, E>) -> ResponseEnvelope {
@@ -1126,8 +1211,74 @@ fn ok_or_internal<E: std::fmt::Display>(r: Result<ResponseEnvelope, E>) -> Respo
 mod tests {
     use super::*;
     use fff_ipc::types::HealthReport;
+    use fff_ipc::types::RootHealth;
     use fff_ipc::{PROTOCOL_MISMATCH, PROTOCOL_VERSION};
     use serde_json::json;
+
+    fn health_root(slug: &str, base_path: &str, last_access_age_sec: Option<u64>) -> RootHealth {
+        RootHealth {
+            slug: slug.into(),
+            base_path: base_path.into(),
+            indexed_files: None,
+            last_scan_age_sec: None,
+            watcher_backlog: None,
+            dirty_count: None,
+            last_access_age_sec,
+        }
+    }
+
+    // One worker (index 7) holding the given roots.
+    fn health_report(roots: Vec<RootHealth>) -> HealthReport {
+        HealthReport {
+            master_pid: 1,
+            uptime_sec: 0,
+            workers: vec![WorkerHealth {
+                index: 7,
+                pid: 100,
+                socket_path: "w.sock".into(),
+                roots,
+            }],
+        }
+    }
+
+    #[test]
+    fn evicts_root_idle_past_ttl() {
+        let report = health_report(vec![health_root("idle", "/proj/idle", Some(7200))]);
+        let evict = roots_to_evict(&report, &HashSet::new(), 3600, |_| false);
+        assert_eq!(evict, vec![(7, "idle".to_string())]);
+    }
+
+    #[test]
+    fn keeps_root_queried_within_ttl() {
+        let report = health_report(vec![health_root("hot", "/proj/hot", Some(60))]);
+        let evict = roots_to_evict(&report, &HashSet::new(), 3600, |_| false);
+        assert!(evict.is_empty());
+    }
+
+    #[test]
+    fn evicts_path_gone_root_regardless_of_idle() {
+        // Queried seconds ago, but its path is gone → evicted immediately.
+        let report = health_report(vec![health_root("gone", "/proj/gone", Some(0))]);
+        let evict = roots_to_evict(&report, &HashSet::new(), 3600, |bp| bp == "/proj/gone");
+        assert_eq!(evict, vec![(7, "gone".to_string())]);
+    }
+
+    #[test]
+    fn never_evicts_configured_root() {
+        // Idle AND path-gone, but configured → exempt from both.
+        let configured: HashSet<String> = ["cfg".to_string()].into_iter().collect();
+        let report = health_report(vec![health_root("cfg", "/proj/cfg", Some(99999))]);
+        let evict = roots_to_evict(&report, &configured, 3600, |_| true);
+        assert!(evict.is_empty());
+    }
+
+    #[test]
+    fn ttl_zero_disables_all_eviction() {
+        // Idle and path-gone, but ttl=0 disables the whole pass.
+        let report = health_report(vec![health_root("x", "/proj/x", Some(99999))]);
+        let evict = roots_to_evict(&report, &HashSet::new(), 0, |_| true);
+        assert!(evict.is_empty());
+    }
 
     // A master state with one worker already holding `base_path`, so a handshake
     // routing hit returns without spawning a real worker process.

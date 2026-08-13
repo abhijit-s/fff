@@ -175,8 +175,9 @@ root that is also live appears once and keeps its `name`/`default`).
 
 `HealthReport` is `{master_pid, uptime_sec, workers: [{index, pid, roots:
 [RootHealth]}]}`, where `RootHealth` is `{slug, base_path, indexed_files?,
-last_scan_age_sec?, watcher_backlog?, dirty_count?}` (numeric fields are nullable;
-`null` means "not measured", not zero).
+last_scan_age_sec?, watcher_backlog?, dirty_count?, last_access_age_sec?}` (numeric
+fields are nullable; `null` means "not measured", not zero). `last_access_age_sec`
+is seconds since the root last served a query and drives idle-root eviction.
 
 ### Worker-socket verbs
 

@@ -355,6 +355,7 @@ pub async fn handle_health(state: &EngineState) -> SearchResponse {
                 last_scan_age_sec: None,
                 watcher_backlog: None,
                 dirty_count: Some(dirty),
+                last_access_age_sec: None,
             }],
         })
     })

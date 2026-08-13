@@ -287,6 +287,10 @@ pub struct RootHealth {
     pub last_scan_age_sec: Option<u64>,
     pub watcher_backlog: Option<u64>,
     pub dirty_count: Option<u64>,
+    /// Seconds since this root last served a query. Drives idle-root eviction.
+    /// Appended last to preserve bincode field order for existing consumers.
+    #[serde(default)]
+    pub last_access_age_sec: Option<u64>,
 }
 
 /// Response to `SearchRequest::Health` — all roots loaded by a single worker.
@@ -613,6 +617,7 @@ mod tests {
                 last_scan_age_sec: Some(12),
                 watcher_backlog: None,
                 dirty_count: Some(47),
+                last_access_age_sec: Some(90),
             }],
         });
         let rt = round_trip(&resp);
@@ -625,6 +630,7 @@ mod tests {
                 assert_eq!(r.roots[0].last_scan_age_sec, Some(12));
                 assert_eq!(r.roots[0].watcher_backlog, None);
                 assert_eq!(r.roots[0].dirty_count, Some(47));
+                assert_eq!(r.roots[0].last_access_age_sec, Some(90));
             }
             _ => panic!("wrong variant"),
         }
@@ -646,6 +652,7 @@ mod tests {
                     last_scan_age_sec: Some(5),
                     watcher_backlog: None,
                     dirty_count: Some(2),
+                    last_access_age_sec: Some(30),
                 }],
             }],
         });

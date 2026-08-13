@@ -128,6 +128,32 @@ claude mcp add -s user fff -- $(brew --prefix)/bin/fff-mcp
 
 Tools accept an optional `base_path` matching a root's `name` or path; omitting it targets `default`. A positional argument (`fff-mcp /path/to/project`) overrides `[mcp].default` for a single root, `--root <PATH>` merges extra roots, and `--config <PATH>` points at an alternate `config.toml`.
 
+### Reclaiming idle on-demand roots
+
+Any `base_path` a tool call passes is registered as an *on-demand* root and stays
+resident in a worker (holding a watcher and index) so repeat searches are warm.
+Worktree-aware routing gives each git worktree its own scoped root, so a
+throwaway worktree leaves a root behind after `git worktree remove`. The master
+reaper reclaims these:
+
+- **Idle**: an on-demand root unqueried for `idle_root_ttl_secs` (default 21600
+  = 6h) is evicted. "Queried" means any routed search/grep/git-status/etc.,
+  not scan time.
+- **Path-gone**: an on-demand root whose directory no longer exists (or is a
+  dangling git worktree) is evicted on the next tick, regardless of idle time.
+- Roots declared under `[[mcp.roots]]` (and the `default`) are **exempt** from
+  both — they are intentional and permanent.
+
+Configure it under `[index]` in `~/.config/fff/config.toml`:
+
+```toml
+[index]
+idle_root_ttl_secs = 21600   # 0 disables idle + path-gone eviction entirely
+```
+
+`FFF_IDLE_ROOT_TTL_SECS` overrides the config value. A frecency database persists
+on disk per root, so a re-queried root reloads losslessly after eviction.
+
 ### Managing daemons with `fffctl`
 
 `fff-mcp` spawns one `fff-engine` daemon per project root the first time it's queried. They keep running in the background; manage them with `fffctl`:

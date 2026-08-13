@@ -179,24 +179,29 @@ impl WorkerState {
     // the master during containment subsumption. Arcs are cloned under a brief
     // read lock; the merge runs lock-free; removal takes the write lock.
     fn drop_root(&self, slug: &str, merge_into_slug: &str) {
-        let (child, parent) = {
-            let map = self.roots.read();
-            (
-                map.get(slug).map(|e| Arc::clone(&e.state)),
-                map.get(merge_into_slug).map(|e| Arc::clone(&e.state)),
-            )
-        };
-        match (&child, &parent) {
-            (Some(child), Some(parent)) => merge_child_frecency(parent, child),
-            (Some(_), None) => tracing::warn!(
-                "worker-{}: subsuming {slug} but parent {merge_into_slug} is not loaded here \
-                 — frecency not merged (parent re-accrues signal as it is used)",
-                self.index
-            ),
-            _ => {}
+        // Empty merge target ⇒ plain eviction (idle/stale reaper): no frecency
+        // merge. The per-slug LMDB persists on disk, so a later re-load of the
+        // root is lossless.
+        if !merge_into_slug.is_empty() {
+            let (child, parent) = {
+                let map = self.roots.read();
+                (
+                    map.get(slug).map(|e| Arc::clone(&e.state)),
+                    map.get(merge_into_slug).map(|e| Arc::clone(&e.state)),
+                )
+            };
+            match (&child, &parent) {
+                (Some(child), Some(parent)) => merge_child_frecency(parent, child),
+                (Some(_), None) => tracing::warn!(
+                    "worker-{}: subsuming {slug} but parent {merge_into_slug} is not loaded here \
+                     — frecency not merged (parent re-accrues signal as it is used)",
+                    self.index
+                ),
+                _ => {}
+            }
         }
         if self.roots.write().remove(slug).is_some() {
-            tracing::info!("worker-{}: dropped subsumed root {slug}", self.index);
+            tracing::info!("worker-{}: dropped root {slug}", self.index);
         }
     }
 
@@ -205,17 +210,25 @@ impl WorkerState {
     // the actual file count / dirty count read happens after dropping the
     // worker-level lock by going through each EngineState's picker.
     fn collect_health(&self) -> HealthResponse {
-        let snapshot: Vec<(String, Arc<EngineState>, Instant)> = {
+        let snapshot: Vec<(String, Arc<EngineState>, Instant, u64)> = {
             let map = self.roots.read();
             map.iter()
-                .map(|(slug, entry)| (slug.clone(), Arc::clone(&entry.state), entry.loaded_at))
+                .map(|(slug, entry)| {
+                    (
+                        slug.clone(),
+                        Arc::clone(&entry.state),
+                        entry.loaded_at,
+                        entry.last_access_ms.load(Ordering::Relaxed),
+                    )
+                })
                 .collect()
         };
 
         let now = Instant::now();
+        let now_wall = now_ms();
         let roots = snapshot
             .into_iter()
-            .map(|(slug, state, loaded_at)| {
+            .map(|(slug, state, loaded_at, last_access_ms)| {
                 let (indexed_files, dirty_count) = read_picker_freshness(&state);
                 RootHealth {
                     slug,
@@ -224,6 +237,7 @@ impl WorkerState {
                     last_scan_age_sec: Some(now.duration_since(loaded_at).as_secs()),
                     watcher_backlog: None,
                     dirty_count,
+                    last_access_age_sec: Some(now_wall.saturating_sub(last_access_ms) / 1000),
                 }
             })
             .collect();
