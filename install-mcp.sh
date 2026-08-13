@@ -2,7 +2,7 @@
 set -eo pipefail
 
 # FFF MCP Server installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/dmtrKovalenko/fff.nvim/main/install-mcp.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/dmtrKovalenko/fff/main/install-mcp.sh | bash
 
 REPO="abhijit-s/fff"
 BINARY_NAME="fff-mcp"
