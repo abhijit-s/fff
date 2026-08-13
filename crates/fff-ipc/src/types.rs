@@ -288,7 +288,12 @@ pub struct RootHealth {
     pub watcher_backlog: Option<u64>,
     pub dirty_count: Option<u64>,
     /// Seconds since this root last served a query. Drives idle-root eviction.
-    /// Appended last to preserve bincode field order for existing consumers.
+    /// New fields go LAST because bincode is positional. `#[serde(default)]`
+    /// only backfills self-describing formats (JSON), NOT bincode: a new master
+    /// decoding an OLD adopted worker's shorter `RootHealth` runs out of bytes
+    /// and the health decode fails. That degrades safely — empty health evicts
+    /// nothing, and Phase 2 eviction routes by routing.json, not health — so do
+    /// not over-trust append-last + default the next time a field is added.
     #[serde(default)]
     pub last_access_age_sec: Option<u64>,
 }

@@ -1187,9 +1187,17 @@ fn roots_to_evict(
 #[cfg(unix)]
 fn root_path_gone(base_path: &str) -> bool {
     let p = std::path::Path::new(base_path);
-    if !p.exists() {
-        return true;
+    // Only a CONFIRMED not-found counts as gone. Any other stat error
+    // (EACCES, I/O, an unreachable network mount, a mid-flight worktree/rebase
+    // rewriting `.git`) is transient — keep the root rather than reap it.
+    match std::fs::symlink_metadata(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+        Ok(_) => {}
     }
+    // Dangling git worktree: a `.git` marker present yet no working tree
+    // resolves. Reached only once the path is confirmed present above, so this
+    // fires on a real resolution failure, not a transient stat error.
     p.join(".git").exists() && fff::git::working_tree_root(p).is_none()
 }
 

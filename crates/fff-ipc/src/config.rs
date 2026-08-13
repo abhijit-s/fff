@@ -190,10 +190,18 @@ impl IndexConfig {
     /// Resolve the idle-root TTL: `FFF_IDLE_ROOT_TTL_SECS` env override wins,
     /// then the config value, then the 6h default. `0` means disabled.
     pub fn resolved_idle_root_ttl_secs(&self) -> u64 {
-        std::env::var("FFF_IDLE_ROOT_TTL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(self.idle_root_ttl_secs)
+        // A set-but-unparseable env override is a user mistake worth surfacing
+        // rather than silently discarding. eprintln! (not tracing) mirrors the
+        // rest of this module — tracing may not be initialised yet.
+        if let Ok(raw) = std::env::var("FFF_IDLE_ROOT_TTL_SECS") {
+            match raw.parse() {
+                Ok(secs) => return secs,
+                Err(_) => {
+                    eprintln!("Warning: FFF_IDLE_ROOT_TTL_SECS={raw:?} is not a valid u64; ignoring")
+                }
+            }
+        }
+        self.idle_root_ttl_secs
             .unwrap_or(Self::DEFAULT_IDLE_ROOT_TTL_SECS)
     }
 }

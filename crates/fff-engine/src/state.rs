@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fff::file_picker::FilePicker;
 use fff::frecency::FrecencyTracker;
@@ -23,6 +24,20 @@ pub struct EngineState {
     // Last time the get_git_status serve path recomputed status. TTL-gates a
     // live refresh so out-of-band edits the watcher missed still surface.
     pub last_git_refresh: std::sync::Mutex<Option<std::time::Instant>>,
+    // Unix-epoch ms of the last served request. Stamped lock-free on the query
+    // hot path so a pooled (persistent) connection keeps the root's idle signal
+    // fresh; read verbatim by the worker health snapshot that drives eviction.
+    last_access_ms: AtomicU64,
+}
+
+impl EngineState {
+    pub fn touch_last_access(&self) {
+        self.last_access_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn last_access_ms(&self) -> u64 {
+        self.last_access_ms.load(Ordering::Relaxed)
+    }
 }
 
 pub fn init(args: &EffectiveArgs) -> Result<EngineState, Box<dyn std::error::Error>> {
@@ -75,6 +90,7 @@ pub fn init(args: &EffectiveArgs) -> Result<EngineState, Box<dyn std::error::Err
         shared_frecency,
         base_path,
         last_git_refresh: std::sync::Mutex::new(None),
+        last_access_ms: AtomicU64::new(now_ms()),
     })
 }
 
@@ -97,4 +113,11 @@ fn default_frecency_path(base_path: &Path) -> PathBuf {
         .join("fff")
         .join("frecency")
         .join(fff_ipc::base_path_slug(base_path))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
