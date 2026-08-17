@@ -127,21 +127,63 @@ Parameters:
 Mode precedence:
 1. `--fff-mode <mode>` CLI flag
 2. `PI_FFF_MODE=<mode>` environment variable
-3. default (`tools-and-ui`)
+3. `mode` in the global config file
+4. default (`tools-and-ui`)
+
+## Configuration
+
+For persistent global configuration, create `pi-fff.json` in pi's agent directory (`~/.pi/agent/pi-fff.json` by default; `PI_CODING_AGENT_DIR` is respected):
+
+```json
+{
+  "mode": "override",
+  "frecencyDbPath": "/path/to/frecency",
+  "historyDbPath": "/path/to/history",
+  "enableFsRootScanning": false,
+  "enableHomeDirScanning": true
+}
+```
+
+All fields are optional:
+
+| Field | Type | Default |
+|---|---|---|
+| `mode` | `tools-and-ui`, `tools-only`, or `override` | `tools-and-ui` |
+| `frecencyDbPath` | non-empty string | See [Data](#data) |
+| `historyDbPath` | non-empty string | See [Data](#data) |
+| `enableFsRootScanning` | boolean | `false` |
+| `enableHomeDirScanning` | boolean | `true` |
+
+CLI flags take precedence over environment variables, which take precedence over this file. A missing file is ignored. Malformed JSON, unknown fields, and invalid values stop the extension from loading and report the file path and error. `/fff-mode` changes the current session; it does not edit this file.
+
+The file is global only. Project-level config cannot safely control tool names because pi decides which tools an extension registers before project configuration can be trusted.
 
 ## Flags
 
 - `--fff-mode <mode>` — set mode (see above)
-- `--fff-frecency-db <path>` — path to frecency database (also: `FFF_FRECENCY_DB` env)
-- `--fff-history-db <path>` — path to query history database (also: `FFF_HISTORY_DB` env)
+- `--fff-frecency-db <path>` — path to frecency database (also: `FFF_FRECENCY_DB` env). Optional; see [Data](#data) for the default.
+- `--fff-history-db <path>` — path to query history database (also: `FFF_HISTORY_DB` env). Optional; see [Data](#data) for the default.
 - `--fff-enable-root-scan` — allow indexing when launched from `/` (also: `FFF_ENABLE_ROOT_SCAN=1` env). FFF refuses to init at the filesystem root by default.
 - `--fff-enable-home-scan` — index the home directory when launched from `$HOME` (also: `FFF_ENABLE_HOME_SCAN` env). Enabled by default. Disable with `--fff-enable-home-scan=false` or `FFF_ENABLE_HOME_SCAN=0` if your `$HOME` contains huge trees (toolchains, kernel sources, build outputs) that make the background index run for a long time. When launched from `$HOME` with this enabled, pi shows a warning that the whole home tree is being indexed.
 
 ## Data
 
-When database paths are provided, FFF stores:
-- frecency database — file access frequency/recency
-- history database — query-to-file selection history
+FFF uses two LMDB databases:
+- frecency database - file access frequency/recency, used to rank results
+- history database - query-to-file selection history
+
+Each path is resolved independently, in this order:
+
+1. CLI flag — `--fff-frecency-db` / `--fff-history-db`
+2. Env var — `FFF_FRECENCY_DB` / `FFF_HISTORY_DB`
+3. Global config — `frecencyDbPath` / `historyDbPath`
+4. An existing [fff.nvim](https://github.com/dmtrKovalenko/fff.nvim) database, so pi reuses the frecency you built up in your editor:
+   - frecency: `$XDG_CACHE_HOME/nvim/fff_nvim`
+   - history: `$XDG_DATA_HOME/nvim/fff_queries`
+   - `XDG_CACHE_HOME` defaults to `~/.cache` and `XDG_DATA_HOME` to `~/.local/share`; on Windows both fall back under `%LOCALAPPDATA%\nvim-data`. Only directories count — a plain file at those paths is ignored.
+5. pi-local directory, created on demand — `$PI_CODING_AGENT_DIR/fff/{frecency,history}`, defaulting to `~/.pi/agent/fff/{frecency,history}`
+
+The extension only reads these databases; it never records the agent's own searches into your Neovim history. If a database cannot be opened, the finder starts without persistence and pi shows a warning instead of failing.
 
 No project files are uploaded anywhere by this extension. It runs locally and only uses the configured LLM through pi itself.
 

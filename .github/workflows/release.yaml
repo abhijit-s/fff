@@ -2,7 +2,7 @@ name: Build & Publish
 
 on:
   push:
-    branches: [main, fix/use-trusted-publishing]
+    branches: [main, fix/npm-pulish]
     tags:
       - "v*"
   pull_request:
@@ -17,10 +17,18 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   build-nvim:
     name: Build Neovim ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     permissions:
       contents: read
       id-token: write
@@ -94,6 +102,11 @@ jobs:
         with:
           key: nvim-${{ matrix.target }}
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.17.0
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -149,6 +162,10 @@ jobs:
   build-c:
     name: Build C FFI ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     permissions:
       contents: read
     strategy:
@@ -232,6 +249,11 @@ jobs:
         with:
           key: c-${{ matrix.target }}
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.17.0
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -298,6 +320,10 @@ jobs:
   build-mcp:
     name: Build MCP ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     permissions:
       contents: read
     strategy:
@@ -349,6 +375,11 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
           key: mcp-${{ matrix.target }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.17.0
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -508,7 +539,7 @@ jobs:
     name: Release
     needs: [build-nvim, build-c, build-mcp, build-python, build-python-sdist]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/use-trusted-publishing' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: write
     steps:
@@ -786,6 +817,16 @@ jobs:
             fi
           done
 
+      # Every install must happen before the first set-npm-version: the bump
+      # injects platform optionalDependencies that only resolve once published,
+      # and npm ci validates the whole workspace against the lockfile.
+      - name: Install and build JS packages
+        working-directory: packages
+        run: |
+          npm ci
+          (cd fff-bun && npm run build)
+          (cd fff-node && npm run build)
+
       - name: Publish bun package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
@@ -795,8 +836,6 @@ jobs:
           make set-npm-version PKG=packages/fff-bun VERSION="$VERSION"
 
           cd packages/fff-bun
-          bun install --frozen-lockfile
-          bun run build
           npm publish --tag "$TAG" --access public --provenance
 
       - name: Publish Node.js package
@@ -808,8 +847,6 @@ jobs:
           make set-npm-version PKG=packages/fff-node VERSION="$VERSION"
 
           cd packages/fff-node
-          npm install
-          npm run build
           npm publish --tag "$TAG" --access public --provenance
 
       - name: Publish pi-fff package

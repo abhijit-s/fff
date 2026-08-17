@@ -41,8 +41,15 @@ git2 = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.8"
 libc = "0.2"
 
 # One `fff` .deb bundling the daemon trio. Built with --no-build after a

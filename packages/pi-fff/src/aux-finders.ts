@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { FileFinderApi } from "@ff-labs/fff-node";
+import type { FilePickerFactory } from "./file-picker";
 import { HOME_DIR } from "./paths";
-import { loadSdk, SCAN_TIMEOUT_MS } from "./sdk";
 
 export const MAX_AUX = 3;
 export const IDLE_TTL_MS = 5 * 60 * 1000;
@@ -16,6 +16,7 @@ interface AuxPicker {
 export interface AuxOpts {
   enableFsRootScanning: boolean;
   enableHomeDirScanning?: boolean;
+  pickers: FilePickerFactory;
   // Called before a newly spawned aux picker starts a scan that covers $HOME.
   onHomeDirScan?: (root: string) => void;
 }
@@ -99,25 +100,13 @@ export class AuxFinderPool {
       this.opts.onHomeDirScan?.(root);
     }
 
-    const { FileFinder } = await loadSdk();
-    // LMDB env can only be opened once per process; the main finder already
-    // owns the frecency/history DBs. Aux finders are transient and run without
-    // persistent scoring — see issue #700.
-    const result = FileFinder.create({
+    const finder = await this.opts.pickers.create({
       basePath: root,
-      aiMode: true,
       enableHomeDirScanning,
       enableFsRootScanning: this.opts.enableFsRootScanning,
     });
-    if (!result.ok)
-      throw new Error(`Failed to create aux file finder for ${root}: ${result.error}`);
 
-    await result.value.waitForScan(SCAN_TIMEOUT_MS);
-    const entry: AuxPicker = {
-      root,
-      finder: result.value,
-      lastUsed: Date.now(),
-    };
+    const entry: AuxPicker = { root, finder, lastUsed: Date.now() };
     this.entries.push(entry);
     return entry;
   }

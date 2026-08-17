@@ -1,5 +1,7 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 
 type MockFinder = {
   isDestroyed: boolean;
@@ -87,7 +89,7 @@ mock.module("@sinclair/typebox", () => ({
       properties,
       options,
     }),
-    Optional: (value: unknown) => ({ ...value, optional: true }),
+    Optional: (value: Record<string, unknown>) => ({ ...value, optional: true }),
     String: schema("string"),
     Union: (items: unknown[], options?: unknown) => ({ type: "union", items, options }),
   },
@@ -97,12 +99,14 @@ const { default: fffExtension } = await import("../src/index");
 
 type EventHandler = (...args: any[]) => unknown;
 
-function createPi(mode?: string) {
+function createPi(mode?: string, flags: Record<string, unknown> = {}) {
   const events = new Map<string, EventHandler>();
   const commands = new Map<string, any>();
 
   const pi = {
-    getFlag: mock((name: string) => (name === "fff-mode" ? mode : undefined)),
+    getFlag: mock((name: string) =>
+      name === "fff-mode" && mode !== undefined ? mode : flags[name],
+    ),
     on: mock((event: string, handler: EventHandler) => {
       events.set(event, handler);
     }),
@@ -110,7 +114,7 @@ function createPi(mode?: string) {
       commands.set(name, command);
     }),
     registerFlag: mock(() => undefined),
-    registerTool: mock(() => undefined),
+    registerTool: mock((_tool: any) => undefined),
     appendEntry: mock(() => undefined),
   };
 
@@ -120,17 +124,18 @@ function createPi(mode?: string) {
 function createContext(cwd = "/tmp/workspace") {
   return {
     cwd,
+    // Signatures mirror the real pi UI surface so mock.calls stays typed.
     ui: {
-      addAutocompleteProvider: mock(() => undefined),
-      notify: mock(() => undefined),
+      addAutocompleteProvider: mock((_factory: (current: any) => any) => undefined),
+      notify: mock((_message: string, _level?: string) => undefined),
       setEditorComponent: mock(() => undefined),
-      setStatus: mock(() => undefined),
+      setStatus: mock((_key: string, _text?: string) => undefined),
     },
   };
 }
 
-async function start(mode?: string, cwd?: string) {
-  const setup = createPi(mode);
+async function start(mode?: string, cwd?: string, flags: Record<string, unknown> = {}) {
+  const setup = createPi(mode, flags);
   const ctx = createContext(cwd);
   fffExtension(setup.pi as any);
 
@@ -159,14 +164,105 @@ function abortOptions() {
   return { signal: new AbortController().signal };
 }
 
+const CONFIG_ENV_KEYS = [
+  "PI_CODING_AGENT_DIR",
+  "PI_FFF_MODE",
+  "FFF_FRECENCY_DB",
+  "FFF_HISTORY_DB",
+  "FFF_ENABLE_ROOT_SCAN",
+  "FFF_ENABLE_HOME_SCAN",
+] as const;
+
+const savedEnv: Record<string, string | undefined> = {};
+for (const key of CONFIG_ENV_KEYS) savedEnv[key] = process.env[key];
+
+const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fff-extension-"));
+const configPath = path.join(agentDir, "pi-fff.json");
+
 beforeEach(() => {
   createCalls.length = 0;
   finders = [];
   mixedSearchImpl = undefined;
   scanProgressImpl = undefined;
-  delete process.env.PI_FFF_MODE;
-  delete process.env.FFF_ENABLE_HOME_SCAN;
+
+  for (const key of CONFIG_ENV_KEYS) delete process.env[key];
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  fs.rmSync(configPath, { force: true });
 });
+
+afterAll(() => {
+  for (const key of CONFIG_ENV_KEYS) {
+    const value = savedEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  fs.rmSync(agentDir, { recursive: true, force: true });
+});
+
+describe("pi-fff global config", () => {
+  test("applies every supported startup option", async () => {
+    writeConfig({
+      mode: "override",
+      frecencyDbPath: "/config/frecency",
+      historyDbPath: "/config/history",
+      enableFsRootScanning: true,
+      enableHomeDirScanning: false,
+    });
+
+    const setup = await start();
+    const toolNames = setup.pi.registerTool.mock.calls.map(([tool]) => tool.name);
+
+    expect(toolNames).toContain("grep");
+    expect(toolNames).toContain("find");
+    expect(toolNames).not.toContain("ffgrep");
+    expect(createCalls[0]).toEqual({
+      basePath: "/tmp/workspace",
+      frecencyDbPath: "/config/frecency",
+      historyDbPath: "/config/history",
+      aiMode: true,
+      enableHomeDirScanning: false,
+      enableFsRootScanning: true,
+    });
+    await shutdown(setup);
+  });
+
+  test("keeps flag and environment precedence", async () => {
+    writeConfig({
+      mode: "tools-only",
+      frecencyDbPath: "/config/frecency",
+      historyDbPath: "/config/history",
+      enableFsRootScanning: true,
+      enableHomeDirScanning: false,
+    });
+    process.env.PI_FFF_MODE = "override";
+    process.env.FFF_FRECENCY_DB = "/env/frecency";
+    process.env.FFF_HISTORY_DB = "/env/history";
+    process.env.FFF_ENABLE_ROOT_SCAN = "1";
+    process.env.FFF_ENABLE_HOME_SCAN = "1";
+
+    const setup = await start("tools-and-ui", undefined, {
+      "fff-frecency-db": "/flag/frecency",
+      "fff-enable-root-scan": false,
+    });
+    const toolNames = setup.pi.registerTool.mock.calls.map(([tool]) => tool.name);
+
+    expect(toolNames).toContain("ffgrep");
+    expect(toolNames).toContain("fffind");
+    expect(createCalls[0]).toEqual({
+      basePath: "/tmp/workspace",
+      frecencyDbPath: "/flag/frecency",
+      historyDbPath: "/env/history",
+      aiMode: true,
+      enableHomeDirScanning: true,
+      enableFsRootScanning: false,
+    });
+    await shutdown(setup);
+  });
+});
+
+function writeConfig(config: Record<string, unknown>): void {
+  fs.writeFileSync(configPath, JSON.stringify(config));
+}
 
 // Regression for #743: launching from $HOME must be visible and interruptible.
 describe("pi-fff $HOME scan warning", () => {
@@ -211,9 +307,9 @@ describe("pi-fff $HOME scan warning", () => {
     });
     const setup = await start(undefined, os.homedir());
 
-    const [key, text] = setup.ctx.ui.setStatus.mock.calls.at(-1) as [string, string];
-    expect(key).toBe("fff");
-    expect(text).toContain("12345 files");
+    const lastStatus = setup.ctx.ui.setStatus.mock.calls.at(-1);
+    expect(lastStatus?.[0]).toBe("fff");
+    expect(lastStatus?.[1]).toContain("12345 files");
 
     // session_shutdown must stop the poller and clear the footer.
     await shutdown(setup);
@@ -239,8 +335,9 @@ describe("pi-fff autocomplete registration", () => {
     expect(createCalls).toEqual([
       {
         basePath: "/tmp/workspace",
-        frecencyDbPath: undefined,
-        historyDbPath: undefined,
+        // Resolved defaults are host-dependent; covered by test/db-paths.test.ts.
+        frecencyDbPath: expect.any(String),
+        historyDbPath: expect.any(String),
         aiMode: true,
         enableHomeDirScanning: true,
         enableFsRootScanning: false,
