@@ -642,7 +642,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fff-c"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "fff-query-parser",
  "fff-search",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "fff-ctl"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "clap",
  "clap_complete",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "fff-engine"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "bincode",
  "blake3",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "fff-grep"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "bstr",
  "memchr",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "fff-ipc"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "bincode",
  "blake3",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "fff-mcp"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "clap",
  "clap_complete",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "fff-nvim"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "ahash",
  "chrono",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "fff-python"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "fff-query-parser",
  "fff-search",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "fff-query-parser"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "criterion",
  "zlob",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "fff-search"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "ahash",
  "aho-corasick",
