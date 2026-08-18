@@ -190,7 +190,7 @@ impl IndexConfig {
     /// Resolve the idle-root TTL: `FFF_IDLE_ROOT_TTL_SECS` env override wins,
     /// then the config value, then the 6h default. `0` means disabled.
     pub fn resolved_idle_root_ttl_secs(&self) -> u64 {
-        // A set-but-unparseable env override is a user mistake worth surfacing
+        // A set-but-unparsable env override is a user mistake worth surfacing
         // rather than silently discarding. eprintln! (not tracing) mirrors the
         // rest of this module — tracing may not be initialised yet.
         if let Ok(raw) = std::env::var("FFF_IDLE_ROOT_TTL_SECS") {
@@ -239,7 +239,7 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Load the config from the default XDG path. Returns `FffConfig::default()`
-/// when the file is absent or unreadable/unparseable, warning to stderr
+/// when the file is absent or unreadable/unparsable, warning to stderr
 /// (tracing may not be initialised yet). The implicit path is best-effort;
 /// for an explicitly-named file use [`load_from`], which errors instead.
 pub fn load() -> FffConfig {

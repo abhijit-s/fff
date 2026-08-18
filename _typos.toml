@@ -1,5 +1,10 @@
 [files]
-extend-exclude = ["/CHANGELOG.md", "data/filetypes/base.lua"]
+extend-exclude = [
+  "/CHANGELOG.md",
+  "data/filetypes/base.lua",
+  # Armoured PGP keys are base64: every rotation lands new false positives.
+  "apt/*.asc",
+]
 
 [default.extend-words]
 noice = "noice"
