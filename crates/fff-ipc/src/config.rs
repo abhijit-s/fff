@@ -197,7 +197,9 @@ impl IndexConfig {
             match raw.parse() {
                 Ok(secs) => return secs,
                 Err(_) => {
-                    eprintln!("Warning: FFF_IDLE_ROOT_TTL_SECS={raw:?} is not a valid u64; ignoring")
+                    eprintln!(
+                        "Warning: FFF_IDLE_ROOT_TTL_SECS={raw:?} is not a valid u64; ignoring"
+                    )
                 }
             }
         }

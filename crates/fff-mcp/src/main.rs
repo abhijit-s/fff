@@ -11,12 +11,12 @@ pub(crate) mod client;
 mod cursor;
 mod healthcheck;
 mod output;
+mod parent;
 #[cfg(unix)]
 pub(crate) mod pool;
 #[cfg(unix)]
 mod recovery;
 pub(crate) mod registry;
-mod parent;
 mod server;
 mod update_check;
 

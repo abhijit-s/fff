@@ -1170,7 +1170,8 @@ fn roots_to_evict(
                 continue;
             }
             let idle_expired = idle_ttl_secs > 0
-                && r.last_access_age_sec.is_some_and(|age| age >= idle_ttl_secs);
+                && r.last_access_age_sec
+                    .is_some_and(|age| age >= idle_ttl_secs);
             if idle_expired || path_gone(&r.base_path) {
                 out.push((w.index, r.slug.clone()));
             }

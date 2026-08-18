@@ -470,8 +470,9 @@ fn print_health_json(report: &HealthReport) {
     });
 }
 
-const HEALTH_HEADERS: [&str; 7] =
-    ["ROOT", "SLUG", "FILES", "SCAN AGE", "BACKLOG", "DIRTY", "IDLE"];
+const HEALTH_HEADERS: [&str; 7] = [
+    "ROOT", "SLUG", "FILES", "SCAN AGE", "BACKLOG", "DIRTY", "IDLE",
+];
 // ROOT/SLUG left-aligned; numeric columns right-aligned.
 const HEALTH_RIGHT: [bool; 7] = [false, false, true, true, true, true, true];
 
@@ -1158,10 +1159,16 @@ fn cmd_audit(deep: bool, json: bool) -> i32 {
             if path.extension().and_then(|s| s.to_str()) != Some("lock") {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
+            let Some(stem) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+            else {
                 continue;
             };
-            let Some(lock) = lockfile::read(&path) else { continue };
+            let Some(lock) = lockfile::read(&path) else {
+                continue;
+            };
 
             let live = lock.is_alive();
             let sock = path.with_extension("sock");
@@ -1188,10 +1195,16 @@ fn cmd_audit(deep: bool, json: bool) -> i32 {
             if path.extension().and_then(|s| s.to_str()) != Some("lock") {
                 continue;
             }
-            let Some(slug) = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
+            let Some(slug) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+            else {
                 continue;
             };
-            let Some(lock) = lockfile::read(&path) else { continue };
+            let Some(lock) = lockfile::read(&path) else {
+                continue;
+            };
 
             let live = lock.is_alive();
             let sock = cache.join("sockets").join(format!("{slug}.sock"));
@@ -1237,16 +1250,19 @@ fn cmd_audit(deep: bool, json: bool) -> i32 {
             for (&idx, entry) in &table.workers {
                 let wl_path = fff_ipc::worker_lockfile_path(idx);
                 let ws_path = fff_ipc::worker_socket_path(idx);
-                let exists = artifacts.iter().any(|a| {
-                    a.kind == "worker"
-                        && a.label == format!("worker-{idx}")
-                });
+                let exists = artifacts
+                    .iter()
+                    .any(|a| a.kind == "worker" && a.label == format!("worker-{idx}"));
 
                 if !exists {
                     let lock_pid = lockfile::read(&wl_path).map(|l| l.pid);
                     let pid = lock_pid.unwrap_or(entry.pid);
                     let lock_live = lock_pid.is_some_and(|p| {
-                        Lockfile { pid: p, base_path: None }.is_alive()
+                        Lockfile {
+                            pid: p,
+                            base_path: None,
+                        }
+                        .is_alive()
                     });
                     let sock_ok = socket_reachable(&ws_path);
 
@@ -1282,11 +1298,19 @@ fn cmd_audit(deep: bool, json: bool) -> i32 {
 
     if json {
         print_json(&AuditJson {
-            summary: AuditSummaryJson { total, live, stale, zombie },
+            summary: AuditSummaryJson {
+                total,
+                live,
+                stale,
+                zombie,
+            },
             artifacts,
         });
     } else {
-        println!("{:<12}  {:<22}  {:<8}  {:<6}  DETAIL", "KIND", "LABEL", "PID", "STATUS");
+        println!(
+            "{:<12}  {:<22}  {:<8}  {:<6}  DETAIL",
+            "KIND", "LABEL", "PID", "STATUS"
+        );
         println!("{}", "-".repeat(80));
         for a in &artifacts {
             let icon = match a.status.as_str() {
@@ -1305,9 +1329,7 @@ fn cmd_audit(deep: bool, json: bool) -> i32 {
             );
         }
         println!("{}", "-".repeat(80));
-        println!(
-            "{total} artifact(s): {live} live, {stale} stale, {zombie} zombie",
-        );
+        println!("{total} artifact(s): {live} live, {stale} stale, {zombie} zombie",);
     }
 
     if stale > 0 || zombie > 0 {
@@ -1323,7 +1345,10 @@ fn classify(live: bool, socket_ok: bool, extra_hint: Option<String>) -> (String,
     } else if socket_ok {
         ("live".into(), extra_hint)
     } else {
-        ("zombie".into(), extra_hint.or(Some("PID alive but socket unreachable".into())))
+        (
+            "zombie".into(),
+            extra_hint.or(Some("PID alive but socket unreachable".into())),
+        )
     }
 }
 
