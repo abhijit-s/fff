@@ -242,7 +242,7 @@ pub async fn handle_get_git_status(state: &EngineState, include_clean: bool) -> 
     // authoritative while rapid repeated calls reuse a fresh-enough result.
     const GIT_STATUS_TTL: Duration = Duration::from_secs(3);
     let needs_refresh = match state.last_git_refresh.lock() {
-        Ok(g) => (*g).map_or(true, |t| t.elapsed() >= GIT_STATUS_TTL),
+        Ok(g) => (*g).is_none_or(|t| t.elapsed() >= GIT_STATUS_TTL),
         Err(_) => true,
     };
     if needs_refresh {
