@@ -417,6 +417,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Captured BEFORE the initialize handshake: a client that dies right after
+    // handshaking would otherwise have reparented us to init by the time we
+    // looked, so ppid <= 1 would read as "detection unavailable" rather than
+    // "orphaned" -- and with no idle timeout that means running forever.
+    let parent_watcher = parent::ParentWatcher::new();
+    match &parent_watcher {
+        Some(watcher) => tracing::info!(
+            "Watching parent process (pid {}); will exit when it dies",
+            watcher.parent_pid()
+        ),
+        None => tracing::warn!(
+            "Parent process liveness detection unavailable; idle timeout will exit unconditionally"
+        ),
+    }
+
     // ── Unix proxy path: connect to fff-engine daemon ─────────────────────────
     #[cfg(unix)]
     {
@@ -431,10 +446,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pool.insert(base_path_ref, engine_client);
                 let server =
                     FffServer::new_proxy(std::sync::Arc::new(pool), std::sync::Arc::new(registry));
+                let last_activity = server.last_activity();
                 let service = server
                     .serve(stdio())
                     .await
                     .map_err(|e| format!("Failed to start MCP server: {}", e))?;
+                spawn_lifecycle_watchdog(parent_watcher, last_activity, args.idle_timeout_secs);
                 service.waiting().await?;
                 return Ok(());
             }
@@ -530,17 +547,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let parent_watcher = parent::ParentWatcher::new();
-    match &parent_watcher {
-        Some(watcher) => tracing::info!(
-            "Watching parent process (pid {}); will exit when it dies",
-            watcher.parent_pid()
-        ),
-        None => tracing::warn!(
-            "Parent process liveness detection unavailable; idle timeout will exit unconditionally"
-        ),
+    spawn_lifecycle_watchdog(parent_watcher, last_activity, idle_timeout_secs);
+
+    let picker_for_shutdown = shared_picker.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        if let Ok(mut guard) = picker_for_shutdown.write()
+            && let Some(ref mut picker) = *guard
+        {
+            picker.stop_background_monitor();
+        }
+        std::process::exit(0);
+    });
+
+    service.waiting().await?;
+
+    if let Ok(mut guard) = shared_picker.write()
+        && let Some(ref mut picker) = *guard
+    {
+        picker.stop_background_monitor();
     }
 
+    Ok(())
+}
+
+/// Exit when the spawning client dies, or (absent a client to watch) when idle.
+///
+/// Both serve paths need this: the proxy path used to return straight into
+/// `service.waiting()` with no watcher at all, so an orphaned proxy-mode
+/// server stayed alive forever once its client was gone.
+fn spawn_lifecycle_watchdog(
+    parent_watcher: Option<parent::ParentWatcher>,
+    last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    idle_timeout_secs: u64,
+) {
     if idle_timeout_secs > 0 || parent_watcher.is_some() {
         last_activity.store(
             SystemTime::now()
@@ -586,27 +626,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-
-    let picker_for_shutdown = shared_picker.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        if let Ok(mut guard) = picker_for_shutdown.write()
-            && let Some(ref mut picker) = *guard
-        {
-            picker.stop_background_monitor();
-        }
-        std::process::exit(0);
-    });
-
-    service.waiting().await?;
-
-    if let Ok(mut guard) = shared_picker.write()
-        && let Some(ref mut picker) = *guard
-    {
-        picker.stop_background_monitor();
-    }
-
-    Ok(())
 }
 
 // Tracing appender is non blocking, to get full log give it some time before hard exit

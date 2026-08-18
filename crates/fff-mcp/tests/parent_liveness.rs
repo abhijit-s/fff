@@ -90,7 +90,10 @@ fn exits_when_parent_dies_even_without_idle_timeout() {
             Ok(_) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                panic!("fff-mcp did not exit within 5s of its parent dying")
+                panic!(
+                    "fff-mcp did not exit within 5s of its parent dying\n--- server log ---\n{}",
+                    read_session_logs(dir.path())
+                )
             }
         }
     }
