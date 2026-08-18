@@ -1,14 +1,14 @@
 Package: fff
-Version: 0.19.1-1
+Version: 0.19.2-1
 Architecture: arm64
 Maintainer: Abhijit Salvi <a.salvi@easygo.io>
 Installed-Size: 21334
 Depends: libc6:arm64 (>= 2.39)
-Filename: pool/main/f/fff/fff_0.19.1-1_arm64.deb
-Size: 5705652
-MD5sum: ba8851960bd3355a7dda5acd84616cdf
-SHA1: 1d7640ea1ee65cfbd10611bc466e09336417d0b8
-SHA256: fd12b787a69ef3a9ff37623d67756ba31eca0a765f1e78a9a9af8900b1f69240
+Filename: pool/main/f/fff/fff_0.19.2-1_arm64.deb
+Size: 5701748
+MD5sum: 2d0f6cece153d5d22c123ae358f1fcbb
+SHA1: c7488f59d3fd1391a60adf58c5cc667403baff79
+SHA256: 13a606cdc315604b62f9c95ebed16128d200b91ae4b35fed8a7abeb807d400a8
 Section: utils
 Priority: optional
 Description: MCP server for FFF file finder - drop-in replacement for AI code assistant
