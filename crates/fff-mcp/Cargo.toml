@@ -1,6 +1,6 @@
 [package]
 name = "fff-mcp"
-version = "0.19.2"
+version = "0.19.3"
 edition = "2024"
 description = "MCP server for FFF file finder - drop-in replacement for AI code assistant search tools"
 license = "MIT"
@@ -23,9 +23,9 @@ ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep"]
 zlob = ["fff/zlob", "fff-query-parser/zlob"]
 
 [dependencies]
-fff = { package = "fff-search", path = "../fff-core", default-features = false , version = "0.19.2", features = ["definitions"] }
-fff-ipc = { path = "../fff-ipc", version = "0.19.2" }
-fff-query-parser = { path = "../fff-query-parser", default-features = false , version = "0.19.2" }
+fff = { package = "fff-search", path = "../fff-core", default-features = false , version = "0.19.3", features = ["definitions"] }
+fff-ipc = { path = "../fff-ipc", version = "0.19.3" }
+fff-query-parser = { path = "../fff-query-parser", default-features = false , version = "0.19.3" }
 dirs = { workspace = true }
 libc = "0.2"
 mimalloc = { workspace = true }
