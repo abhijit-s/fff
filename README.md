@@ -15,6 +15,27 @@ Originally started as [Neovim plugin](#neovim-plugin) people loved, but it turne
 
 ---
 
+## Sponsors
+
+fff is MIT and open source forever. Development is supported by these companies:
+
+<table>
+  <tr>
+    <td align="center" width="110"><sub><b>💎<br>DIAMOND</b></sub></td>
+    <td align="center" width="420"><a href="https://anoma.ly"><img alt="Anomaly" src="./assets/sponsors/anomaly.png" width="400"></a></td>
+    <td><b><a href="https://anoma.ly">Anomaly</a></b><br><sub>The team behind <a href="https://opencode.ai">opencode</a>.</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>🥇<br>GOLD</b></sub></td>
+    <td align="center"><a href="https://mangoproxy.com/?utm_source=dmtrkovalenko&utm_medium=partner&utm_campaign=dmtrkovalenko_github"><img alt="Mango Proxy" src="./assets/sponsors/mango-proxy.png" width="280"></a></td>
+    <td><b><a href="https://mangoproxy.com/?utm_source=dmtrkovalenko&utm_medium=partner&utm_campaign=dmtrkovalenko_github">Mango Proxy</a></b><br><sub>Fast, secure proxies for all the needs.</sub></td>
+  </tr>
+</table>
+
+<sub>Use and enjoy fff? <a href="mailto:dmitriy@iusevimbtw.com">Become a sponsor to get your features/fixes the highest priority</a>.</sub>
+
+---
+
 Pick what you are interested in:
 
 <details id="mcp-server">
@@ -399,6 +420,17 @@ Both `file_search` and `content_search` honour an optional `cwd` field. The firs
 - If the index is still warming up after a `change_indexing_directory`, you can pass `wait_for_index_ms = N` to block for up to `N` ms regardless of whether `cwd` triggered the swap. Pass `0` to skip waiting entirely (useful for fire-and-forget calls where partial results are acceptable).
 - Invalid or non-existent `cwd` paths return an empty result and emit an error via `vim.notify`.
 
+### Autocmds
+
+The picker fires `User` autocmds when it opens and closes. `FFFOpen` runs with the prompt window focused, `FFFClose` runs after every picker window is gone — so hide global UI, not window-local options of the picker itself:
+
+```lua
+vim.api.nvim_create_autocmd('User', {
+  pattern = { 'FFFOpen', 'FFFClose' },
+  callback = function(ev) vim.o.showtabline = ev.match == 'FFFOpen' and 0 or 2 end,
+})
+```
+
 ### Commands
 
 - `:FFFScan`. Rescan files.
@@ -479,10 +511,16 @@ require('fff').setup({
     grep_jump_to_next_file = { '<C-A-n>', '<A-Down>' },
     grep_jump_to_prev_file = { '<C-A-p>', '<A-Up>' },
     cycle_previous_query = '<C-Up>',
+    -- unbound by default, wipes the whole input line
+    -- clear_query = '<C-u>', -- overrides preview_scroll_up in insert mode
     toggle_select = '<Tab>',
     send_to_quickfix = '<C-q>',
     focus_list = '<leader>l',
     focus_preview = '<leader>p',
+  },
+  -- extra keymaps for the picker input, keyed by mode, applied over the built-ins
+  mappings = {
+    -- i = { ['<A-BS>'] = function() vim.api.nvim_input('<C-w>') end },
   },
   frecency = {
     enabled = true,

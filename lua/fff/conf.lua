@@ -37,12 +37,15 @@ local M = {}
 --- @field insert_newline_escape string
 --- @field cycle_previous_query string
 --- @field cycle_forward_query string
+--- @field clear_query string|string[]|nil
 --- @field grep_jump_to_next_file string|string[]
 --- @field grep_jump_to_prev_file string|string[]
 --- @field toggle_select string
 --- @field send_to_quickfix string
 --- @field focus_list string
 --- @field focus_preview string
+
+--- @alias FffMappingsConfig table<string, table<string, function|string>>
 
 --- @class FffFrecencyConfig
 --- @field enabled boolean
@@ -82,6 +85,7 @@ local M = {}
 --- @field layout FffLayoutConfig
 --- @field preview FffPreviewConfig
 --- @field keymaps FffKeymapsConfig
+--- @field mappings FffMappingsConfig extra keymaps for the picker input, keyed by mode
 --- @field hl table<string, string>
 --- @field frecency FffFrecencyConfig
 --- @field history FffHistoryConfig
@@ -205,6 +209,33 @@ local function fallback_hl(name)
   return resolved_hl or name[#name]
 end
 
+-- Drops malformed user mappings so a bad entry can't break picker creation
+local function sanitize_mappings(mappings)
+  if type(mappings) ~= 'table' then return {} end
+
+  for mode, maps in pairs(mappings) do
+    if type(mode) ~= 'string' or type(maps) ~= 'table' then
+      vim.notify(
+        ('fff: ignoring mappings[%s], expected a table of keymaps'):format(vim.inspect(mode)),
+        vim.log.levels.WARN
+      )
+      mappings[mode] = nil
+    else
+      for lhs, rhs in pairs(maps) do
+        if type(lhs) ~= 'string' or not vim.tbl_contains({ 'string', 'function' }, type(rhs)) then
+          vim.notify(
+            ('fff: ignoring mappings.%s[%s], rhs must be a string or function'):format(mode, vim.inspect(lhs)),
+            vim.log.levels.WARN
+          )
+          maps[lhs] = nil
+        end
+      end
+    end
+  end
+
+  return mappings
+end
+
 local function init()
   local config = vim.g.fff or {}
   local default_config = {
@@ -294,6 +325,9 @@ local function init()
       focus_list = '<leader>l',
       focus_preview = '<leader>p',
     },
+    -- extra keymaps for the picker input, keyed by mode, e.g.
+    -- mappings = { i = { ['<A-BS>'] = function() vim.api.nvim_input('<C-w>') end } }
+    mappings = {},
     hl = {
       border = 'FloatBorder',
       normal = 'NormalFloat',
@@ -460,6 +494,8 @@ local function init()
   else
     merged_config.debug.show_file_info = default_sections
   end
+
+  merged_config.mappings = sanitize_mappings(merged_config.mappings)
 
   state.config = merged_config
 end

@@ -52,6 +52,7 @@ M.on_input_change = search_manager.on_input_change
 M.cycle_grep_modes = search_manager.cycle_grep_modes
 M.recall_query_from_history = search_manager.recall_query_from_history
 M.cycle_forward_query = search_manager.cycle_forward_query
+M.clear_query = search_manager.clear_query
 M.get_suggestion_renderer = search_manager.get_suggestion_renderer
 
 -- Wire renderer module (list rendering, scroll, empty state)
@@ -666,7 +667,8 @@ local function open_ui_with_state(query, results, location, merged_config, curre
   if query then
     vim.schedule(function()
       if M.state.active and M.state.input_win and vim.api.nvim_win_is_valid(M.state.input_win) then
-        vim.api.nvim_win_set_cursor(M.state.input_win, { 1, #M.state.config.prompt + #query })
+        local line = vim.api.nvim_buf_get_lines(M.state.input_buf, 0, 1, false)[1] or ''
+        vim.api.nvim_win_set_cursor(M.state.input_win, { 1, #line })
         vim.cmd('startinsert!')
       end
     end)
@@ -675,6 +677,8 @@ local function open_ui_with_state(query, results, location, merged_config, curre
   end
 
   M.monitor_scan_progress(0)
+
+  vim.api.nvim_exec_autocmds('User', { pattern = 'FFFOpen', modeline = false })
   return true
 end
 
