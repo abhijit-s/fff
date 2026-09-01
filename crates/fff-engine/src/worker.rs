@@ -764,6 +764,10 @@ fn bad_request(message: &str) -> ResponseEnvelope {
 // Shared fire-and-forget frecency write for both encodings.
 #[cfg(unix)]
 fn record_access(state: &EngineState, path: String) {
+    // Recording a file open is user activity: refresh the root's idle signal so a
+    // connection that only records (never searches) still keeps the root loaded.
+    state.touch_last_access();
+
     let frecency = state.shared_frecency.clone();
     let base = state.base_path.clone();
     tokio::task::spawn_blocking(move || {
@@ -854,6 +858,41 @@ mod tests {
 
         // collect_health reads the SAME field: its age derives from `after`, so
         // a freshly-stamped root reports a near-zero last_access_age_sec.
+        let health = ws.collect_health();
+        let root_health = health.roots.first().expect("one loaded root");
+        assert!(
+            root_health.last_access_age_sec.expect("age surfaced") <= 1,
+            "health must surface the freshly-stamped last_access"
+        );
+    }
+
+    // RecordAccess is user activity too: a connection that only records file
+    // opens (never searches) must still advance last_access, or the reaper evicts
+    // a root that is actively in use. Fails pre-fix (record_access did not stamp).
+    #[tokio::test]
+    async fn record_access_advances_last_access() {
+        let root = tempfile::tempdir().expect("root");
+        let frec = tempfile::tempdir().expect("frec");
+        let ws = WorkerState::new(0, light_config(frec.path()));
+        let state = ws
+            .get_or_init(root.path().to_path_buf())
+            .await
+            .expect("init root");
+
+        let before = state.last_access_ms();
+        // Sleep past ms resolution so a fresh stamp is observably newer.
+        std::thread::sleep(Duration::from_millis(5));
+
+        record_access(&state, "some/file.rs".to_string());
+
+        let after = state.last_access_ms();
+        assert!(
+            after > before,
+            "record_access must advance last_access ({after} !> {before})"
+        );
+
+        // collect_health reads the SAME EngineState field, so the freshly-stamped
+        // root reports a near-zero last_access_age_sec.
         let health = ws.collect_health();
         let root_health = health.roots.first().expect("one loaded root");
         assert!(
