@@ -29,16 +29,12 @@ install_macos() {
   brew tap "$TAP_REPO" >/dev/null 2>&1 || true
   brew trust "$TAP_SHORT" >/dev/null 2>&1 || true # recent Homebrew gates untrusted taps
 
-  local arch; arch="$(uname -m)"
   if [ "$CHANNEL" = head ]; then
     log "Installing fff (--HEAD, builds from main)"
     brew install --HEAD "$TAP_SHORT/fff" || brew upgrade --fetch-HEAD "$TAP_SHORT/fff"
-  elif [ "$arch" = "arm64" ]; then
-    log "Installing fff (stable arm64 bottle)"
-    brew install "$TAP_SHORT/fff" || brew upgrade "$TAP_SHORT/fff"
   else
-    log "Stable bottle is arm64-only; building from source (--HEAD) on $arch"
-    brew install --HEAD "$TAP_SHORT/fff" || brew upgrade --fetch-HEAD "$TAP_SHORT/fff"
+    log "Installing fff (stable bottle, Apple Silicon + Intel)"
+    brew install "$TAP_SHORT/fff" || brew upgrade "$TAP_SHORT/fff"
   fi
 }
 
